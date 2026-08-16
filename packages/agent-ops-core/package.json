@@ -1,0 +1,27 @@
+{
+  "name": "agent-ops-core",
+  "version": "0.0.0",
+  "description": "Shared operational machinery for AI decisioning applications: evaluation, audit, approval, telemetry, guardrails.",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc --build"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

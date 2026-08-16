@@ -1,0 +1,10 @@
+node_modules/
+dist/
+coverage/
+*.tsbuildinfo
+.env
+.env.local
+.DS_Store
+
+# Claude Code local overrides (personal, not team config)
+.claude/settings.local.json

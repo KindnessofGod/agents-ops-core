@@ -1,0 +1,26 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: agent-ops-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: agent_ops
+      POSTGRES_PASSWORD: agent_ops
+      POSTGRES_DB: agent_ops
+    ports:
+      # Host port 5433 by default so this never collides with a Postgres
+      # you already run on 5432. Override with AGENT_OPS_PG_PORT.
+      - "${AGENT_OPS_PG_PORT:-5433}:5432"
+    volumes:
+      - agent-ops-pgdata:/var/lib/postgresql/data
+      # Every .sql file in ./migrations runs, in filename order, the first
+      # time this volume is created. `npm run db:reset` re-runs them.
+      - ./migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agent_ops -d agent_ops"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  agent-ops-pgdata:

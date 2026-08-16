@@ -1,0 +1,28 @@
+{
+  "name": "agent-ops-core-workspace",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "tsc --build",
+    "typecheck": "tsc --build --force",
+    "test": "vitest run --passWithNoTests",
+    "test:watch": "vitest",
+    "lint:boundaries": "depcruise packages/agent-ops-core/src",
+    "check": "npm run typecheck && npm run lint:boundaries && npm run test",
+    "db:up": "docker compose up -d --wait",
+    "db:down": "docker compose down",
+    "db:reset": "docker compose down -v && docker compose up -d --wait"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "dependency-cruiser": "^16.0.0",
+    "typescript": "~5.9.3",
+    "vitest": "^4.1.10"
+  }
+}

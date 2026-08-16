@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "hooks": {
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "prompt",
+            "timeout": 300,
+            "statusMessage": "Drafting the builder's log...",
+            "prompt": "You are writing the builder's log for the agent-ops-core repository at the end of this session.\n\nRead the session transcript. Identify the REAL decision points — moments where a fork with a genuine trade-off was resolved, where the user overruled a proposal, where a stated belief turned out to be wrong, or where something non-obvious was learned. Ignore mechanical work: file creation, renames, formatting, dependency installs, and anything that had only one sensible answer.\n\nAPPEND your entries to docs/DECISIONS.draft.md. Create that file if it does not exist. NEVER write to docs/DECISIONS.md — that file is promoted by hand via the /log-review skill, and writing to it from this hook would destroy the review step that gives the log its value.\n\nUse exactly this format for each entry, newest at the bottom of the file:\n\n## [DRAFT] YYYY-MM-DD · <title>\n**Tag:** [DECISION|REJECTED|CORRECTION|LEARNED]\n**The question.**\n**What I proposed.**\n**What the user decided.**\n**Why (their words where you have them).**\n**What would change our mind.**\n\nRules, in order of importance:\n\n1. If nothing of substance was decided, WRITE NOTHING AND COMMIT NOTHING. An empty log day is honest; a padded one is not. Do not manufacture an entry to justify running. Exit quietly.\n\n2. Never invent reasoning the user did not give. If you are reconstructing a rationale rather than quoting one, prefix that line with INFERRED so the user can correct it. Quote the user's actual words wherever you have them, in quotation marks. Their wording beats your paraphrase every time.\n\n3. If the user overruled you, say so plainly. Name what you proposed, name what they chose, and — if you still believe you were right — state where you think they were wrong and why, in one or two sentences under 'What would change our mind.' Do not soften this. A log that only records agreement is worthless.\n\n4. 'What would change our mind' must name a concrete, observable trigger (a measurement, a failure mode, a scale threshold), not a vague 'if requirements change'.\n\n5. Use today's date in YYYY-MM-DD form.\n\nThen, ONLY if you wrote at least one entry:\n  git add docs/DECISIONS.draft.md\n  git commit -m \"docs: log session decision drafts\"\n  git push -u origin HEAD\n\nThe filesystem is ephemeral and reclaimed when this session ends. Unpushed drafts are lost. If the push fails for a network reason, retry up to 4 times with 2s, 4s, 8s, 16s backoff. If it still fails, say so in your output so the user knows the drafts did not survive.\n\nIf you wrote no entries, do not stage, commit, or push anything.\n\n$ARGUMENTS"
+          }
+        ]
+      }
+    ]
+  }
+}
