@@ -1,6 +1,19 @@
 # Phase 2 — Interface review of the seven candidate modules
 
-**Status:** findings, awaiting decision. No implementation code exists.
+**Status:** findings accepted. Four modules confirmed. No implementation code
+exists yet.
+
+**Decisions taken (2026-08-16), recorded here and due for promotion to the
+builder's log:**
+
+| Fork | Ruling |
+|---|---|
+| Four survivors — `audit`, `approval`, `evals`, `guardrails` | **Accepted** |
+| `telemetry` cut, `tools` dissolved | **Accepted** |
+| Does `shadow` merge into `evals`? | **Merge.** One runner, two case sources, two incompatible report types. Review rule: a third entry point on `evals` is a signal to split, not to extend. |
+| Who handles waiting on a human approval? | **The library.** `approval` is durable and resumable: a case suspends, the process may die, the case rehydrates when the approver answers. The largest single piece of work in the project, taken on because the cost is a cliff rather than a slope — surviving one restart and surviving a week cost the same, so nineteen partial implementations would be strictly worse than one complete one. |
+| Reserved decisions | **Added** as a first-class concept, orthogonal to risk tier, structurally enforced. |
+| Approval brief | **Added.** The library owns the required contents; each application owns the screen. |
 
 Vocabulary per `CLAUDE.md`: module, interface, seam, adapter, depth, leverage,
 locality. Interface means everything a caller must know to use the module
@@ -145,6 +158,20 @@ whole class of mistake unrepresentable across nineteen applications.
   because reserved status is a legal obligation rather than a risk judgement —
   and it is orthogonal to tier, so it cannot be re-tiered away by a team chasing
   throughput.
+- **An approval request cannot be constructed without a complete brief.** Every
+  required field is non-optional in the type, so an application that omits the
+  contrary evidence or the do-nothing consequence fails to compile rather than
+  shipping a screen that quietly produces rubber stamps. An approval obtained on
+  a thin brief is worse than none: it manufactures the paperwork of human
+  oversight without the substance.
+- **The second approver's brief structurally excludes the first's verdict.**
+  Dual control is two independent judgements or it is one judgement counted
+  twice. This is a property of the type served to the second approver, not a
+  rule for whoever builds the screen.
+- **Time-to-decision is recorded on every approval**, and no answer is ever
+  pre-selected. The library records the signal and sets no threshold — plausible
+  reading time for a £200 expense and a £2M disbursement are not the same
+  number, and only the application knows which it is.
 - An effect executes at most once per idempotency key. A repeat returns the
   *original* outcome — it does not re-execute and does not error.
 - Dual control's two authorities are distinct, and the second approval is
@@ -205,6 +232,12 @@ keep if I could keep only one.
   business quietly remove a legal obligation by adjusting a risk threshold,
   which is precisely the failure the concept exists to prevent. Two seams, on
   purpose, against the usual instinct to unify.
+- **`BriefRenderer`** — Adapter 1: a web dashboard. Adapter 2: an email or chat
+  approval with the same required fields inline. **Real seam** — and it is the
+  reason the brief is data rather than a screen. The library refuses to build
+  nineteen user interfaces and refuses to let any of them omit a field.
+- **`CaseStore`** (durable suspension) — Adapter 1: Postgres. Adapter 2:
+  in-memory, for hermetic tests. **Real seam.**
 - **`Authority`** — Adapter 1: human, via a task queue. Adapter 2: delegated
   automated policy at low tier (still recorded with a named delegation, per
   `CONTEXT.md`). **Real seam.**

@@ -80,6 +80,56 @@ lets you re-run a case to check it without accidentally paying twice.
 Two different people must both approve before something happens, and the system
 makes it impossible for one person to be both. Common wherever large sums move.
 
+One rule that people get wrong constantly: **the second person must not be shown
+what the first decided.** If the screen says "Jane approved this", you haven't
+got two opinions — you've got Jane's opinion and somebody agreeing with Jane.
+That is one decision wearing a disguise.
+
+**Approval brief**
+Everything the approver needs in front of them before they can sensibly say yes
+or no. Not the screen itself — the information that has to be on it.
+
+Each of your businesses builds its own screen, because a claims handler and a
+finance manager want very different layouts. But the *contents* are fixed for
+everyone, and the system will not let an approval be requested without all of
+it:
+
+- What will actually happen, in real terms — "£47,200 leaves account 8812
+  today", not "payment authorised"
+- What the computer concluded, and the evidence behind it
+- **What the computer is unsure about**, and any evidence pointing the other way
+- What it could *not* check
+- Whether this is one a person is legally required to decide, and under which
+  rule
+- **What happens if you do nothing** — does it expire, escalate, or sit forever?
+- The case reference, so the full record is one click away
+
+The third and sixth points are the ones usually missing. A brief that only makes
+the case *for* saying yes isn't a brief, it's a sales pitch. And an approver who
+doesn't know what waiting costs can't weigh whether to wait.
+
+**Rubber-stamping**
+Approving without really looking.
+
+This is worse than having no approval step at all, and it's worth being clear
+why. It produces a record saying *a human approved this* — which satisfies your
+legal obligation on paper while delivering none of the actual protection. You've
+bought the paperwork and skipped the safety. Afterwards, a rubber stamp and a
+genuine approval look identical.
+
+Three cheap defences, all built in:
+
+- **Time taken is recorded on every approval.** A queue averaging 1.2 seconds
+  per decision is rubber-stamping, and the number shows it without anyone having
+  to accuse a colleague.
+- **No answer is ever pre-selected.** No default button, no "approve all". The
+  first thing the approver does is make a choice.
+- **Saying yes is never the easier click than saying no.**
+
+We record the timing. We don't set the limit — a £200 expense and a £2 million
+payment don't share a believable reading time, and only your business knows
+which is which.
+
 **Kill switch**
 A single control that stops the system doing anything in the real world, without
 stopping it from thinking. During an incident you switch it on: payments stop,

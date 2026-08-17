@@ -127,6 +127,56 @@ distinctness is enforced structurally rather than checked. The second approver
 must be unable to be the first.
 _Avoid_: four-eyes, maker-checker, double approval.
 
+**The second approver must not see the first approver's verdict before giving
+their own.** Dual control where the second person is shown "Jane approved this"
+is not two decisions; it is Jane's decision with an echo. The brief served to
+the second approver structurally excludes the first's outcome.
+
+**Approval brief**:
+The package of information that must accompany a request for approval, without
+which the request cannot be constructed. Not a screen — the data behind one.
+Each application renders it however suits its people; none may omit a field.
+_Avoid_: context, summary, approval screen, review packet.
+
+Required contents:
+
+1. **The effect in concrete terms** — what will actually happen, in the units
+   the approver thinks in. "£47,200 leaves account 8812 today", not "payment
+   authorised".
+2. **What the system concluded, and the evidence it used** — with the evidence
+   reachable, not summarised away.
+3. **What the system is unsure about, stated explicitly**, including contrary
+   evidence. A brief that presents only the supporting case is advocacy, not a
+   brief.
+4. **What it could not check**, and why. Absence of a finding is not a finding.
+5. **Whether the decision is reserved**, and under which rule or statute.
+6. **What happens if the approver does nothing** — expiry, escalation, or
+   indefinite hold. An approver who does not know the cost of waiting cannot
+   weigh it.
+7. **The correlation identifier**, so the full trace is one step away.
+
+**Rubber-stamping**:
+An approval granted without the approver engaging with the brief. It is worse
+than no approval: it produces a record that a human approved, which discharges
+the obligation on paper while delivering none of the protection, and it is
+indistinguishable from genuine approval after the fact unless it is measured
+for.
+_Avoid_: nodding through, formality, sign-off.
+
+Three countermeasures, all cheap and all structural:
+
+- **Time-to-decision is recorded on every approval.** A queue averaging 1.2
+  seconds per approval is rubber-stamping, and the number makes it visible
+  without anyone having to allege it.
+- **No answer is ever pre-selected.** No default, no pre-highlighted button, no
+  "approve all". The approver's first action is a choice.
+- **Approving is not the low-effort path.** Where approve and reject differ in
+  effort, the difference must not favour approve.
+
+The library records the signal; it does not set a threshold. What counts as too
+fast is domain-specific — a £200 expense and a £2M disbursement do not share a
+plausible reading time.
+
 > **Note the independence.** Abstention does not imply escalation: a system may
 > abstain and terminate on a default with no human involved. Escalation does not
 > imply abstention: a verdict may be highly confident and still require a human
