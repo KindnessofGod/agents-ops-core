@@ -155,6 +155,57 @@ Required contents:
    weigh it.
 7. **The correlation identifier**, so the full trace is one step away.
 
+**Escalation ladder**:
+*Plain English: what happens as a case sits unanswered — who gets told, when,
+and who it goes to next.*
+The ordered sequence of ageing responses for a decision awaiting an authority:
+each step names a delay, an action, and a recipient. Mandatory and non-empty
+for every gated decision, and doubly so for a reserved one.
+_Avoid_: timeout, SLA, reminder, chase, nudge.
+
+**Removing the expiry branch is not sufficient on its own.** A reserved
+decision correctly has no default to time out *into* — "nobody was on shift" is
+not a lawful basis for an automated decision. But a decision with neither an
+expiry nor a ladder does not fail safely; it fails **silently**, which is worse.
+The case sits unanswered, nothing errors, no dashboard turns red, and it lands
+in the dangerous quadrant: not contained by any honest reading, not resolved,
+and invisible.
+
+The rule is therefore two-sided, and both sides are enforced in the type:
+
+- **A reserved decision has no terminal state reachable without an authority
+  answering.** No expiry, no default, no threshold, no override.
+- **A gated decision cannot be declared without a non-empty ladder.** The
+  `DoNothing` type deletes the `expire` branch for reserved decisions *and*
+  requires `ladder: NonEmpty<EscalationStep>` for all gated ones. Declaring a
+  human gate without saying what happens as it ages does not compile.
+
+An unanswered case therefore gets **louder over time, never quieter**. Waiting
+is legitimate; waiting silently is not.
+
+**Ageing**:
+The recorded fact that a decision has been awaiting an authority for a given
+duration, and which ladder steps have fired. Ageing is recorded as nodes on the
+trace like anything else — a case that waited eleven days and escalated four
+times has that written down, not merely implied by two timestamps.
+_Avoid_: pending, stuck, stale, in progress.
+
+**A case awaiting an authority is never `contained`, and is never terminal.**
+It has not completed. Any metric that counts a waiting case as finished — in
+either direction — is measuring the wrong thing, and the terminal states are
+closed such that "awaiting" is not among them.
+
+**Buried case**:
+A decision awaiting an authority that has exhausted its escalation ladder
+without being answered. It is an **incident**, not a state — the ladder has
+failed, and the failure is of the organisation, not of the case.
+_Avoid_: stale, abandoned, orphaned, timed out, expired.
+
+A buried case must remain answerable indefinitely: it never self-resolves, it
+never disappears from the queue, and it never acquires a verdict by the passage
+of time. What it acquires is escalating visibility, terminating in a named
+human being paged. The library refuses to close it; only an authority can.
+
 **Rubber-stamping**:
 An approval granted without the approver engaging with the brief. It is worse
 than no approval: it produces a record that a human approved, which discharges
