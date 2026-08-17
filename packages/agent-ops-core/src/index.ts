@@ -1,9 +1,30 @@
 // agent-ops-core — public entry point.
 //
-// Nothing is exported yet. Which modules exist is being decided in Phase 2
-// (see docs/design/PHASE-2-INTERFACE-REVIEW.md); implementation starts only
-// after that decision. Exporting a placeholder surface now would be the exact
-// mistake this project is trying to avoid: nineteen applications inheriting an
-// interface nobody argued about.
+// Four modules survive interface review: audit, approval, evals, guardrails.
+// See docs/design/PHASE-2-INTERFACE-REVIEW.md for why, and FINDINGS.md for the
+// interface each one took.
+//
+// `audit` is the foundation — the other three record into it and none of them
+// are meaningful without it — so it is built first and is the only one exported
+// so far. Re-exporting a module before it exists would be the exact mistake
+// this project is trying to avoid.
 
-export {};
+export {
+  createAudit,
+  inMemoryTraceStore,
+  NoSuchCase,
+  CaseAlreadyClosed,
+} from "./audit/index.js";
+
+export type {
+  Audit,
+  CaseTrace,
+  Clock,
+  Containment,
+  CorrelationId,
+  NodeId,
+  NodePayload,
+  RecordedNode,
+  ReplayedCase,
+  TraceStore,
+} from "./audit/index.js";
