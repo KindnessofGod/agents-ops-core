@@ -5,7 +5,7 @@ abbreviation is spelled out the first time it appears.
 
 **About the numbers on this page.** Every statement below was checked against
 the source files on 17 August 2026. On that date the type checker completed with
-no errors, and 707 automated tests across 76 files all passed, in 19.4 seconds.
+no errors, and 825 automated tests across 87 files all passed, in about 25 seconds.
 Figures used to illustrate an argument rather than to describe this system are
 marked **(illustration)**. Judgements rather than measurements are marked
 **(estimate)**.
@@ -85,7 +85,7 @@ you care about. It is not knowable when the case closes. It needs evidence from
 outside the system, gathered later.
 
 So the software does not record it. **There is no resolution field anywhere in
-the library.** Not empty — absent, across all 50,417 lines of source, verified
+the library.** Not empty — absent, across all 59,245 lines of source, verified
 on 17 August 2026. This is a refusal, not an omission. A figure the library
 invented would have no named source and no stated waiting period, and a figure
 whose origin is unknown cannot be audited and is therefore evidence of nothing.
@@ -243,7 +243,7 @@ level up.
 There is no target figure in the library. No default. No configurable goal.
 Nothing to tune.
 
-**Unassisted containment carries no target anywhere in the 50,417 lines.** It is
+**Unassisted containment carries no target anywhere in the 59,245 lines.** It is
 recorded and never optimised. This is deliberate, and the reason is arithmetic
 rather than principle.
 
@@ -293,11 +293,19 @@ until they are supplied, the relevant fields stay empty.
 6. **The entitlement standard, the evidence source and the window** for judging
    outcomes later. See refusal 2.
 
-**Why this matters more than it sounds.** Because none of these is built in, the
-707 automated tests cannot telephone a supplier, reach a database, or page a
-real engineer — even with real credentials sitting in the environment. There is
-no route from this software to a network to be switched off. That is a fact
-about how the code is wired, not a promise about a setting.
+**Why this matters more than it sounds.** Because none of these is built in,
+786 of the 825 automated tests cannot telephone a supplier, reach a database, or
+page a real engineer — even with real credentials sitting in the environment.
+There is no route from this software to a network to be switched off. That is a
+fact about how the code is wired, not a promise about a setting.
+
+The other 39 tests can reach one thing: a throwaway copy of the database, and
+only when somebody deliberately points them at one. They still cannot reach a
+supplier, a payment channel or a real engineer's telephone, because no such
+connection can be built from anything they can see. A separate check reads the
+source files and confirms that only those four files can reach a database at
+all — so the promise in this paragraph is itself tested, rather than being a
+sentence somebody has to keep true by remembering to.
 
 ---
 
@@ -331,10 +339,13 @@ and how many went into the record unmasked. "We found and masked 3 items" and
 "we found nothing and wrote all 4,812 characters down" (illustration) are
 different rows in the record, not the same one.
 
-**It will not stop actions for one risk tier only.** The kill switch stops
-actions system-wide, and that is enforced. Stopping actions for the high tier
-alone is a label written into the record, and the record will faithfully report
-whatever it is told. See item 12 in Part 4.
+**It will stop actions for one risk level only — this refusal has been
+withdrawn.** The kill switch now states either "everything" or a named list of
+risk levels, and the software decides whether the switch covers the action in
+hand rather than trusting the setting to describe itself. A switch that cannot
+be read stops every risk level. This is recorded as a change of position rather
+than deleted, because a reader who planned around the old answer needs to know
+it moved.
 
 **It will not put personal data in an alarm.** There are 9 alarm conditions and
 not one of them has a free-text field, so there is nowhere for a customer name
@@ -356,15 +367,20 @@ Checked one by one against the code on 17 August 2026.
 
 1. **The outside watcher is not supplied.** Refusal 4. Deploy without it and the
    chasing can stop in silence.
-2. **The proof-of-life records are held in memory only.** There is 1 shipped way
-   to store them, and it does not survive a restart. The database-backed version
-   is named and not built, because it needs a database change that does not
-   exist. After a restart the watcher sees "never seen" rather than a real gap.
-   That errs towards raising the alarm, which is the safe direction, and it is
-   still a limit.
-3. **The alarm diary also has 1 way to store it**, in memory. The version backed
-   by the permanent record is named and not built.
-4. **Record entries are not de-duplicated on retry.** See Part 3.
+2. **The proof-of-life records can be stored durably.** There are now 2 shipped
+   ways to store them: in memory, and in the database. Stored in the database,
+   the history survives a restart and a watcher sees a real gap rather than
+   "never seen". Stored in memory it still dies with the process — that is now
+   a deployment choice rather than the only option.
+3. **The alarm diary also has 2 ways to store it**: in memory, and written into
+   the permanent record of the case the alarm is about.
+4. **Record entries are de-duplicated on retry where the caller names the
+   attempt.** If the caller supplies a name for an attempt, a retry after a
+   crash returns the original entry and writes nothing, and the answer says
+   plainly that it was a duplicate. Without such a name, a retry still adds a
+   second entry — the software will not guess that two entries which happen to
+   look alike are the same event, because a record that loses a real event to
+   make a retry cheaper is not evidence.
 5. **The database's own protections are not tested here.** The primary key, the
    one-seal rule, the parent link, the edit-blocking triggers and the
    insert-only permissions are properties of the database. **0 tests in this

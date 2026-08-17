@@ -1,4 +1,5 @@
 import { checkCoverage, type CoverageCategory, type CoverageNote, type DetectorCoverage } from "./coverage.js";
+import { LimitsInvalid } from "./errors.js";
 import { assertPatternSafe, type Pattern } from "./safe-pattern.js";
 import type {
   Classifier,
@@ -57,15 +58,44 @@ export type { Pattern } from "./safe-pattern.js";
  *   3. **`screen` is asynchronous and yields periodically**, so the engine's
  *      race can be scheduled while a scan is still running rather than after it.
  *
- * What is left, stated as a bound: an accepted pattern can still be *polynomial*
- * in field length, so a single (pattern, field) scan can cost on the order of
- * `maxFieldChars²` character comparisons — roughly a second of one core at the
- * default 32,768 — and no in-process timer can preempt it. `lib/safe-pattern.ts`
- * gives the full accounting, including why a worker thread is the wrong trade.
+ * What is left **in this adapter**, and the reversal that closes it elsewhere.
+ * An accepted pattern can still be far worse than linear in field length, and no
+ * in-process timer can preempt it once a single scan is under way. This file
+ * used to end by saying a worker thread was the wrong trade for that. **That
+ * position is reversed**: `lib/preemption.ts` ships `preemptiveDetector`, a
+ * third adapter that runs the identical scan in a bounded worker pool and
+ * terminates the thread when the budget is spent. The old objection — the
+ * caller's text lives in a second heap this module cannot prove it has released
+ * — is still true, which is why preemption is opt-in per detector and this
+ * adapter, unchanged, remains the default.
  */
 
 /** How many (field, pattern) scans run between yields to the event loop. */
 const SCANS_PER_YIELD = 8;
+
+/**
+ * How many sites one detector may report before it refuses to report any.
+ *
+ * A bound on **memory**, and — the half that matters — a bound on **redaction**.
+ * A pattern matching densely over sixty-four fields of 32,768 characters
+ * produces millions of drafts, every one of which this module holds, masks and
+ * ranks before truncating the *report* to `maxFindingsPerScreening`. That is the
+ * one unbounded allocation left in the screening path.
+ *
+ * Truncating the drafts instead is not available, and the reason is not memory:
+ * a masked site is masked because a detector reported it, so a detector that
+ * reported the first thousand sites of ten thousand would have this module write
+ * the other nine thousand into a seven-year archive **unmasked**, under a
+ * screening that reads as a successful redaction. So the bound fails the
+ * detector closed instead. A screening that abstains is a working system saying
+ * it could not do the job; a partial redaction presented as a complete one is
+ * the incident this module exists to prevent.
+ *
+ * The default is deliberately generous. A pack hitting it is a pack whose
+ * pattern is wrong, not a payload that is unusually full of national insurance
+ * numbers.
+ */
+export const DEFAULT_MAX_MATCHES_PER_SCAN = 4_096;
 
 export interface DeterministicDetectorSpec {
   readonly id: string;
@@ -77,6 +107,13 @@ export interface DeterministicDetectorSpec {
   readonly patterns: NonEmpty<Pattern>;
   /** Screen only these fields. Omit to screen every field. */
   readonly fields?: readonly string[];
+  /**
+   * The most sites this detector may report. Defaults to
+   * `DEFAULT_MAX_MATCHES_PER_SCAN`; past it the detector declares itself
+   * unavailable and the screening fails closed. See that constant for why a
+   * partial report is not the alternative.
+   */
+  readonly maxMatchesPerScan?: number;
   /**
    * Categories this pack addresses **incompletely**, each with the caveat.
    *
@@ -102,6 +139,11 @@ export const deterministicDetector = (spec: DeterministicDetectorSpec): Detector
   // A cast can defeat the brand; it cannot defeat this. Refused at boot, which
   // is the loudest cheap place to refuse a pattern that stalls a hot path.
   for (const pattern of spec.patterns) assertPatternSafe(pattern);
+
+  const maxMatches = spec.maxMatchesPerScan ?? DEFAULT_MAX_MATCHES_PER_SCAN;
+  if (!Number.isSafeInteger(maxMatches) || maxMatches < 1) {
+    throw new LimitsInvalid("maxMatchesPerScan", maxMatches);
+  }
 
   const covers = [...new Set(spec.patterns.map((p) => p.covers))].sort() as unknown as NonEmpty<CoverageCategory>;
   const declares: DetectorCoverage = {
@@ -147,6 +189,18 @@ export const deterministicDetector = (spec: DeterministicDetectorSpec): Detector
           const re = new RegExp(pattern.match.source, withGlobal(pattern.match.flags));
           for (const match of text.matchAll(re)) {
             if (match.index === undefined || match[0].length === 0) continue;
+            if (drafts.length >= maxMatches) {
+              // Fail closed rather than report a partial redaction. See
+              // `DEFAULT_MAX_MATCHES_PER_SCAN` — the drafts collected so far are
+              // dropped with the report, so nothing half-masked reaches a store.
+              return {
+                outcome: "unavailable",
+                reason: "declared",
+                detail: `rule ${pattern.rule} matched more than ${maxMatches} sites; a partial redaction is not a redaction`,
+                costTenthCents: 0,
+                modelCalls: 0,
+              };
+            }
             drafts.push({
               category: spec.category,
               severity: spec.severity,

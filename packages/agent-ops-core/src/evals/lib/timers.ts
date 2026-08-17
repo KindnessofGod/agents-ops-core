@@ -48,6 +48,18 @@ export const systemTimers = (): Timers => ({
 export interface ManualTimers extends Timers {
   /** Move virtual time forward, firing everything due. */
   advance(millis: number): void;
+  /**
+   * Virtual time since these timers were constructed, in milliseconds. Moves
+   * only under `advance`.
+   *
+   * It exists so a test can assert a **runtime ceiling** — "200 cases at
+   * concurrency 8 finished inside `runMillis`" — against the same clock the
+   * module's own wall-clock deadline is driven from, rather than against
+   * `Date.now()`. That comparison was the one place in this package where a
+   * real clock drove an assertion, and a coarse ceiling read from the wall is
+   * evidence about the machine the test ran on, not about the bound.
+   */
+  now(): number;
   /** How many deadlines and sleeps are outstanding. Bounded, and assertable. */
   pending(): number;
   /** Every interval slept, in order. This is how a backoff sequence is tested. */
@@ -115,6 +127,7 @@ export const manualTimers = (): ManualTimers => {
       now += millis;
       drain();
     },
+    now: () => now,
     pending: () => waiters.filter((w) => !w.cancelled).length,
     slept: () => [...slept],
   };

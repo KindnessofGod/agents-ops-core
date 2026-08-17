@@ -16,8 +16,10 @@ import {
   LimitsInvalid,
   NODE,
   createGuardrails,
+  deterministicDetector,
   groundednessDetector,
   judgeGroundedness,
+  safePattern,
   type NonEmpty,
   type Source,
   type SourceId,
@@ -198,5 +200,110 @@ describe("guardrails — the timer still bounds an asynchronous detector", () =>
 
     expect((await screening).recommended.recommend).toBe("abstain");
     expect((await screening).cost.unmeasuredDetectors).toBe(1);
+  });
+});
+
+/**
+ * The two allocations that used to grow with the payload rather than with the
+ * wiring, and which `limits.ts` claimed did not exist.
+ *
+ * Both are on the shipped deterministic path, so both were reachable by any of
+ * the nineteen applications with a pattern slightly wronger than intended — and
+ * neither presented as a defect. One presented as memory; the other presented as
+ * a clean redaction over text that had not been redacted.
+ */
+describe("guardrails — a detector's report is bounded, and the bound fails closed", () => {
+  const dense = (maxMatchesPerScan?: number) =>
+    deterministicDetector({
+      id: "pii.dense",
+      locales: ["en-GB"] as unknown as NonEmpty<string>,
+      searches: "a pattern that matches everywhere",
+      category: "personal-data",
+      severity: "redact",
+      ...(maxMatchesPerScan === undefined ? {} : { maxMatchesPerScan }),
+      patterns: [
+        safePattern({
+          rule: "dense",
+          match: /x/g,
+          confidenceBasisPoints: 5_000,
+          covers: "personal-data.name",
+        }),
+      ],
+    });
+
+  it("declares itself unavailable rather than reporting a partial redaction", async () => {
+    const h = harness({ detectorSets: sameAtEveryTier(setOf("dense", [dense(16)])) });
+    const screening = await h.guardrails.screenInput({
+      correlationId: CASE_A,
+      tier: "low",
+      payload: { narrative: "x".repeat(64) },
+    });
+
+    // The alternative — mask the first sixteen and write the other forty-eight
+    // into a seven-year archive under `recommend: "redact-and-allow"` — is the
+    // failure redaction exists to prevent. A screening that abstains is a
+    // working system saying it could not do the job.
+    expect(screening.recommended.recommend).toBe("abstain");
+    expect(screening.recommended).toMatchObject({
+      grounds: [{ ground: "detector-unavailable", reason: "declared" }],
+    });
+    expect(screening.payload.fields["narrative"]).toBe("x".repeat(64));
+    expect(screening.coverage.maskedSites).toBe(0);
+  });
+
+  it("still reports normally below the bound", async () => {
+    const h = harness({ detectorSets: sameAtEveryTier(setOf("dense", [dense(16)])) });
+    const screening = await h.guardrails.screenInput({
+      correlationId: CASE_A,
+      tier: "low",
+      payload: { narrative: "x-x" },
+    });
+    expect(screening.recommended.recommend).toBe("redact-and-allow");
+    expect(screening.payload.fields["narrative"]).toBe("[redacted]-[redacted]");
+  });
+
+  it("refuses a nonsensical bound at construction, not at screening time", () => {
+    expect(() => dense(0)).toThrow(LimitsInvalid);
+  });
+});
+
+describe("guardrails — grounds are bounded by the wiring, not by the payload", () => {
+  it("raises one ground per rule that fired, however many sites it fired at", async () => {
+    const many = deterministicDetector({
+      id: "content.blocked",
+      locales: ["en-GB"] as unknown as NonEmpty<string>,
+      searches: "a blocked word",
+      category: "prohibited-content",
+      severity: "block",
+      patterns: [
+        safePattern({
+          rule: "blocked.word",
+          match: /nope/g,
+          confidenceBasisPoints: 9_000,
+          covers: "prompt-injection.instruction-override",
+        }),
+      ],
+    });
+    const h = harness({ detectorSets: sameAtEveryTier(setOf("blocked", [many])) });
+
+    const screening = await h.guardrails.screenInput({
+      correlationId: CASE_A,
+      tier: "high",
+      payload: { narrative: "nope ".repeat(50) },
+    });
+
+    // Fifty sites, one rule, one ground. A ground carries no coordinates, so
+    // fifty copies of it were fifty identical objects on the returned screening
+    // and tens of kilobytes of `groundKinds` on the settled node — with a real
+    // chance of `audit` refusing the very node that explains the screening.
+    expect(screening.recommended.recommend).toBe("abstain");
+    expect(screening.recommended).toMatchObject({
+      grounds: [{ ground: "finding", rule: "blocked.word", severity: "block" }],
+    });
+    if (!("grounds" in screening.recommended)) throw new Error("expected grounds");
+    expect(screening.recommended.grounds).toHaveLength(1);
+    // Nothing observable was lost: every site is still a finding.
+    if (!("found" in screening.findings)) throw new Error("expected findings");
+    expect(screening.findings.found).toHaveLength(50);
   });
 });

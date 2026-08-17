@@ -207,7 +207,7 @@ is a guideline:
    that one true-or-false field. It cannot be omitted and there is no
    general-purpose "success" field to hide it in.
 2. **There is no resolution field anywhere in the library.** Not empty — absent,
-   across all 50,417 lines of source. Resolution needs a named outside evidence
+   across all 59,245 lines of source. Resolution needs a named outside evidence
    source and a waiting period, neither of which the library may invent on
    nineteen applications' behalf. The library refuses to record a figure it
    cannot stand behind rather than let each team make one up.

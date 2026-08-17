@@ -58,15 +58,18 @@ describe("audit — the store seam cannot be impersonated", () => {
     const nowhere = {
       openCase: async () => undefined,
       append: async (input: { readonly correlationId: CorrelationId }) => ({
-        id: "forged" as NodeId,
-        correlationId: input.correlationId,
-        sequence: 0,
-        at: 0,
-        tier: "high" as const,
-        payloadSchemaVersion: 1,
-        redaction: "none",
-        payload: { kind: "payment.authorised", v: 1 },
-        canonical: "",
+        node: {
+          id: "forged" as NodeId,
+          correlationId: input.correlationId,
+          sequence: 0,
+          at: 0,
+          tier: "high" as const,
+          payloadSchemaVersion: 1,
+          redaction: "none",
+          payload: { kind: "payment.authorised", v: 1 },
+          canonical: "",
+        },
+        deduplicated: false,
       }),
       closeCase: async () => {
         throw new Error("unreachable");
@@ -87,8 +90,8 @@ describe("audit — the store seam cannot be impersonated", () => {
     const frozen: TraceStore = {
       ...inner,
       async append(input) {
-        const node = await inner.append(input);
-        return { ...node, sequence: 0 };
+        const ack = await inner.append(input);
+        return { ...ack, node: { ...ack.node, sequence: 0 } };
       },
     };
     const { audit } = harness({ store: frozen });
@@ -183,6 +186,7 @@ describe("audit — the terminal node kind is reserved", () => {
         redaction: redactNothing.id,
         parent: undefined,
         telemetry: undefined,
+        idempotencyKey: undefined,
       }),
     ).rejects.toThrow(ReservedNodeKind);
   });

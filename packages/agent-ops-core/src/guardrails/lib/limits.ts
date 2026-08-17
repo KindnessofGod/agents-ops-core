@@ -27,10 +27,20 @@ import type { Limits } from "./types.js";
  *     `Pattern` cannot be built from a regular expression capable of exponential
  *     backtracking, and every detector is handed a `deadline` over the same
  *     injected clock which both shipped adapters check between units of work.
- *     What is left is a **polynomial** worst case for one accepted pattern over
- *     one field — on the order of `maxFieldChars²` character comparisons, which
- *     is the term to halve if a stall is ever measured. `lib/safe-pattern.ts`
- *     gives the full accounting; `lib/detectors.ts` gives the mechanism.
+ *     What is left **in process** is a worst case the analyser cannot put a
+ *     number on: `a*a*a*b` passes it, correctly by its own rules, and costs
+ *     hours over two thousand characters. So `preemptiveDetector` runs the
+ *     identical scan in a bounded worker pool and **terminates the thread** when
+ *     the budget is spent. That reverses a position this library previously
+ *     held; `lib/preemption.ts` names the reversal and states what the second
+ *     heap costs. `lib/safe-pattern.ts` gives the analyser's own accounting;
+ *     `lib/detectors.ts` gives the in-process mechanism.
+ *   - **A detector's finding list.** `maxMatchesPerScan` bounds how many sites
+ *     one detector may report, and past it the detector declares itself
+ *     unavailable rather than returning a partial list — because masking is
+ *     driven by what was reported, so a truncated report means an unmasked
+ *     payload in a seven-year archive under a screening that reads as a
+ *     successful redaction.
  *   - **A judge's model calls.** `maxClaims` bounds the count and the budget is
  *     now divided across them rather than discarded, so each call is asked for a
  *     bound. A classifier that ignores its `budgetMicros` is bounded by nothing

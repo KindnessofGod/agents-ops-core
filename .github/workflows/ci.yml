@@ -1,0 +1,258 @@
+# Continuous integration for agent-ops-core.
+#
+# Nineteen applications inherit whatever merges here. Until this file existed
+# there was no build at all: `npm run check` was a thing a human remembered to
+# run, and the Postgres guarantees at the centre of the library — append-only
+# grants, immutability triggers, the one-seal index — were exercised by nothing
+# anywhere, ever.
+#
+# Four jobs, and each answers a different question:
+#
+#   check              Does it typecheck, keep its module shape, keep its
+#                      vocabulary and pass every hermetic test — on Node 20 AND
+#                      Node 22? The package claims `engines.node: >=20`; a claim
+#                      tested on one version is a claim about one version.
+#   published-surface  Is the tarball the artefact the callers were promised?
+#   live-postgres      Does the SCHEMA refuse what it promises to refuse, in a
+#                      real Postgres 16? This job is the reason the workflow
+#                      exists.
+#   clone-to-running   Do the four commands in README.md work from a clean
+#                      checkout, with nothing warmed up?
+#
+# Two rules hold across all of them:
+#
+#   * `AGENT_OPS_LIVE_DATABASE_URL` is set in exactly ONE job. Everywhere else
+#     it is unset, which is what proves the hermetic path is still hermetic:
+#     `npm run check` must pass on a machine with no database and no network.
+#   * Nothing here is unbounded. Every job has `timeout-minutes`, the live
+#     suites run one file at a time, and superseded runs on a branch are
+#     cancelled rather than queued.
+
+name: check
+
+on:
+  push:
+  pull_request:
+
+# A second push to the same branch cancels the first. Unbounded queues are the
+# thing this repository refuses everywhere else; a build queue is no different.
+concurrency:
+  group: check-${{ github.ref }}
+  cancel-in-progress: true
+
+# Read-only. Nothing in this workflow writes to the repository, publishes a
+# package or touches a deployment, and the token should not be able to.
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. The whole check, on both supported Node versions, with NO database.
+  # ---------------------------------------------------------------------------
+  check:
+    name: check (node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      # Both versions always report. A failure on 22 that hides a failure on 20
+      # tells you least about the version most callers are pinned to.
+      fail-fast: false
+      matrix:
+        node: ["20", "22"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - run: npm ci
+
+      # `check` is: typecheck -> dependency-cruiser boundaries -> vocabulary
+      # lint -> every test. All four, in that order, as one command, so that
+      # what continuous integration runs and what a developer runs cannot drift.
+      #
+      # AGENT_OPS_LIVE_DATABASE_URL is deliberately NOT set here. Two reasons,
+      # and both matter:
+      #   1. This is the run that proves the library is hermetic — no network, no
+      #      database, no live model reachable with real credentials present.
+      #   2. `check` runs all test files in PARALLEL. Every live suite applies
+      #      all of ./migrations in its own beforeAll, so pointing them at one
+      #      shared database from here deadlocks in Postgres. See the
+      #      live-postgres job, which runs them one file at a time.
+      - run: npm run check
+
+  # ---------------------------------------------------------------------------
+  # 2. The published surface. What `npm install agent-ops-core` actually gets.
+  # ---------------------------------------------------------------------------
+  published-surface:
+    name: published surface
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - run: npm ci
+
+      # The checker reads the tarball npm would produce, not the working tree,
+      # because a file that exists on disk and is missing from the tarball is
+      # exactly the failure it hunts. The build has to run first: an unbuilt
+      # package publishes an empty one.
+      - run: npm run build
+
+      - run: npm run check:package
+
+  # ---------------------------------------------------------------------------
+  # 3. The schema's own guarantees, against a real Postgres 16.
+  #
+  # README.md item 5 said this: "The Postgres schema's own guarantees are not
+  # exercised by any test here… nothing runs it in continuous integration
+  # today." This job is what retires that sentence. A green run here means the
+  # UPDATE was refused, the DELETE was refused, the second seal lost to a partial
+  # unique index and the INSERT-only grants held — not that the suites were
+  # skipped, which is what `npm test` does on a machine with no database and is
+  # the false green `npm run test:live` refuses to produce.
+  # ---------------------------------------------------------------------------
+  live-postgres:
+    name: live postgres (node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ["20", "22"]
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          # Identical to docker-compose.yml, and secret from nobody: this is a
+          # throwaway database that exists for the length of one job. The suites
+          # refuse to run against a database holding cases they did not write.
+          POSTGRES_USER: agent_ops
+          POSTGRES_PASSWORD: agent_ops
+          POSTGRES_DB: agent_ops
+        ports:
+          - 5432:5432
+        # Bounded wait. Without this the first migration races the database's
+        # own start-up and fails for a reason that has nothing to do with the
+        # code under test.
+        options: >-
+          --health-cmd "pg_isready -U agent_ops -d agent_ops"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+
+    env:
+      # POSTGRES_USER is the superuser of the Postgres container above, so this
+      # connection OWNS the tables the migrations create and is a member of
+      # agent_ops_writer. Both are required, and for a specific reason: two of
+      # the audit cases turn the GRANTS out of the way (by running as the owner,
+      # whom grants do not bind) so that the immutability TRIGGER is the only
+      # thing left that can refuse the write. Without an owner connection those
+      # two cases would pass for the wrong reason.
+      AGENT_OPS_LIVE_DATABASE_URL: postgres://agent_ops:agent_ops@localhost:5432/agent_ops
+      AGENT_OPS_MIGRATE_DATABASE_URL: postgres://agent_ops:agent_ops@localhost:5432/agent_ops
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - run: npm ci
+
+      # docker-compose.yml applies ./migrations through
+      # /docker-entrypoint-initdb.d, which the container above does not have.
+      # This applies them in filename order and then asserts that every file
+      # recorded its own version in agent_ops.schema_migrations.
+      - name: apply ./migrations in filename order
+        run: npm run db:migrate
+
+      # Runs every <module>/tests/live-*.test.ts — discovered by readdir, not
+      # listed, so a live suite added tomorrow is picked up by this unchanged
+      # workflow — one file at a time, and FAILS if any of them skipped. A
+      # skipped grant test and a passing grant test look identical in a summary
+      # line and only one of them is evidence.
+      - name: exercise the append-only grants and triggers
+        run: npm run test:live
+
+      # `alerts` has no gated suite and will not get one: its
+      # tests/production.test.ts asserts structurally that NO file under
+      # alerts/tests/ reads an environment variable at all, and `alerts` is the
+      # module that can page a real engineer. Its live coverage lives outside
+      # the package instead — eight contract obligations, the restart proof, six
+      # schema attacks and seven concurrency checks against this container.
+      - name: exercise the alerts liveness table
+        run: npm run verify:liveness
+
+  # ---------------------------------------------------------------------------
+  # 4. The README's four commands, from a clean checkout, exactly as written.
+  #
+  # README.md says: clone, `npm install`, `npm run db:up`, `npm run check`. Not
+  # `npm ci`, not a warmed cache, not a database somebody already had running.
+  # This job runs those commands and nothing else, so that the claim on the
+  # front page is a tested claim rather than a remembered one.
+  # ---------------------------------------------------------------------------
+  clone-to-running:
+    name: clone to running (README four commands)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      # Command 1: `git clone`. A checkout is the same thing without the
+      # network round trip; no cache is configured anywhere in this job.
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      # Command 2.
+      - name: npm install
+        run: npm install
+
+      # Command 3. Postgres 16 on host port 5433 via docker compose, with
+      # ./migrations mounted at /docker-entrypoint-initdb.d and applied on first
+      # volume creation. `--wait` is inside the script.
+      - name: npm run db:up
+        run: npm run db:up
+
+      # The README claims db:up "applies everything in ./migrations in filename
+      # order the first time the volume is created". A container that started is
+      # not that claim. This asks the database.
+      - name: prove the migrations actually applied
+        run: |
+          set -euo pipefail
+          expected=$(ls migrations/*.sql | wc -l | tr -d ' ')
+          applied=$(docker compose exec -T postgres \
+            psql -U agent_ops -d agent_ops -tAc \
+            'SELECT count(*) FROM agent_ops.schema_migrations')
+          echo "migration files: $expected, versions recorded: $applied"
+          if [ "$expected" != "$applied" ]; then
+            echo "db:up did not apply every migration. README.md overstates it." >&2
+            docker compose logs postgres | tail -50 >&2
+            exit 1
+          fi
+
+      # Command 4. Deliberately WITHOUT AGENT_OPS_LIVE_DATABASE_URL, even though
+      # a database is now running two lines above: `npm test` needing no database
+      # is itself one of the guarantees, and the README says so ("Tests need no
+      # database and no network. `npm run db:up` is for running the system, not
+      # for `npm test`").
+      - name: npm run check
+        run: npm run check
+
+      - name: stop the database
+        if: always()
+        run: npm run db:down

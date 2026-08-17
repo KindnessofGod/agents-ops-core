@@ -8,8 +8,8 @@ Its figures are taken from the worked example shipped with the software and from
 the software's own test material, so that everything below can be checked. Every
 *mechanism* described — what is checked, in what order, what is written down,
 what happens when nobody answers — was verified against the source files on
-17 August 2026. On that date the type checker completed with no errors and 707
-automated tests across 76 files all passed, in 19.4 seconds. Judgements rather
+17 August 2026. On that date the type checker completed with no errors and 825
+automated tests across 87 files all passed, in about 25 seconds. Judgements rather
 than measurements are marked **(estimate)**.
 
 ---
@@ -349,7 +349,7 @@ Whether paying that invoice was the right thing to do.
 That is **resolution** — whether the party whose problem it was got what they
 were entitled to — and it is not knowable at the moment a case closes. It needs
 evidence from outside the system, gathered afterwards. So the library records
-none, and holds that line by having no such field at all across its 50,417 lines
+none, and holds that line by having no such field at all across its 59,245 lines
 of source.
 
 For an invoice, the business has all 3 evidence shapes available and should say

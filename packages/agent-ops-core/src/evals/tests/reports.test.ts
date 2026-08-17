@@ -53,15 +53,25 @@ const goldenRun = async (text: string): Promise<AccuracyReport> => {
 };
 
 describe("agreement is not accuracy, and the compiler enforces it", () => {
+  // A generous timeout, not a slow test. This case runs the TypeScript
+  // compiler in-process over a fixture; under `vitest`'s default parallelism
+  // several such cases compile at once and the 5s default is a coin flip on a
+  // loaded machine. A flaky gate is worse than a slow one — it teaches people
+  // to re-run rather than to read.
   it("compiles the disjointness fixture with exactly the expected errors", () => {
     // Zero diagnostics: every expected error is marked `@ts-expect-error`, and a
     // directive that stops being needed raises TS2578 and fails this test.
     expect(compileFixture("reports-are-disjoint.ts")).toEqual([]);
-  });
+  }, 30_000);
 
+  // A generous timeout, not a slow test. This case runs the TypeScript
+  // compiler in-process over a fixture; under `vitest`'s default parallelism
+  // several such cases compile at once and the 5s default is a coin flip on a
+  // loaded machine. A flaky gate is worse than a slow one — it teaches people
+  // to re-run rather than to read.
   it("compiles the capability and recorder-brand fixture with exactly the expected errors", () => {
     expect(compileFixture("subject-cannot-write.ts")).toEqual([]);
-  });
+  }, 30_000);
 
   it("derives the report type from the case source rather than the verb called", async () => {
     const report = await goldenRun("");

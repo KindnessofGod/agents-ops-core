@@ -20,7 +20,7 @@
  * than papered over with a regular expression that would catch nothing.
  */
 
-import { AlertPayloadInvalid, UnknownAlertCondition } from "./errors.js";
+import { AlertPayloadInvalid, LivenessBeatUnrecordable, UnknownAlertCondition } from "./errors.js";
 import { SEVERITY_BY_CONDITION, type AlertCondition } from "./conditions.js";
 import type { AlertPayload } from "./primitives.js";
 
@@ -74,5 +74,52 @@ export const assertRecordablePayload = (
       continue;
     }
     throw new AlertPayloadInvalid(field, `${typeof value} is not a recordable field type`);
+  }
+};
+
+/**
+ * The same two rules applied to the one write in this module that is not a
+ * payload: a beat.
+ *
+ * A liveness record is compared against an injected clock to decide whether a
+ * component is dead, so a fractional or unsafe instant makes that comparison
+ * meaningless — and rounding one silently is how a two-minute detection window
+ * quietly becomes something else. Kept here rather than in either store so both
+ * adapters enforce it identically; obligation 6 of `livenessStoreContract` is
+ * what proves they do.
+ */
+export const assertRecordableBeat = (
+  component: string,
+  at: number,
+  run: { readonly ran: "did-work"; readonly itemsProcessed: number } | { readonly ran: "nothing-was-due" },
+): void => {
+  if (!Number.isSafeInteger(at)) {
+    throw new LivenessBeatUnrecordable(component, "at", `not a safe integer: ${String(at)}`);
+  }
+  if (run.ran === "did-work" && (!Number.isSafeInteger(run.itemsProcessed) || run.itemsProcessed < 0)) {
+    throw new LivenessBeatUnrecordable(
+      component,
+      "itemsProcessed",
+      `not a non-negative safe integer: ${String(run.itemsProcessed)}`,
+    );
+  }
+};
+
+/** The same, for the terms a component is watched on. */
+export const assertRecordableWatch = (
+  component: string,
+  expectedEveryMs: number,
+  since: number,
+): void => {
+  if (!Number.isSafeInteger(expectedEveryMs) || expectedEveryMs <= 0) {
+    throw new LivenessBeatUnrecordable(
+      component,
+      "expectedEveryMs",
+      `not a positive safe integer: ${String(expectedEveryMs)} — a cadence of zero means every ` +
+        `component is permanently overdue`,
+    );
+  }
+  if (!Number.isSafeInteger(since)) {
+    throw new LivenessBeatUnrecordable(component, "since", `not a safe integer: ${String(since)}`);
   }
 };

@@ -6,9 +6,11 @@ import {
   ReservedNodeKind,
   TraceUnavailable,
 } from "./errors.js";
+import { assertSameAppend, assertUsableKey } from "./idempotency.js";
 import { SEAL_REDACTION, SEAL_TIER, isReservedKind, sealPayload } from "./seal.js";
 import { closedCaseDigest } from "./witness.js";
 import type {
+  AppendAck,
   AppendInput,
   CorrelationId,
   ExpiredCase,
@@ -107,6 +109,17 @@ export interface InMemoryTraceStore extends TraceStore, RetentionRegister {
 interface CaseState {
   readonly provenance: TraceProvenance;
   readonly nodes: RecordedNode[];
+  /**
+   * Idempotency key to the node written under it, for this case only.
+   *
+   * Per case rather than per store, matching the partial unique index in
+   * `migrations/0007_audit_idempotency.sql`: nineteen applications mint keys in
+   * nineteen namespaces, and a store-wide map would let one application's
+   * `"attempt-1"` return another application's node from another case. It is
+   * bounded by `maxNodesPerCase` for free, because it holds at most one entry
+   * per node.
+   */
+  readonly byIdempotencyKey: Map<string, RecordedNode>;
   /**
    * The sequence of the seal, once one exists. Not a status flag anybody can
    * flip: it is set inside the same critical section that appends the seal, and
@@ -224,7 +237,12 @@ export const inMemoryTraceStore = (
           if (cases.size >= maxCases) {
             throw new TraceUnavailable("capacity", correlationId);
           }
-          cases.set(correlationId, { provenance, nodes: [], sealedAt: undefined });
+          cases.set(correlationId, {
+            provenance,
+            nodes: [],
+            byIdempotencyKey: new Map(),
+            sealedAt: undefined,
+          });
           return;
         }
         // Reopening is idempotent only on an identical scope statement.
@@ -249,13 +267,29 @@ export const inMemoryTraceStore = (
       });
     },
 
-    async append(input: AppendInput) {
+    async append(input: AppendInput): Promise<AppendAck> {
       if (isReservedKind(input.payload.kind)) {
         throw new ReservedNodeKind(input.correlationId, input.payload.kind);
       }
-      return critical(input.correlationId, () =>
-        appendNode(
-          requireCase(input.correlationId),
+      assertUsableKey(input.correlationId, input.idempotencyKey);
+      // Invariant 8, and the lookup is **inside** the critical section on
+      // purpose. Checking the map before taking the mutex is a race, not a
+      // check: eight concurrent retries of one crashed append would all miss,
+      // all append, and produce the eight nodes deduplication exists to
+      // prevent. This is the in-memory equivalent of the Postgres adapter
+      // taking the per-case advisory lock before it looks.
+      return critical(input.correlationId, () => {
+        const state = requireCase(input.correlationId);
+        const key = input.idempotencyKey;
+        if (key !== undefined) {
+          const already = state.byIdempotencyKey.get(key);
+          if (already !== undefined) {
+            assertSameAppend(already, input, key);
+            return { node: already, deduplicated: true };
+          }
+        }
+        const node = appendNode(
+          state,
           input.correlationId,
           input.at,
           input.tier,
@@ -263,8 +297,10 @@ export const inMemoryTraceStore = (
           input.redaction,
           input.parent,
           input.telemetry,
-        ),
-      );
+        );
+        if (key !== undefined) state.byIdempotencyKey.set(key, node);
+        return { node, deduplicated: false };
+      });
     },
 
     async closeCase(

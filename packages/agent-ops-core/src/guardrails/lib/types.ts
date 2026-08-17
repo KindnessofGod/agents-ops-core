@@ -386,11 +386,15 @@ export type DetectorReport =
     };
 
 /**
- * The seam. Two adapters ship, both real:
+ * The seam. Three adapters ship, all real:
  *
  *   1. `deterministicDetector` — patterns and dictionaries, sub-millisecond, no
  *      I/O of any kind.
  *   2. `modelDetector` — a classifier behind an injected `Classifier`.
+ *   3. `preemptiveDetector` — the same patterns in a bounded worker pool, so a
+ *      runaway scan can be **stopped** rather than merely refused. Opt-in per
+ *      detector; see `lib/preemption.ts` for what still crosses into the second
+ *      heap and for the reversal it represents.
  *
  * Tier selects which set runs, because a model-based detector roughly doubles
  * decision latency and cost, and low-tier throughput dies without a cheap-only
@@ -434,8 +438,11 @@ export interface Detector {
    * What actually bounds the shipped deterministic adapter is two other things —
    * `Pattern` cannot be constructed from a regular expression capable of
    * exponential backtracking, and the scan checks `subject.deadline` between
-   * every pattern and every field. See `lib/safe-pattern.ts`, which also states
-   * the polynomial residue that remains and gives its bound.
+   * every pattern and every field. Neither can stop a scan already under way, so
+   * the only thing that genuinely preempts one is `preemptiveDetector`, which
+   * runs it in a worker thread the pool can terminate. See `lib/safe-pattern.ts`
+   * for what the analyser can and cannot prove, and `lib/preemption.ts` for the
+   * preemption itself.
    *
    * For an application-supplied detector the honest claim is narrower still: a
    * detector that awaits something can be raced, a detector that yields to its

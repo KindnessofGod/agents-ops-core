@@ -21,7 +21,12 @@ import { compileFixture } from "./typecheck.js";
  */
 
 describe("guardrails — what the types make unrepresentable", () => {
+  // A generous timeout, not a slow test. This case runs the TypeScript
+  // compiler in-process over a fixture; under `vitest`'s default parallelism
+  // several such cases compile at once and the 5s default is a coin flip on a
+  // loaded machine. A flaky gate is worse than a slow one — it teaches people
+  // to re-run rather than to read.
   it("compiles the fixture with no diagnostics, which is the assertion", () => {
     expect(compileFixture("unforgeable.ts")).toEqual([]);
-  });
+  }, 30_000);
 });

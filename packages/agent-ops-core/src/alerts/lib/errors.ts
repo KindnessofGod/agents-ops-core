@@ -185,3 +185,124 @@ export class LivenessTermsConflict extends AlertError {
     );
   }
 }
+
+/**
+ * The liveness store could not answer.
+ *
+ * **Fail-closed on both verbs, and the reason differs on each — which is the
+ * whole point of naming it.**
+ *
+ * On `watch` and `beat` the write is refused and the caller learns its beat was
+ * not recorded. That is the ordinary direction: a component that cannot record
+ * a beat is a component whose next check will read as overdue, which is an
+ * alert about a real fault rather than a fabricated all-clear.
+ *
+ * On `snapshot` the read is refused **rather than returning an empty list**, and
+ * that is the decision worth stating. An empty snapshot is indistinguishable
+ * from "nothing is watched": `livenessFindings([], now, tolerance)` returns no
+ * findings, a watcher reads no findings as all-clear, and the failure of the
+ * store becomes silence that looks like health. That is precisely the shape of
+ * failure this module exists to find, arriving through the module itself. So a
+ * failed read rejects, the external watcher sees the query stop answering, and
+ * `external-watchdog.ts` requirement 3 — *alert if the query itself stops
+ * answering* — is what catches it. No answer is the loudest answer there is.
+ *
+ * Not degradable. There is no partial answer a caller could safely act on: half
+ * a snapshot read as a whole one is a component silently unmonitored.
+ */
+export class LivenessStoreUnavailable extends AlertError {
+  override readonly name = "LivenessStoreUnavailable";
+  override readonly degradable = false;
+  constructor(
+    readonly reason:
+      /** The store adapter itself failed — connection, timeout, driver fault. */
+      | "store-failure"
+      /** The bounded write queue is full. Shed rather than grow without limit. */
+      | "backpressure"
+      /** More watched components exist than one snapshot may return. */
+      | "capacity",
+    readonly detail: string,
+    options?: { readonly cause?: unknown },
+  ) {
+    super(`liveness store unavailable (${reason}): ${detail}`, options);
+  }
+}
+
+/**
+ * A stored liveness row does not decode to a `LivenessRecord`.
+ *
+ * A `bigint` column that came back as `NaN`, a beat count that is not a safe
+ * integer, a `did-work` run with no item count beside it, a run kind outside the
+ * union. Every one of these is either a schema that has drifted from this
+ * adapter or a row edited by hand.
+ *
+ * **Fail-closed, not degradable, and deliberately not "skip the bad row".**
+ * Dropping an undecodable row from a snapshot removes a *watched component*
+ * from the watcher's view, which is the one outcome worse than an error: the
+ * component stops being monitored and nothing says so. Coercing it is worse
+ * again — a fabricated `lastSeen` reads as a live component. So the read fails
+ * whole, loudly, naming the component and the column.
+ */
+export class LivenessRecordCorrupt extends AlertError {
+  override readonly name = "LivenessRecordCorrupt";
+  override readonly degradable = false;
+  constructor(
+    readonly component: string,
+    readonly column: string,
+    readonly detail: string,
+  ) {
+    super(`liveness row for ${component} is not decodable at column ${column}: ${detail}`);
+  }
+}
+
+/**
+ * A beat offered a value that cannot be recorded byte-stably: a fractional
+ * instant, an unsafe integer, a `NaN`, an infinity, a negative item count.
+ *
+ * **Fail-closed, not degradable.** This is `AlertPayloadInvalid`'s reasoning
+ * applied to the one write in this module that is not a payload. A liveness
+ * record is compared against an injected clock to decide whether a component is
+ * dead; a fractional or unsafe instant makes that comparison meaningless, and
+ * rounding one silently is how a two-minute detection window quietly becomes
+ * something else. Every store adapter owes this check — see
+ * `livenessStoreContract` obligation 6 — so that an application cannot discover
+ * the difference by swapping adapters.
+ */
+export class LivenessBeatUnrecordable extends AlertError {
+  override readonly name = "LivenessBeatUnrecordable";
+  override readonly degradable = false;
+  constructor(
+    readonly component: string,
+    readonly field: string,
+    readonly detail: string,
+  ) {
+    super(`beat for ${component} is not recordable at ${field}: ${detail}`);
+  }
+}
+
+/**
+ * The journal was handed an entry it cannot record as a node without losing or
+ * overwriting evidence.
+ *
+ * Raised by `auditBackedAlertJournal` when a condition's payload already owns a
+ * field name the journal must add — `alerted`, `alertBy`, `alertSeverity` — so
+ * that merging the two would silently replace one with the other.
+ *
+ * **Fail-closed, not degradable, and it never loses the alert.** `createAlerts`
+ * walks the sink chain *before* it journals and catches every rejection out of
+ * `record`, so this surfaces as `journalled: false, why: "journal-failed"` on an
+ * outcome that still says `delivered`. The alert reached a human; the node did
+ * not get written; both facts are visible. Silently overwriting a payload field
+ * would give an auditor in 2033 a node that says something the condition never
+ * said.
+ */
+export class AlertJournalEntryUnrecordable extends AlertError {
+  override readonly name = "AlertJournalEntryUnrecordable";
+  override readonly degradable = false;
+  constructor(
+    readonly field: string,
+    readonly detail: string,
+  ) {
+    super(`alert journal entry cannot be recorded as a node at ${field}: ${detail}`);
+  }
+}

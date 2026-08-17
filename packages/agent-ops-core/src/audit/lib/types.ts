@@ -272,10 +272,22 @@ export interface ReplayedCase {
   verify(expected: TraceDigest): boolean;
 }
 
-/** A node that was written. */
+/** A node that was written — or, on a deduplicated retry, one that already was. */
 export interface Recorded {
   readonly recorded: true;
   readonly node: RecordedNode;
+  /**
+   * True where this call wrote nothing because an earlier append under the same
+   * `idempotencyKey` already existed on this case, and `node` is that earlier
+   * node.
+   *
+   * A caller is entitled to know the difference. "Your node is in the trace" and
+   * "your node was already in the trace, from the attempt that crashed" are the
+   * same outcome and different stories, and a library that reported only the
+   * first would be hiding a retry from the one place that exists to record what
+   * happened. Always `false` where no key was supplied.
+   */
+  readonly deduplicated: boolean;
 }
 
 /**
@@ -322,6 +334,23 @@ export interface RecordOptions<T extends RiskTier> {
   readonly parent?: RecordedNode;
   /** Present where this node measured a model call. See `NodeTelemetry`. */
   readonly telemetry?: NodeTelemetry;
+  /**
+   * Opt-in. Names *this* append, so a crash-retry returns the first node rather
+   * than appending a second beside it.
+   *
+   * Optional rather than required, because most appends happen inside something
+   * that either happened or did not and inventing a key for them would be
+   * ceremony. Where it is supplied, reusing it on this case with a **different**
+   * payload, tier, parent or telemetry is `IdempotencyKeyConflict` and not a
+   * silent return of the first node — a caller who reused a key by mistake must
+   * not have their second event quietly disappear.
+   *
+   * The key is never written into the canonical bytes and never reaches a
+   * digest: it is a fact about how a node came to be written, not about what
+   * happened. It is also caller data, so it must carry no personal data — the
+   * same rule the payload is under, and nothing redacts it.
+   */
+  readonly idempotencyKey?: string;
 }
 
 /** Why the store could not take a write. Every value is a named error mode. */
@@ -381,6 +410,17 @@ export interface Redactor {
   apply(payload: NodePayload): NodePayload;
 }
 
+/**
+ * Ceiling on an idempotency key, in characters.
+ *
+ * Bounded here **and** by a check constraint in
+ * `migrations/0007_audit_idempotency.sql`, on the same reasoning as the
+ * append-only guarantee: a bound the writer holds alone is a bound a `psql`
+ * prompt does not have. 200 characters is a generous three identifiers joined
+ * by separators and is not a place to put a payload.
+ */
+export const MAX_IDEMPOTENCY_KEY_CHARS = 200;
+
 /** Everything a store needs to append one node. Redaction has already run. */
 export interface AppendInput {
   readonly correlationId: CorrelationId;
@@ -391,6 +431,38 @@ export interface AppendInput {
   readonly redaction: RedactionId;
   readonly parent: NodeId | undefined;
   readonly telemetry: NodeTelemetry | undefined;
+  /**
+   * The caller's name for this append, or `undefined`.
+   *
+   * Where present, a store that has already accepted this key **on this case**
+   * writes nothing and returns the node it wrote the first time. Where absent,
+   * the append is an append: this module derives no key from content, because
+   * two identical payloads in one case can be two real events and collapsing
+   * them would lose one.
+   *
+   * Bounded by `MAX_IDEMPOTENCY_KEY_CHARS`, non-empty. See
+   * `IdempotencyKeyUnusable`.
+   */
+  readonly idempotencyKey: string | undefined;
+}
+
+/**
+ * What a store hands back from `append`.
+ *
+ * `deduplicated` is a separate field rather than something inferred from the
+ * node, because every honest way of inferring it is wrong somewhere. Comparing
+ * clock readings fails when a retry lands inside the same millisecond;
+ * comparing sequences fails after a restart, when the writer has no memory of
+ * what it asked for. Only the store knows whether it wrote a row, so the store
+ * says so.
+ */
+export interface AppendAck {
+  readonly node: RecordedNode;
+  /**
+   * True where an earlier node under the same idempotency key was returned and
+   * **nothing was written**. Always false for a keyless append.
+   */
+  readonly deduplicated: boolean;
 }
 
 /**
@@ -450,6 +522,14 @@ declare const traceStoreBrand: unique symbol;
  *      `StoreContractViolated`, because a streaming reader that trusted an
  *      unordered page would compute a digest over an order the store never
  *      assigned.
+ *   8. An **idempotency key deduplicates within one case**, inside the same
+ *      critical section that writes. A key already accepted on this case returns
+ *      the first node with `deduplicated: true` and writes nothing; the same key
+ *      offered with a different payload, tier, parent or telemetry raises
+ *      `IdempotencyKeyConflict` rather than returning the first node, because a
+ *      caller who reused a key by mistake must not have their second event
+ *      silently disappear. A check outside the critical section is a race, not a
+ *      check: two concurrent retries must produce one node, not two.
  */
 export interface TraceStore {
   readonly [traceStoreBrand]: true;
@@ -458,7 +538,7 @@ export interface TraceStore {
    * a contradictory one. Writes the case-level provenance once.
    */
   openCase(correlationId: CorrelationId, provenance: TraceProvenance): Promise<void>;
-  append(input: AppendInput): Promise<RecordedNode>;
+  append(input: AppendInput): Promise<AppendAck>;
   /** Atomic seal-and-close. Returns the terminal seal node. */
   closeCase(
     correlationId: CorrelationId,
@@ -708,13 +788,14 @@ export interface RetentionRegister {
  * amend. The guarantee is the shape of this interface, and the database grants
  * carry the other half of it.
  *
- * **Not idempotent, and it says so.** A repeated `record` after a crash writes
- * a second node rather than returning the first: the trace is append-only
- * evidence, and two appends genuinely happened. C2's at-most-once requirement
- * is about *effects*, which `approval` owns; a duplicated node costs a row and
- * is visible on replay, where a duplicated payment is a clawback. Deduplicating
- * appends needs a key column and a partial unique index this migration does not
- * have — see the note in `index.ts`.
+ * **Idempotent where the caller names the append, and nowhere else.** Supply
+ * `RecordOptions.idempotencyKey` and a retry after a crash returns the first
+ * node with `deduplicated: true`, writing nothing — enforced by a partial unique
+ * index in `migrations/0007_audit_idempotency.sql` rather than by a cache the
+ * writer forgets on restart. Supply no key and an append is an append: this
+ * module derives no key from content, because two identical payloads in one case
+ * can be two real events. C2's at-most-once requirement is still about
+ * *effects*, which `approval` owns.
  */
 export interface CaseTrace {
   readonly correlationId: CorrelationId;
@@ -780,7 +861,43 @@ export interface AuditDeps {
   readonly alerting?: import("../../alerts/index.js").AlertRaiser | undefined;
 }
 
+/**
+ * The brand on `Audit`, on exactly the reasoning behind `TraceStore`'s and
+ * `Witness`'s — and the last of the three to be minted, which is why
+ * `README.md` item 8 called `Audit` "the one unbranded witness".
+ *
+ * The attack it stops is four lines long and was, until now, well-typed:
+ *
+ * ```ts
+ * const audit: Audit = {
+ *   open: async () => ({ correlationId, record: async () => ({ recorded: true, node, deduplicated: false }), close: async () => node }),
+ *   replay: async () => emptyCase,
+ *   walk: ..., witness: ..., verifyAgainstWitness: ...,
+ * };
+ * ```
+ *
+ * It acknowledges every write, persists nothing, and satisfies a structural
+ * `Audit` completely. `guardrails` compensates at runtime — it checks every
+ * acknowledgement and proves its first node by replay, and raises
+ * `AuditWitnessUnsound` — but a module that must re-read its own writes to find
+ * out whether its recorder is real is paying for a hole in a type. The brand
+ * closes it: `declare const` means the symbol exists only in the type system,
+ * `index.ts` does not export it, and `lib/` is private to dependency-cruiser, so
+ * the object above no longer typechecks anywhere outside this module.
+ *
+ * **The limits, stated exactly, and they are the same two as `TraceStore`'s.**
+ * `as unknown as Audit` compiles in any TypeScript, and spreading a real audit
+ * into a decorator copies the brand along with the verbs — deliberately, because
+ * a delegating wrapper is a legitimate thing to build. Neither is a regression:
+ * `guardrails`' runtime checks stay exactly where they are, and they are what
+ * catches both. What the brand removes is the *accident* — the fully-typed
+ * object literal a composition root writes in a hurry and nothing complains
+ * about.
+ */
+declare const auditBrand: unique symbol;
+
 export interface Audit {
+  readonly [auditBrand]: true;
   open(correlationId: CorrelationId): Promise<CaseTrace>;
   /**
    * The whole case, materialised, with the graph indexed. The common path: a
@@ -823,3 +940,12 @@ export interface Audit {
     limits?: Partial<WalkLimits>,
   ): Promise<WitnessVerdict>;
 }
+
+/**
+ * Mints the `Audit` brand. Called in exactly one place — `createAudit` — which
+ * is the whole point: "who is allowed to be an `Audit`" is one grep away, and
+ * the answer is "the factory that wires a real store, a real clock and a real
+ * redactor".
+ */
+export const asAudit = (impl: Omit<Audit, typeof auditBrand>): Audit =>
+  impl as Audit;

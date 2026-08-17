@@ -10,6 +10,7 @@ import {
   TraceTampered,
   TraceUnavailable,
 } from "./errors.js";
+import { assertSameAppend, assertUsableKey } from "./idempotency.js";
 import {
   SEAL_REDACTION,
   SEAL_TIER,
@@ -19,6 +20,7 @@ import {
 } from "./seal.js";
 import type { SqlExecutor, SqlRow } from "./sql.js";
 import type {
+  AppendAck,
   AppendInput,
   CorrelationId,
   NodeId,
@@ -162,8 +164,25 @@ WHERE correlation_id = $1`,
   append: `-- audit:append
 INSERT INTO ${NODE}
   (correlation_id, sequence, node_id, at_ms, tier, parent_sequence,
-   payload_schema_version, redaction, kind, payload_canonical, node_canonical, is_seal)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+   payload_schema_version, redaction, kind, payload_canonical, node_canonical,
+   is_seal, idempotency_key)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
+
+  /**
+   * The deduplication lookup. Run under the per-case advisory lock, so it and
+   * the insert that may follow it are one critical section — a lookup outside
+   * the lock is a race, not a check, and two concurrent retries would both miss
+   * and both append.
+   *
+   * It is an index-only probe of `audit_trace_node_idempotency`, the partial
+   * unique index from `migrations/0007_audit_idempotency.sql`, so a case with a
+   * hundred thousand keyless nodes costs nothing here.
+   */
+  readByIdempotencyKey: `-- audit:read-by-idempotency-key
+SELECT sequence, node_id, at_ms, tier, parent_sequence,
+       payload_schema_version, redaction, kind, payload_canonical, node_canonical, is_seal
+FROM ${NODE}
+WHERE correlation_id = $1 AND idempotency_key = $2`,
 
   readCase: `-- audit:read-case
 SELECT captured_via, canonical_form, redaction, opened_at_ms
@@ -373,6 +392,7 @@ export const postgresTraceStore = (
     redaction: RedactionId,
     parent: NodeId | undefined,
     telemetry: NodeTelemetry | undefined,
+    idempotencyKey: string | undefined,
   ): Promise<RecordedNode> => {
     const skeleton = {
       id: `${correlationId}#${sequence}` as NodeId,
@@ -413,16 +433,37 @@ export const postgresTraceStore = (
       canonicalPayloadForm(payload),
       node.canonical,
       isSealNode(node),
+      // NULL rather than an empty string where there is no key: the partial
+      // unique index covers `idempotency_key IS NOT NULL` only, so a keyless
+      // node is not in the index at all and collides with nothing.
+      idempotencyKey ?? null,
     ]);
 
     return node;
   };
 
+  /**
+   * The per-case advisory lock, taken on its own.
+   *
+   * Split out from `claimSequence` because the idempotency lookup must happen
+   * under the same lock as the insert that may follow it, and **before** the
+   * closure check: a retry of an append that already succeeded must return the
+   * first node even if the case has since been sealed. Raising
+   * `CaseAlreadyClosed` there would refuse work that is already done and already
+   * in the trace, and would put this adapter at odds with the in-memory one.
+   */
+  const lockCase = async (
+    tx: SqlExecutor,
+    correlationId: CorrelationId,
+  ): Promise<void> => {
+    await tx.query(SQL.lock, [correlationId]);
+  };
+
+  /** Callers take `lockCase` first. Split so the lock is taken exactly once. */
   const claimSequence = async (
     tx: SqlExecutor,
     correlationId: CorrelationId,
   ): Promise<number> => {
-    await tx.query(SQL.lock, [correlationId]);
     const { rows } = await tx.query(SQL.nextSequence, [correlationId]);
     const row = rows[0];
     if (row === undefined) {
@@ -434,6 +475,31 @@ export const postgresTraceStore = (
       throw new TraceUnavailable("capacity", correlationId);
     }
     return next;
+  };
+
+  /**
+   * The node already written under this key on this case, if any.
+   *
+   * At most one row: the partial unique index makes a second impossible. A
+   * second row here would mean the index is missing — migration 0007 not
+   * applied — and that is reported as a broken contract rather than silently
+   * picking one, because "the deduplication index is not there" and "your retry
+   * was deduplicated" must never be the same answer.
+   */
+  const readByIdempotencyKey = async (
+    tx: SqlExecutor,
+    correlationId: CorrelationId,
+    key: string,
+  ): Promise<RecordedNode | undefined> => {
+    const { rows } = await tx.query(SQL.readByIdempotencyKey, [correlationId, key]);
+    if (rows.length === 0) return undefined;
+    if (rows.length > 1) {
+      throw new StoreContractViolated(
+        correlationId,
+        `idempotency key matched ${rows.length} nodes, so the partial unique index from migrations/0007_audit_idempotency.sql is not in place`,
+      );
+    }
+    return rowToNode(rows[0] as SqlRow, correlationId);
   };
 
   const readNodes = async (
@@ -505,7 +571,7 @@ export const postgresTraceStore = (
       }
     },
 
-    async append(input: AppendInput) {
+    async append(input: AppendInput): Promise<AppendAck> {
       if (isReservedKind(input.payload.kind)) {
         // Invariant 6. `is_seal` is written from this string, so an unreserved
         // kind let a caller set the column and brick the case at its first node.
@@ -514,11 +580,27 @@ export const postgresTraceStore = (
       if (input.parent !== undefined) {
         parentSequenceOf(input.parent, input.correlationId);
       }
+      assertUsableKey(input.correlationId, input.idempotencyKey);
       return bounded(input.correlationId, async () => {
         try {
           return await sql.transaction(async (tx) => {
+            // The lock first, then the deduplication lookup, then the sequence.
+            // All three inside one transaction, which is what makes eight
+            // concurrent retries of one crashed append produce one node: the
+            // seven that lose the lock find the winner's row when they get it.
+            await lockCase(tx, input.correlationId);
+
+            const key = input.idempotencyKey;
+            if (key !== undefined) {
+              const already = await readByIdempotencyKey(tx, input.correlationId, key);
+              if (already !== undefined) {
+                assertSameAppend(already, input, key);
+                return { node: already, deduplicated: true };
+              }
+            }
+
             const sequence = await claimSequence(tx, input.correlationId);
-            return insertNode(
+            const node = await insertNode(
               tx,
               input.correlationId,
               sequence,
@@ -528,7 +610,9 @@ export const postgresTraceStore = (
               input.redaction,
               input.parent,
               input.telemetry,
+              key,
             );
+            return { node, deduplicated: false };
           });
         } catch (error) {
           return asStoreError(error, input.correlationId);
@@ -548,6 +632,7 @@ export const postgresTraceStore = (
             // no node can land between computing the digest and writing it. A
             // seal that attests to a trace which is not the trace is worse than
             // no seal at all.
+            await lockCase(tx, correlationId);
             const sequence = await claimSequence(tx, correlationId);
             const existing = await readNodes(tx, correlationId);
             const provenance = await readProvenance(tx, correlationId);
@@ -564,6 +649,11 @@ export const postgresTraceStore = (
               sealPayload(outcome, existing, provenance),
               SEAL_REDACTION,
               undefined,
+              undefined,
+              // A seal never carries an idempotency key. Closing twice is
+              // refused by the one-seal partial unique index and by the sealed
+              // check above; making it idempotent instead would let a second
+              // close report success for a seal it did not write.
               undefined,
             );
           });

@@ -72,9 +72,15 @@
  *                  instead, because claiming a search nobody ran is worse than
  *                  admitting none happened.
  *   Rate watch.    The eighth silent condition — **the fail-closed screening
- *                  rate moving sharply** — is the only one this module can see,
- *                  and it is a property of a window rather than of a payload:
- *                  *"every individual case behaved exactly as designed."* Wired
+ *                  rate moving sharply** — is the only *measure* of it this
+ *                  module can see. The condition declares two, and the other is
+ *                  the abstention rate, which belongs to `approval`: an
+ *                  abstention is a verdict disposition and this module produces
+ *                  no verdict. The reusable shape `approval` must call is
+ *                  exported here as `createRateWatch`, so the library holds one
+ *                  definition of "moved sharply" rather than two. It is a
+ *                  property of a window rather than of a payload: *"every
+ *                  individual case behaved exactly as designed."* Wired
  *                  through `GuardrailsDeps.rateAlerting`, as one object with its
  *                  raiser so a window with nowhere to raise cannot be built.
  *                  Deliberately **not** written as a node: a movement over a
@@ -85,7 +91,11 @@
  *   Clock.         Injected. No `Date.now()` in this module, ever. So is the
  *                  timer that bounds a detector's budget.
  *   Bounds.        Bounded fan-out, bounded payload, bounded finding list,
- *                  bounded budget per detector — and **no retries at all**. A
+ *                  bounded budget per detector, bounded **sites per detector**
+ *                  (`maxMatchesPerScan`, which fails closed rather than reporting
+ *                  a partial redaction), and — where preemption is wired — a
+ *                  bounded worker pool with a bounded queue, a bounded heap and a
+ *                  bounded worker lifetime. And **no retries at all**. A
  *                  caller who wants a second attempt re-screens with the first
  *                  `Screening` as `under`, so the retry is a visible node with a
  *                  recorded parent rather than a hidden one. Every `Limits`
@@ -142,24 +152,33 @@
  * 2. Nothing here can see effects, so "before any effect" is enforced only as
  *    far as `checkOutput` requiring an **input** `Screening` — the effect side
  *    of the ordering belongs to `approval`.
- * 3. **The recording witness is caller-supplied and unbranded.**
- *    `GuardrailsDeps.audit` names `Audit`, a structural interface: a fully-typed
- *    object that acknowledges every write and persists nothing satisfies it, and
- *    a caller holding one used to receive a real branded `Screening` over zero
- *    persisted bytes. `docs/design/OPEN-ITEMS-RESOLVED.md` §1 resolved exactly
- *    this by branding the recorder with a symbol only `audit`'s own constructors
- *    can mint — and the brand landed on `TraceStore`, one layer below this
- *    module, and on `Screening`, one layer above, but not on `Audit`.
+ * 3. **The recording witness is caller-supplied. It is now branded; that closes
+ *    the structural half and not the behavioural half.**
+ *    `GuardrailsDeps.audit` names `Audit`, which *used* to be a purely
+ *    structural interface: a fully-typed object that acknowledged every write
+ *    and persisted nothing satisfied it, and a caller holding one received a
+ *    real branded `Screening` over zero persisted bytes.
+ *    `docs/design/OPEN-ITEMS-RESOLVED.md` §1 resolved that for `TraceStore`,
+ *    one layer below this module, and for `Screening`, one layer above — but
+ *    not for `Audit`, and this passage used to report a brand on `Audit` upward
+ *    as the real fix.
  *
- *    What this module does about it, since the brand is `audit`'s to mint:
- *    every acknowledgement is checked against what was asked for, and the first
- *    node of each case is **proven by replay** before any detector runs —
- *    `audit`'s own doctrine that replay is the proof of a write. A two-line
- *    impostor fails. A witness that maintains a coherent in-memory trace and
- *    writes no bytes still passes, exactly as `audit` says of its own store
- *    contract check, so the scope is stamped onto every opened node as
- *    `capturedVia: "caller-supplied-audit-witness"` rather than asserted here.
- *    **A brand on `Audit` is reported upward as the real fix.**
+ *    **That fix has landed.** `Audit` now carries a non-exported `unique
+ *    symbol` minted only by `createAudit`, so a hand-built impostor no longer
+ *    typechecks and the two-line forgery is unrepresentable rather than merely
+ *    detected. The sentence claiming otherwise was true when written and is not
+ *    true now; it is named here rather than quietly deleted.
+ *
+ *    What the brand does **not** buy, and why the checks below stay: a brand
+ *    proves the object came from `createAudit`, not that the `TraceStore`
+ *    underneath it persists anything. A real `Audit` over a store that keeps a
+ *    coherent trace in memory and writes no bytes is still a witness that can
+ *    say `recorded: true` over an empty database. So every acknowledgement is
+ *    still checked against what was asked for, and the first node of each case
+ *    is still **proven by replay** before any detector runs — `audit`'s own
+ *    doctrine that replay is the proof of a write. The scope stays stamped onto
+ *    every opened node as `capturedVia: "caller-supplied-audit-witness"` rather
+ *    than asserted here.
  *
  * The honest claim is *unrepresentable through `guardrails`, against a witness
  * that persists*, not *unrepresentable*.
@@ -190,15 +209,25 @@
  *      what bounds the aggregate: a pack of twelve patterns over sixty-four
  *      fields cannot compound one slow scan into a slow screening.
  *
- * **What remains possible.** An accepted pattern can still be polynomial, so one
- * (pattern, field) scan can cost on the order of `maxFieldChars²` character
- * comparisons — roughly a second of one core at the default — and nothing in
- * this runtime can preempt it. That is a stall, it is bounded, and the bound is
- * computable from `Limits`. A caller-supplied detector that neither awaits nor
- * reads its deadline is bounded by nothing this module can offer; its *answer*
- * is still refused on time. True preemption needs a worker thread, and
- * `lib/safe-pattern.ts` states why serialising an unredacted payload into a
- * second heap is the wrong trade for closing a bounded stall.
+ *   4. **A scan can be preempted outright**, by running it in a bounded worker
+ *      pool that terminates the thread. `preemptiveDetector`, opt-in per
+ *      detector, and this is the reversal of a position the module previously
+ *      held — `lib/preemption.ts` and `lib/safe-pattern.ts` both say so and give
+ *      the reason the old argument's premise was wrong. It is what actually
+ *      closes the residual below.
+ *
+ * **What remains possible, and where.** In the **in-process** adapter an
+ * accepted pattern can still be far worse than linear — `a*a*a*b` passes this
+ * analyser, correctly by its own rules, and costs hours over two thousand
+ * characters — and nothing in this runtime can preempt a scan already under way.
+ * That is why `preemptiveDetector` exists and why it is the right choice for a
+ * field carrying caller-controlled free text at length. It is not the default,
+ * because a worker round trip against a pattern that finishes in a microsecond
+ * is absurd overhead, and because the caller's text lives in a second heap for
+ * the duration of the scan — a residue `lib/preemption.ts` states in full rather
+ * than asserting away. A caller-supplied detector that neither awaits, nor reads
+ * its deadline, nor runs in a pool is bounded by nothing this module can offer;
+ * its *answer* is still refused on time.
  *
  * ## The residual risk, because it is a conversation and not a footnote
  *
@@ -251,9 +280,15 @@
  * C5: one adapter is a hypothetical seam, two is a real one. Counted straight,
  * including where the count is zero:
  *
- *   - **`Detector` — a real seam.** Two shipped adapters with genuinely
- *     different bodies: `deterministicDetector` (patterns, no I/O) and
- *     `modelDetector` (a classifier behind an injected port).
+ *   - **`Detector` — a real seam.** Three shipped adapters with genuinely
+ *     different bodies: `deterministicDetector` (patterns, no I/O),
+ *     `modelDetector` (a classifier behind an injected port) and
+ *     `preemptiveDetector` (the same patterns in a bounded worker pool). The
+ *     seam was already real at two; the third is counted straight because its
+ *     failure modes — saturation, preemption, worker death — do not exist in the
+ *     first and cannot be produced by it. `ScanPool` beneath it is **not** a
+ *     seam: one construction, no second named, a bounded resource rather than a
+ *     place behaviour is meant to vary.
  *
  *     `personalDataDetector` and `promptInjectionDetector` are **not** a third
  *     and fourth adapter, and counting them would be exactly the fudge C5
@@ -346,13 +381,53 @@ export { createGuardrails } from "./lib/guardrails.js";
 export { localeOf } from "./lib/locale.js";
 export { DEFAULT_LIMITS } from "./lib/limits.js";
 
-/** Detector adapters. Two, which is what makes `Detector` a real seam. */
-export { deterministicDetector, modelDetector } from "./lib/detectors.js";
+/** Detector adapters. Three, and the seam was already real at two. */
+export {
+  DEFAULT_MAX_MATCHES_PER_SCAN,
+  deterministicDetector,
+  modelDetector,
+} from "./lib/detectors.js";
 export type {
   DeterministicDetectorSpec,
   ModelDetectorSpec,
   Pattern,
 } from "./lib/detectors.js";
+
+/**
+ * Adapter 3, and the reversal named: **a runaway detector can now actually be
+ * stopped.**
+ *
+ * `lib/safe-pattern.ts` argued that a worker thread was the wrong trade for the
+ * polynomial residue — copying an unredacted payload into a second heap to bound
+ * a stall that was already bounded. That position is reversed and
+ * `lib/preemption.ts` says why at length: the stall was **not** bounded in any
+ * sense an operator could act on, because the analyser cannot prove a pattern
+ * linear and `a*a*a*b` — no backreference, no alternation, no quantified group,
+ * accepted by the analyser exactly as its own rules say — costs hours over two
+ * thousand characters.
+ *
+ * What the old objection buys is the shape rather than the decision. Preemption
+ * is **opt-in per detector**, because a worker round trip against a pattern that
+ * finishes in a microsecond is absurd overhead; it runs in a **bounded pool**
+ * with a hard ceiling on threads, a bounded queue, a bounded heap per worker and
+ * a bounded number of tasks before one is retired; and the timeout **terminates
+ * the thread** rather than rejecting a promise while it spins. Every failure is
+ * fail-closed and every one is named — see `ScanFailure` and the header of
+ * `lib/preemption.ts`, which also states plainly what still crosses into the
+ * second heap and for how long.
+ *
+ * `ScanPool` is **not a seam**: one construction, no second named, and the tests
+ * use the real thing because a worker thread is local — there is no live model,
+ * no database and no pager for it to reach.
+ */
+export { preemptiveDetector, preemptiveScanPool } from "./lib/preemption.js";
+export type {
+  PreemptiveDetectorSpec,
+  ScanFailure,
+  ScanPool,
+  ScanPoolSpec,
+  ScanPoolStats,
+} from "./lib/preemption.js";
 
 /**
  * The only mint for a `Pattern`, and the reason a runaway regular expression is
@@ -441,6 +516,7 @@ export {
   LocaleUnsupported,
   OutputCheckOutOfOrder,
   PatternUnsafe,
+  ScanPoolInvalid,
   ScreeningLimitExceeded,
   ScreeningNotRecorded,
   ScreeningParentUnknown,
@@ -465,3 +541,30 @@ export {
  */
 export { isFailClosed } from "./lib/rate-watch.js";
 export type { RateAlerting } from "./lib/rate-watch.js";
+
+/**
+ * The rate-watch shape itself, exported because the **other half** of the eighth
+ * silent condition cannot be built here.
+ *
+ * `AlertCondition.measure` declares `abstention` **or** `fail-closed-screening`.
+ * Only the second was ever produced. The first is not merely unwritten here — it
+ * is unwritable here: per `docs/CONTEXT.md` an abstention is a *verdict
+ * disposition*, and this module produces no verdict. A screening that recommends
+ * `abstain` is a recommendation, the decision may go either way, and counting
+ * recommendations under the name "abstention rate" would put a number in front
+ * of an operator that does not measure what it is called.
+ *
+ * **The abstention-rate watch belongs to `approval`, the module that sees
+ * verdicts.** What is shipped here is the arithmetic — two closed windows, a
+ * minimum sample on both, an absolute move in basis points, a bounded partition
+ * count — so there is exactly one implementation of "has this rate moved
+ * sharply?" rather than two that disagree by a hair over the same alert.
+ * `approval` supplies `{ measure: "abstention", partition, counts, maxPartitions }`
+ * and calls `observe` on every settled verdict.
+ *
+ * The natural long-term home for this shape is `alerts`, which owns the
+ * condition. It is here because `guardrails` is the only module that already
+ * watched a rate, and moving it later is a one-import change for both callers.
+ */
+export { createRateWatch } from "./lib/rate-watch.js";
+export type { RateWatch, RateWatchSpec } from "./lib/rate-watch.js";

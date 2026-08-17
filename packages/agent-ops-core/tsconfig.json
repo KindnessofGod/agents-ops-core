@@ -3,7 +3,11 @@
   "compilerOptions": {
     "rootDir": "./src",
     "outDir": "./dist",
-    "tsBuildInfoFile": "./dist/.tsbuildinfo"
+    // Outside `outDir` deliberately. `files: ["dist"]` publishes the whole
+    // output directory, so build state left inside it ships to nineteen
+    // applications: 54KB listing every source path and its hash, which is both
+    // noise and a small disclosure. `*.tsbuildinfo` is already gitignored.
+    "tsBuildInfoFile": "./.tsbuildinfo"
   },
   "include": ["src/**/*.ts"],
   "exclude": ["src/**/tests/**", "dist"]

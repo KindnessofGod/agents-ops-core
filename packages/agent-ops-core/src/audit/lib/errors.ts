@@ -201,6 +201,64 @@ export class ReservedNodeKind extends AuditError {
 }
 
 /**
+ * An idempotency key was supplied that this module will not carry: empty, or
+ * longer than `MAX_IDEMPOTENCY_KEY_CHARS`.
+ *
+ * Fail-closed at every tier, not degradable. It is a defect at the call site,
+ * and both halves of it are the kind that hide. An empty key is what a caller
+ * writes when it meant to compute one and the computation returned `""`; accept
+ * it and every keyless-but-not-really append in the case collides with every
+ * other one, so the second real event silently returns the first. An unbounded
+ * key is an unbounded column on a table holding seven years of rows.
+ *
+ * The bound is held here **and** by a check constraint in
+ * `migrations/0007_audit_idempotency.sql`, for the same reason the append-only
+ * guarantee is held by grants and triggers as well as by an interface: a bound
+ * the writer holds alone is a bound a `psql` prompt does not have.
+ */
+export class IdempotencyKeyUnusable extends AuditError {
+  override readonly name = "IdempotencyKeyUnusable";
+  override readonly degradable = false;
+  constructor(
+    readonly correlationId: string,
+    readonly detail: string,
+  ) {
+    super(`idempotency key for case ${correlationId} is unusable: ${detail}`);
+  }
+}
+
+/**
+ * An idempotency key already used on this case was offered again for a
+ * **different** append — a different payload, tier, parent or telemetry.
+ *
+ * Fail-closed at every tier, not degradable, and this is the error mode that
+ * makes idempotency safe rather than merely convenient. The tempting behaviour
+ * is to return the first node and call the retry deduplicated; that is exactly
+ * the failure the whole module exists to prevent, because the caller's *second*
+ * event then never happened as far as the evidence is concerned, and nothing
+ * anywhere says so. A key names one append. Reusing it for another is a bug in
+ * the caller's key derivation, and it is louder here than it will ever be in
+ * 2033.
+ *
+ * The clock reading is deliberately **not** compared: a retry after a crash is
+ * a later process and its clock has moved. Everything that describes *what
+ * happened* must match; when it happened is what the first node already records.
+ */
+export class IdempotencyKeyConflict extends AuditError {
+  override readonly name = "IdempotencyKeyConflict";
+  override readonly degradable = false;
+  constructor(
+    readonly correlationId: string,
+    readonly idempotencyKey: string,
+    readonly field: string,
+  ) {
+    super(
+      `idempotency key ${idempotencyKey} on case ${correlationId} was already used for an append with a different ${field}`,
+    );
+  }
+}
+
+/**
  * A store adapter broke the seam contract: it acknowledged a node it did not
  * write correctly, reused a sequence, returned bytes that are not the canonical
  * form of the node it returned, or the database refused the write for an

@@ -166,16 +166,293 @@ a clean bill of health for a component it has never heard of. Your watcher must
 assert on an expected set of component names and page when one is *missing*, not
 only when one is *overdue*.
 
-## 0.4 Two known limits of the shipped liveness store, stated rather than discovered
+## 0.4 Choosing a liveness store, and the one limit that remains
 
-- `inMemoryLivenessStore` is the **only** `LivenessStore` adapter that ships.
-  `postgresLivenessStore` is named in the code and not built; there is no
-  migration for it (`migrations/` has no liveness table). Beat history therefore
-  **dies with the process**.
-- Consequence: after a restart or a deploy the watcher sees `never-seen` rather
-  than `beat`. That is the safe direction — it alerts — but it means a false
-  alarm after every deploy until a durable adapter exists. Do not "fix" this by
-  widening `graceMs` past the outage you are trying to detect.
+Two `LivenessStore` adapters ship. **Choose the durable one for any deployment
+you intend to watch.**
+
+- **`postgresLivenessStore`** — over an injected `SqlExecutor`, backed by
+  `migrations/0008_alerts_liveness.sql`. Apply that migration **before** the
+  composition root's first `watch` call; without the table, `watch` fails rather
+  than degrading, which is the correct direction for the machinery that tells
+  you the machinery stopped. Beat history outlives the process: a watcher
+  polling across a restart reads `overdue` with a real `lastSeenAt`, a real beat
+  count and a real `overdueByMs`.
+- **`inMemoryLivenessStore`** — beat history **dies with the process**. After a
+  restart or a deploy the watcher reads `never-seen`, which is the same thing it
+  reads for a piece of machinery that was deployed and never started. Two
+  different problems with two different fixes, collapsed into one status on
+  every deploy, until an operator learns to read `never-seen` as "we just
+  deployed" and then reads a genuine death that way too.
+
+Do **not** "fix" a noisy `never-seen` by widening `graceMs` past the outage you
+are trying to detect. Move to the durable adapter instead.
+
+**The limit that remains, whichever you choose.** The stored cadence always
+wins: `watch` assigns `expected_every_ms` to itself on conflict, so a second
+composition root offering different terms is refused with
+`LivenessTermsConflict` rather than silently widening your detection window.
+That is deliberate — a deploy that quietly turned a two-minute window into an
+hour, with nothing recorded and nobody asked, is the failure this refuses — but
+it means **changing a cadence is a migration, not a redeploy**. There is no
+`DELETE` grant on this table and no verb on `LivenessStore` that removes a row.
+
+Verify the adapter against your own cluster before you trust it:
+
+```bash
+AGENT_OPS_LIVE_DATABASE_URL=postgres://owner:…@host:5432/throwaway npm run verify:liveness
+```
+
+That runs the eight `livenessStoreContract` obligations, the restart proof, six
+schema attacks (each asserting the SQLSTATE and the named constraint that
+refused it) and seven concurrency checks against a real cluster. It TRUNCATEs
+between groups, so point it at a **throwaway** database — it refuses one holding
+rows it did not write.
+
+---
+
+# 0A. DEPLOYMENT PREREQUISITES: what must exist before the first real case
+
+Section 0 is the one thing you must deploy that this library does not ship.
+This section is the rest of the list, in the order an operator does it. It is a
+checklist, not an explanation: each line links to the section that explains it,
+and nothing here is repeated from there.
+
+Nothing in this section is a default. This library reads **no environment
+variable at all** — every store, clock, executor and transport arrives as a
+parameter at your composition root — so if a prerequisite is not stood up, it is
+not stood up quietly with a fallback. It is absent, and the first case is where
+you find out.
+
+## 0A.1 The order
+
+| # | Prerequisite | Done when | Where it is explained |
+|---|---|---|---|
+| 1 | **An external watcher**, in another process on another host | The four checks in §0.3 pass, including check 2 | [§0](#0-read-this-before-anything-else-the-watchdog-is-outside-this-library) |
+| 2 | **A Postgres 16 database**, and a role that owns it | `SELECT version FROM agent_ops.schema_migrations` answers with every file in `migrations/` | §0A.3 |
+| 3 | **Four login roles, not one** | The application's login role cannot `DROP` a trigger and cannot `INSERT` a witness row | §0A.2 |
+| 4 | **Connection strings, held per role** | The migration string is not in the application's environment | §0A.4 |
+| 5 | **An alerting chain that reaches a human** | `assertProductionAlerting(sinks)` returns rather than throws | [§0.2 step 3](#02-what-to-configure--five-steps-all-of-them-required) |
+| 6 | **A separately-authorised removal role**, held by nobody day to day | Your seven-year removal procedure names a role that is not the application's | [§6.3](#63-is-this-archive-copy-faithful-enough-to-clear-a-seven-year-removal) |
+| 7 | **The three per-application inputs** | The entitlement standard, the resolution evidence source **and** its window, and the reserved-decision list are written down and passed in | `docs/CONTEXT.md`; `README.md`, "Per application" |
+
+Items 1 to 4 are what this section covers. 5, 6 and 7 are covered elsewhere and
+are listed here only so that a deployment checklist has all seven on one page.
+
+**Item 7 blocks production, not the build.** Until an application supplies them
+its resolution field stays empty and its reserved list is empty — visibly
+incomplete rather than quietly wrong. An empty reserved list means every
+decision is eligible for automatic handling, so unassisted containment for a
+decision that should have been reserved will be recorded as correct. The library
+cannot detect that for you.
+
+## 0A.2 Database roles and grants
+
+The migrations create five roles, all `NOLOGIN`. They are not accounts; they are
+sets of privileges your **login** roles are granted membership in. This is what
+the database reports after `migrations/` is applied, and it is the whole of it:
+
+| Role | May do | Held by |
+|---|---|---|
+| `agent_ops_writer` | `SELECT`, `INSERT` on `audit_trace_case` and `audit_trace_node`. `SELECT` on `audit_witness`. `EXECUTE` on `pg_advisory_xact_lock` | The application |
+| `agent_ops_reader` | `SELECT` on the audit tables and the witness. Nothing else | Analysts, dashboards, the on-call read path in [§5.4](#54-raw-sql-when-the-application-is-not-available) |
+| `agent_ops_witness` | `SELECT`, `INSERT` on `audit_witness` — **and this is deliberately not granted to `agent_ops_writer`** | A publisher process whose credentials the application does not hold |
+| `agent_ops_approval_writer` | `SELECT`, `INSERT`, `UPDATE` on `approval_suspension` and `approval_idempotency` | The application. `UPDATE` is here because a suspension is a state machine; there is no `DELETE`, because an approver's own words live in that table |
+| `agent_ops_eval_writer` | `SELECT`, `INSERT`, `UPDATE`, `DELETE` on the eval tables and memos | The evaluation runner, which is **not** the decisioning path |
+
+`agent_ops.schema_migrations` appears in no row above and that is not an
+omission: no `agent_ops_*` role is granted anything on it. The ledger belongs to
+the migration role, and an application that cannot read it cannot come to depend
+on it.
+
+Four rules, and each one is a thing that goes wrong when it is skipped.
+
+1. **The application's login role owns nothing.** Grants do not bind a table's
+   owner. An application connecting as the owner can drop
+   `audit_trace_node_immutable` and then `UPDATE` seven years of evidence, and
+   every test in this repository will still pass, because the tests exercise the
+   adapters and the grants — not your role layout. Membership of
+   `agent_ops_writer` is what the application gets; ownership stays with the
+   migration role.
+2. **The witness publisher's credentials are not the application's.** The
+   witness exists so that a case can be checked against something the writer
+   could not have edited. One login role holding both memberships is the same
+   custody wearing two names, and it defeats the point silently — `README.md`
+   item 6 already says the shipped adapters sit inside our own custody; holding
+   one set of credentials for both makes that worse, not equal.
+3. **The evaluation runner is a different login role from the decisioning
+   path.** `agent_ops_eval_writer` holds `DELETE`. That is correct for eval
+   fixtures and is exactly what must never be reachable from the process that
+   writes a real case's trace.
+4. **`agent_ops_alerts_writer` and any role a later migration adds follow the
+   same rules.** Read the migration; do not assume the list above is still
+   complete. `migrations/` is the truth, and this table is a snapshot.
+
+Verify all four against the database rather than against your intent:
+
+```sql
+-- What each role may actually do. Compare with the table above.
+SELECT table_name, grantee, string_agg(privilege_type, ',' ORDER BY privilege_type)
+  FROM information_schema.role_table_grants
+ WHERE table_schema = 'agent_ops' AND grantee LIKE 'agent_ops%'
+ GROUP BY 1, 2 ORDER BY 1, 2;
+
+-- The immutability triggers. Three, all UPDATE and DELETE.
+SELECT event_object_table, trigger_name, event_manipulation
+  FROM information_schema.triggers WHERE trigger_schema = 'agent_ops';
+
+-- Run this AS THE APPLICATION'S LOGIN ROLE. Both must come back false.
+SELECT pg_has_role(current_user,
+         (SELECT relowner FROM pg_class
+           WHERE oid = 'agent_ops.audit_trace_node'::regclass), 'USAGE') AS owns_the_table,
+       pg_has_role(current_user, 'agent_ops_witness', 'USAGE')           AS can_witness;
+```
+
+## 0A.3 Migration order, and the role that applies them
+
+**Order is filename order, and every file is required.** `0001_bootstrap` then
+`0002_audit_trace` and so on; each opens its own transaction and records its own
+version in `agent_ops.schema_migrations`. Later files assume earlier ones —
+`0007_audit_idempotency` adds an index to a table `0002` created — so a partial
+application is not a partial deployment, it is a broken one. There are **8**
+files; `0008_alerts_liveness` is the liveness table §0.4 requires, and a
+deployment that skips it has a watcher that cannot survive a restart.
+
+**Apply them with the runner, not with `docker compose`.** `docker-compose.yml`
+mounts `migrations/` at `/docker-entrypoint-initdb.d`, which Postgres runs
+**only the first time the volume is created**. That is right for a laptop and
+does nothing on an existing database, which is every database you will ever
+deploy to:
+
+```bash
+AGENT_OPS_MIGRATE_DATABASE_URL=postgres://owner:…@host:5432/agent_ops npm run db:migrate
+```
+
+It applies each file in filename order, stops at the first refusal without
+attempting the rest, and then asserts that every file recorded its own version.
+Re-running is expected: every migration here is written to be applied twice, and
+the runner is where you will find out if one stops being.
+
+**The migration role must be a superuser, or hold `ADMIN OPTION` on the shared
+roles.** This is the failure that costs an evening, because of how it presents.
+Reproduced against Postgres 16.13, not theorised.
+
+`0002_audit_trace` ends with `GRANT agent_ops_writer TO agent_ops`. Under
+Postgres 16 the creator of a role gets `ADMIN OPTION` on it automatically — so
+this works on a laptop, where the same role creates everything, and fails in the
+deployment where a database administrator created the shared roles beforehand
+and a lesser role runs the migrations:
+
+```
+ERROR:  permission denied to grant role "agent_ops_writer"
+DETAIL:  Only roles with the ADMIN option on role "agent_ops_writer" may grant this role.
+```
+
+That failure aborts `0002`'s transaction, so **the tables, the triggers and the
+grants are all rolled back**. Applied file by file with `psql`, the next
+migration then fails with `function agent_ops.audit_trace_immutable() does not
+exist`, which points at the wrong file entirely. If you see that message, the
+problem is not `0003`: it is that `0002` never committed, and the reason is a
+privilege on a role. Either apply as a superuser, or run
+`GRANT agent_ops_writer TO <migration_role> WITH ADMIN OPTION` (and the same for
+`agent_ops_reader`, `agent_ops_witness`, `agent_ops_eval_writer` and
+`agent_ops_approval_writer`) first.
+
+`npm run db:migrate` stops at the first refusal and names the file, so this
+presents as `MigrationFailed: 0002_audit_trace.sql was refused: permission
+denied to grant role "agent_ops_writer"` and never as the misleading `0003`
+message.
+
+## 0A.4 Connection strings
+
+Three variables exist in this repository. **None of them is read by the
+library** — `SqlExecutor` arrives as a parameter, so these are for operators and
+for the build, and your application names its own.
+
+| Variable | Read by | Points at | Never |
+|---|---|---|---|
+| `AGENT_OPS_DATABASE_URL` | `.env.example`, humans | The local `docker compose` database on port 5433 | Production. It carries the credentials every clone of this repository has |
+| `AGENT_OPS_MIGRATE_DATABASE_URL` | `npm run db:migrate` | The database, **as the owning role** | The application's environment. A running application has no reason to hold data-definition rights |
+| `AGENT_OPS_LIVE_DATABASE_URL` | The `live-*.test.ts` suites and `npm run test:live` | A **throwaway** database | Anything you would miss. The suites apply every migration and commit rows to a table nothing in this library can delete from |
+
+The suites refuse to start against a database holding cases they did not write —
+they look for a correlation identifier not prefixed `live-test:` and stop. Treat
+that as a courtesy, not a permission system: it runs after the migrations have
+already been applied.
+
+The application's own connection string is yours to name, and the role it names
+is the one from §0A.2 that owns nothing.
+
+## 0A.5 What continuous integration proves, and what it does not
+
+`.github/workflows/ci.yml` runs on every push and every pull request. Four jobs:
+the whole `npm run check` on Node 20 and Node 22; the published tarball's
+surface; **the live Postgres suites, against a real `postgres:16` with
+`migrations/` applied**; and the four commands from `README.md` from a clean
+checkout.
+
+A green build is evidence that the schema refused the `UPDATE`, refused the
+`DELETE`, refused the second seal and held the `INSERT`-only grants — on a fresh
+database whose migrations were applied by a superuser. `npm run test:live` fails
+rather than passes when those suites skip, which is the failure mode that
+matters: a skipped grant test and a passing grant test look identical in a
+summary line.
+
+It is **not** evidence about your deployment. Continuous integration cannot see
+your role layout (§0A.2), your connection strings (§0A.4), or your watcher (§0),
+and the watcher is the one that pages you at 3am. Run §0.3 and the queries in
+§0A.2 against the deployment itself, after every change to either.
+
+## 0A.6 Asserting the schema's guarantees against a database you own
+
+The append-only guarantee is a property of Postgres, not of TypeScript. Until
+this release nothing executable checked it; the procedure was prose. It is now
+two commands, and you should run them against **a throwaway restore of your own
+production schema** — not against production, and not only in continuous
+integration, because the thing most likely to differ is your role layout.
+
+```bash
+# 1. A throwaway database with your migrations applied.
+AGENT_OPS_MIGRATE_DATABASE_URL=postgres://owner:…@host:5432/throwaway npm run db:migrate
+
+# 2. Attack it. 39 tests across audit, approval, evals and guardrails.
+AGENT_OPS_LIVE_DATABASE_URL=postgres://owner:…@host:5432/throwaway npm run test:live
+
+# 3. The alerts liveness table, which has its own script (§0.4).
+AGENT_OPS_LIVE_DATABASE_URL=postgres://owner:…@host:5432/throwaway npm run verify:liveness
+```
+
+**Read the connection string requirement before you run it.** The connection
+must be the table **owner or a superuser**. Two of the audit cases deliberately
+step *out* of the grants — grants do not bind an owner — so that the
+immutability trigger is the only thing left that can refuse the write. A
+non-owner connection makes those two pass for the wrong reason, which is why
+the suite's preflight throws rather than skipping.
+
+**Use a throwaway database.** Every suite refuses one holding rows it did not
+write, `verify:liveness` truncates between groups, and the round-trip cases
+commit — these tables carry no `DELETE` grant for any role the migrations
+create, which is the guarantee under test.
+
+What a green run tells you, in the terms an auditor will ask about — each one
+printed with the SQLSTATE and the named constraint that refused it:
+
+| Attack | Refused by |
+|---|---|
+| `UPDATE` / `DELETE` / `TRUNCATE` on a trace node as the writer role | `42501`, the `INSERT`-only grants |
+| `UPDATE` / `DELETE` as the **owner** | `P0001`, the `agent_ops.audit_trace_immutable` trigger |
+| A second seal on one case | `23505`, `audit_trace_node_one_seal` |
+| A duplicate `(correlation_id, sequence)` | `23505`, `audit_trace_node_pkey` |
+| A parent naming a node on another case | `23503`, `audit_trace_node_parent_fk` |
+| A parent later than its child | `23514`, `audit_trace_node_parent_is_earlier` |
+| A replayed append under one idempotency key | `23505`, `audit_trace_node_idempotency` |
+| `nothing-was-due` carrying an item count | `23514`, `alerts_liveness_run_shape` |
+| A hand-edited beat counter | `23514`, `alerts_liveness_beats_add_up` |
+
+If any of these **passes** — if the database accepts a statement this table
+promises to refuse — you have a schema that does not match these migrations, and
+the seven-year record it holds is not append-only. That is an incident before it
+is a bug.
 
 ---
 

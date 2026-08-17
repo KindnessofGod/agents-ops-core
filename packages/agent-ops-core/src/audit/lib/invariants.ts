@@ -1,6 +1,9 @@
 import type { Archivist } from "./retention.js";
 import type {
+  AppendAck,
   AppendInput,
+  Audit,
+  CaseTrace,
   CorrelationId,
   Degraded,
   RecordedNode,
@@ -75,7 +78,7 @@ export type DegradedIsNeverHighTier = Assert<
  */
 interface StructuralStoreImpostor {
   openCase(correlationId: CorrelationId, provenance: TraceProvenance): Promise<void>;
-  append(input: AppendInput): Promise<RecordedNode>;
+  append(input: AppendInput): Promise<AppendAck>;
   closeCase(
     correlationId: CorrelationId,
     at: number,
@@ -96,6 +99,52 @@ export type ImpostorStoreDoesNotTypecheck = Assert<
  */
 export type BrandedStoreIsStillAStore = Assert<
   TraceStore extends StructuralStoreImpostor ? true : false
+>;
+
+/**
+ * The recorder itself cannot be impersonated by an object literal either —
+ * `README.md` item 8, "`Audit` is the one unbranded witness", closed.
+ *
+ * This is the shape that used to typecheck: a fully-typed recorder that
+ * acknowledges every write, persists nothing, and replays an empty case.
+ * `guardrails` takes one of these as `GuardrailsDeps.audit` and had to prove its
+ * first node by replay to discover it was talking to nothing. It still does —
+ * the runtime check is the one that catches a deliberate `as unknown as Audit`
+ * — but the accidental version no longer compiles.
+ */
+interface StructuralAuditImpostor {
+  open(correlationId: CorrelationId): Promise<CaseTrace>;
+  replay(correlationId: CorrelationId): Promise<import("./types.js").ReplayedCase>;
+  walk(
+    correlationId: CorrelationId,
+    limits?: Partial<import("./types.js").WalkLimits>,
+  ): AsyncGenerator<RecordedNode, import("./types.js").TraceVerdict, undefined>;
+  witness(
+    correlationId: CorrelationId,
+    limits?: Partial<import("./types.js").WalkLimits>,
+  ): Promise<WitnessReceipt>;
+  verifyAgainstWitness(
+    correlationId: CorrelationId,
+    limits?: Partial<import("./types.js").WalkLimits>,
+  ): Promise<import("./types.js").WitnessVerdict>;
+}
+
+export type ImpostorAuditDoesNotTypecheck = Assert<
+  StructuralAuditImpostor extends Audit ? false : true
+>;
+
+/** …and `createAudit`'s return value still satisfies every verb it declares. */
+export type BrandedAuditIsStillAnAudit = Assert<
+  Audit extends StructuralAuditImpostor ? true : false
+>;
+
+/**
+ * A deduplicated acknowledgement is a first-class answer, not a boolean bolted
+ * onto the node. If `AppendAck` ever loses it, a store can report a write it did
+ * not make and `createAudit` has no way to tell.
+ */
+export type AppendAckStatesWhetherItWrote = Assert<
+  AppendAck extends { readonly deduplicated: boolean } ? true : false
 >;
 
 /**

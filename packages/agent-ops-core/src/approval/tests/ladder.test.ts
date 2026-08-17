@@ -51,13 +51,18 @@ const suspendOne = async (h: ReturnType<typeof setup>, id: string, over = {}) =>
 };
 
 describe("ladder — the type cannot express giving up", () => {
+  // A generous timeout, not a slow test. This case runs the TypeScript
+  // compiler in-process over a fixture; under `vitest`'s default parallelism
+  // several such cases compile at once and the 5s default is a coin flip on a
+  // loaded machine. A flaky gate is worse than a slow one — it teaches people
+  // to re-run rather than to read.
   it("has no stop value and no maximum attempt count to declare", () => {
     // Proved by the compiler, not asserted: the fixture's `@ts-expect-error` on
     // a ladder with no recurrence compiles clean only because the field is
     // mandatory. There is no `stop`, no `until` and no `maxAttempts` in the
     // type to reach for in the first place.
     expect(compileFixture("capability-rejected.ts")).toEqual([]);
-  });
+  }, 30_000);
 
   it("refuses a recurrence tighter than the configured floor", async () => {
     const tight = ladder({ recurrence: { every: 60_000, widenTo: [{ kind: "pool", pool: POOL }] } });

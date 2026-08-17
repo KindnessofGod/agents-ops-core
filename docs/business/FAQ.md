@@ -17,7 +17,7 @@ this system.
 **The single most important fact on this page:** this software has never run in
 production. **0** applications use it live. **0** real cases have gone through
 it. **0** real payments have been made under it. Every answer below describes
-what the software *does*, verified by reading it and running its **707** tests —
+what the software *does*, verified by reading it and running its **825** tests —
 never what it has been observed to achieve, because it has not yet been observed
 achieving anything.
 
@@ -236,7 +236,7 @@ were owed.** This is the one you care about, and **it is not knowable when the
 case closes**. It needs evidence from outside the system and a waiting period.
 
 **The library records the second one nowhere.** There is no such field in
-**50,417** lines of source. Not empty — absent. Recording it requires naming one
+**59,245** lines of source. Not empty — absent. Recording it requires naming one
 of **3** evidence sources and stating the window: nothing came back; somebody
 re-checked a sample; or money went back. The library refuses to record a figure
 it cannot stand behind rather than let each team invent one.
@@ -469,14 +469,20 @@ directly: that depends on grants this library sets up but does not test.**
    deliberately **not built**, because shipping it means choosing a custodian on
    behalf of nineteen applications.
 2. **Tampering before the seal is not caught by any of this.**
-3. **A green test run is not evidence that the database refuses edits.** No test
-   here opens a network connection, deliberately — that is what makes the tests
-   unable to reach a live supplier or page a real engineer even with real
-   credentials present. So the **707** passing tests are evidence about the
-   software's behaviour and are **not** evidence that add-only holds in the
-   database itself. There is a runnable procedure for checking that against a
-   real database. **Nothing runs it automatically today.** This is the largest
-   untested surface in the repository and the project says so about itself.
+3. **This used to be the largest untested surface, and it is now tested.** Most
+   of the tests — 786 of them — cannot open a network connection at all, which
+   is what makes them unable to reach a live supplier or page a real engineer
+   even with real credentials present. That is a strength, but it left a gap: a
+   test that cannot reach the database cannot check that the *database* refuses
+   edits, and add-only is a promise the database makes, not the software.
+
+   Thirty-nine further tests now close that gap. They run only when somebody
+   points them at a throwaway copy of the database, they are switched off by
+   default, and they work by *attacking* the record — trying to edit a sealed
+   entry, trying to delete one, trying to seal a case twice — and checking that
+   each attempt was refused, and refused for the stated reason. They run
+   automatically on every change. The tooling treats a skipped check as a
+   failure, so a run that quietly does nothing cannot be mistaken for a pass.
 
 ### How long is it kept, and can we delete on request?
 
@@ -555,7 +561,7 @@ plainly rather than smoothed over:
 **That it has not, and that nobody should say otherwise.**
 
 **0** applications run it in production. **0** real cases have gone through it.
-Its **707** tests all pass and are evidence that the software behaves as
+Its **825** tests all pass and are evidence that the software behaves as
 described. They are **not** evidence that the arrangement works in an
 organisation, that people answer their approvals, or that the outside watcher was
 deployed. Those are facts about your operation, and the only honest way to obtain

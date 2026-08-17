@@ -4,6 +4,7 @@ import {
   type DecisionPoint,
   type EffectDeclaration,
   type EscalationLadder,
+  type NoEffectPayload,
 } from "../../index.js";
 import { POOL, ladder as defaultLadder } from "./harness.js";
 
@@ -148,7 +149,7 @@ export const gatedDisbursement = (options: {
   });
 
 /** The common caller: no effect, no gate, no brief. Still fully traced. */
-export const extraction = (): DecisionPoint<Invoice, string, never> =>
+export const extraction = (): DecisionPoint<Invoice, string, NoEffectPayload> =>
   defineDecisionPoint({
     id: "invoices.extract_fields",
     schemaVersion: 1,

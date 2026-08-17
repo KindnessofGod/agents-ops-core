@@ -1,5 +1,38 @@
 /**
- * The fail-closed screening rate, watched.
+ * A rate, watched — and the fail-closed screening rate as the first thing
+ * watched with it.
+ *
+ * ## The other half of the eighth condition, and where it has to live
+ *
+ * `AlertCondition`'s `rate-moved-sharply` declares two measures: `abstention`
+ * **or** `fail-closed-screening`. Only the second was ever produced, and the
+ * first was not merely unwritten — it was unwritable here. Per `docs/CONTEXT.md`
+ * an abstention is a **verdict disposition**, the system declining to conclude,
+ * and this module produces no verdict: it produces findings and a *recommended*
+ * disposition. A screening that recommends `abstain` is not an abstention. There
+ * are deployments where the decision overrides the recommendation in both
+ * directions, so counting recommendations and labelling the result "abstention
+ * rate" would put a number in front of an operator that does not measure what
+ * its name says — the precise failure `CONTEXT.md` fixes this vocabulary to
+ * prevent, and a worse outcome than leaving the measure unimplemented.
+ *
+ * **So the abstention-rate watch belongs to `approval`, which is the module that
+ * sees verdicts.** What is here is the arithmetic, generalised so `approval`
+ * supplies its own observation type, its own partition and its own rule for what
+ * counts — and so there is exactly one implementation of "has this rate moved
+ * sharply?" in the library rather than two that disagree by a hair.
+ *
+ * Reported upward as the remaining work, stated concretely so it is not a
+ * gesture: `approval` constructs
+ * `createRateWatch(terms, { measure: "abstention", partition: …, counts: (v) =>
+ * v.disposition === "abstained", maxPartitions: … })` and calls `observe` on
+ * every settled verdict. Nothing else about this file changes when it does.
+ *
+ * The natural long-term home for this shape is `alerts`, which owns the
+ * condition — it lives here because `guardrails` is the only module that already
+ * watched a rate, and moving it is a one-import change for both callers.
+ *
+ * ## The original argument, unchanged
  *
  * `docs/CONTEXT.md`'s eighth silent condition, and the one that is invisible by
  * construction rather than by accident: *"Abstention rate, or fail-closed
@@ -39,9 +72,15 @@
  *
  * ## Bounded, as everything in this module is
  *
- * Six keys at most — two phases by three tiers — each holding two integer pairs.
- * There is no unbounded map keyed on anything a caller supplies, and no entry is
- * ever evicted because none is ever created beyond those six.
+ * Six keys at most for the screening watch — two phases by three tiers — each
+ * holding two integer pairs. Generalising the arithmetic made that bound a
+ * caller's to state rather than a fact of the code, so `maxPartitions` is
+ * required and there is no unbounded setting: past it every further partition is
+ * folded into one reserved `(overflow)` window whose movement is still watched.
+ * Folding rather than dropping is deliberate — a partition function that
+ * explodes is a wiring defect, and an operator should see it as a partition
+ * named `(overflow)` on an alert rather than as signal that quietly stopped
+ * arriving.
  *
  * ## Why the window is keyed by phase and tier, and not by decision point
  *
@@ -60,6 +99,7 @@
  */
 
 import { raiseAndRecord } from "../../alerts/index.js";
+import { LimitsInvalid } from "./errors.js";
 import type { AlertRaiser, AlertRecord, DecisionPointId } from "../../alerts/index.js";
 import type { RiskTier } from "../../audit/index.js";
 import type { Instant, Screening, ScreeningPhase } from "./types.js";
@@ -108,8 +148,10 @@ export interface RateAlerting {
 }
 
 interface Window {
-  screenings: number;
-  failClosed: number;
+  /** How many observations arrived in this window. The denominator. */
+  observations: number;
+  /** How many of them `RateWatchSpec.counts` counted. The numerator. */
+  counted: number;
 }
 
 interface Keyed {
@@ -121,7 +163,7 @@ interface Keyed {
 
 /** Hundredths of a percent, as an integer. No IEEE-754 reaches a payload. */
 const rateOf = (window: Window): number =>
-  window.screenings === 0 ? 0 : Math.round((window.failClosed * 10_000) / window.screenings);
+  window.observations === 0 ? 0 : Math.round((window.counted * 10_000) / window.observations);
 
 /**
  * Whether this screening failed closed: it could not look, so it refused to say
@@ -135,40 +177,120 @@ export const isFailClosed = (screening: Screening): boolean =>
   screening.recommended.recommend === "abstain" &&
   screening.recommended.grounds.some((ground) => ground.ground === "detector-unavailable");
 
-export interface RateWatch {
+/**
+ * The screening watch, which is this module's own use of the shape above.
+ *
+ * Six partitions and no more: two phases by three tiers, every value of it
+ * minted here, so no caller-supplied string reaches the key and the ceiling is
+ * unreachable rather than merely enforced.
+ */
+export const screeningRateWatch: RateWatchSpec<Screening> = Object.freeze({
+  measure: "fail-closed-screening",
+  partition: (screening: Screening): string =>
+    `${screening.phase satisfies ScreeningPhase}:${screening.tier satisfies RiskTier}`,
+  counts: isFailClosed,
+  maxPartitions: 6,
+});
+
+/**
+ * Terms and spec are checked at construction, never at observation time.
+ *
+ * Same argument as `Limits`: a bound whose extreme value silently changes an
+ * answer is a defect that presents as a working system. `minSample: 0` believes
+ * an empty window, `moveBasisPoints: 0` raises on every window that closes until
+ * somebody mutes the alert, and `maxPartitions: 0` folds every partition into
+ * one and reports a movement over traffic nobody meant to combine. All three
+ * produce a monitored-looking deployment, which is the outcome this whole file
+ * exists to avoid.
+ */
+const checkTerms = <T>(terms: RateAlerting, spec: RateWatchSpec<T>): void => {
+  const positive = (name: string, value: unknown): void => {
+    if (!Number.isSafeInteger(value) || (value as number) < 1) {
+      throw new LimitsInvalid(`rateAlerting.${name}`, value);
+    }
+  };
+  positive("windowMs", terms.windowMs);
+  positive("moveBasisPoints", terms.moveBasisPoints);
+  positive("minSample", terms.minSample);
+  positive("maxPartitions", spec.maxPartitions);
+  if (typeof terms.alerts?.raise !== "function") {
+    throw new LimitsInvalid("rateAlerting.alerts", terms.alerts);
+  }
+};
+
+/**
+ * What is being watched, supplied by whichever module can see it.
+ *
+ * Three functions and a bound, and every one of them exists because this module
+ * cannot answer the question for another. `guardrails` knows what a fail-closed
+ * screening is and cannot know what an abstention is; `approval` is the reverse.
+ * Neither should own a second copy of the arithmetic.
+ */
+export interface RateWatchSpec<T> {
   /**
-   * Record one screening and, if it closed a window, judge that window against
+   * Which of `AlertCondition`'s two measures this is. Written onto the raised
+   * condition verbatim, so an operator sees the measure the library declares
+   * rather than one this file inferred.
+   */
+  readonly measure: "abstention" | "fail-closed-screening";
+  /**
+   * The window key, and the `decisionPoint` the alert carries.
+   *
+   * Name the finest partition the calling module can make **truthfully**.
+   * `guardrails` answers `input:high` because it is given no decision point and
+   * will not invent one; `approval` has a real decision point and should use it.
+   */
+  partition(observation: T): string;
+  /** The numerator: whether this observation is one of the things being counted. */
+  counts(observation: T): boolean;
+  /**
+   * The most partitions to hold. Required, with no default: a bound only the
+   * caller can state, because only the caller knows how many values its own
+   * partition function can take. Past it, everything folds into `(overflow)`.
+   */
+  readonly maxPartitions: number;
+}
+
+export interface RateWatch<T> {
+  /**
+   * Record one observation and, if it closed a window, judge that window against
    * the one before it.
    *
    * Returns the alert record where one was raised, so a caller can put it
    * somewhere; `undefined` where the window is still open or the sample was too
-   * small. **Awaited on the screening path**, which is a real cost and a
+   * small. **Awaited on the caller's own path**, which is a real cost and a
    * deliberate one: it happens at most once per window, and an alert sitting in
    * a buffer when the process dies is an alert nobody ever gets.
    */
-  observe(screening: Screening, now: Instant): Promise<AlertRecord | undefined>;
+  observe(observation: T, now: Instant): Promise<AlertRecord | undefined>;
 }
 
+/** The key everything past `maxPartitions` is folded into. Never a real one. */
+const OVERFLOW = "(overflow)";
+
 /**
- * Six windows, no history, no eviction.
+ * Bounded windows, no history, no eviction.
  *
  * The arithmetic between `observe` reading the window and writing it back
- * contains no `await`, so two screenings settling concurrently cannot lose a
+ * contains no `await`, so two observations settling concurrently cannot lose a
  * count to a torn read-modify-write. The `await` is on the raise, after the
  * window has already been rolled and the counters replaced — so a slow sink
  * delays the alert and never double-counts a window or raises one twice.
  */
-export const createRateWatch = (terms: RateAlerting): RateWatch => {
+export const createRateWatch = <T>(terms: RateAlerting, spec: RateWatchSpec<T>): RateWatch<T> => {
+  checkTerms(terms, spec);
   const windows = new Map<string, Keyed>();
 
   return {
-    async observe(screening, now) {
-      // `input:high`, `output:low`. Six possible values, all of them ours: no
-      // caller-supplied string reaches this key, so the map cannot grow.
-      const key = `${screening.phase satisfies ScreeningPhase}:${screening.tier satisfies RiskTier}`;
+    async observe(observation, now) {
+      const named = spec.partition(observation);
+      // A partition function that explodes is a wiring defect, and it must not
+      // become an unbounded map on the hot path of every decision.
+      const key =
+        windows.has(named) || windows.size < spec.maxPartitions ? named : OVERFLOW;
       let held = windows.get(key);
       if (held === undefined) {
-        held = { startedAt: now, current: { screenings: 0, failClosed: 0 }, baseline: null };
+        held = { startedAt: now, current: { observations: 0, counted: 0 }, baseline: null };
         windows.set(key, held);
       }
 
@@ -182,17 +304,17 @@ export const createRateWatch = (terms: RateAlerting): RateWatch => {
         closed = held.current;
         baseline = held.baseline;
         held.baseline = closed;
-        held.current = { screenings: 0, failClosed: 0 };
+        held.current = { observations: 0, counted: 0 };
         held.startedAt = now;
       }
 
-      held.current.screenings += 1;
-      if (isFailClosed(screening)) held.current.failClosed += 1;
+      held.current.observations += 1;
+      if (spec.counts(observation)) held.current.counted += 1;
 
       if (closed === undefined || baseline === null) return undefined;
       // Both windows, not just the observation. A busy morning after a quiet
       // night is not evidence that anything changed.
-      if (closed.screenings < terms.minSample || baseline.screenings < terms.minSample) {
+      if (closed.observations < terms.minSample || baseline.observations < terms.minSample) {
         return undefined;
       }
 
@@ -202,14 +324,15 @@ export const createRateWatch = (terms: RateAlerting): RateWatch => {
 
       return await raiseAndRecord(terms.alerts, {
         kind: "rate-moved-sharply",
-        measure: "fail-closed-screening",
-        // See the header: this is the finest partition this module can name
-        // truthfully. It is not a decision point and does not pretend to be one.
+        measure: spec.measure,
+        // The finest partition the calling module can name truthfully. For
+        // `guardrails` that is `input:high` and it is not a decision point; the
+        // spec's own documentation says so rather than this file pretending.
         decisionPoint: key as DecisionPointId,
         windowMs: terms.windowMs,
         baselineBasisPoints: before,
         observedBasisPoints: observed,
-        sampleSize: closed.screenings,
+        sampleSize: closed.observations,
       });
     },
   };

@@ -37,6 +37,7 @@ import {
   UnknownDecisionPoint,
 } from "./errors.js";
 import { assertLadderSound, becomesBuried, firingAt, nextDueAt } from "./ladder.js";
+import { createAbstentionWatch, noAbstentionWatch } from "./rate-watch.js";
 import { parentIndexes, recorderFor, type Recorder } from "./recorder.js";
 import type {
   AnsweringContext,
@@ -58,6 +59,7 @@ import type {
   HumanAuthority,
   IdempotencyKey,
   Instant,
+  KillSwitchScope,
   KillSwitchState,
   Licence,
   LinkDivergence,
@@ -144,6 +146,53 @@ const MODULE_SPEND: DecisionSpend = {
 
 /** The injected clock is millisecond-resolution, so every latency is too. */
 const CLOCK_RESOLUTION_US = 1_000;
+
+/* --------------------------------------------------------------- kill switch */
+
+/**
+ * Does this engaged switch stop an effect at this tier?
+ *
+ * The whole of the per-tier decision, in one pure function, owned by this
+ * module. It used to be nowhere: `scope` was a string, nothing compared it to
+ * anything, and every engaged switch stopped every effect at every tier while
+ * the node recorded whatever scope the reader claimed. So a switch engaged for
+ * high tier during an incident quietly stopped low-tier ticket routing as well,
+ * and — the direction that actually costs money — a reader that meant to stop
+ * only high tier had no way to be sure it had, because nothing on our side was
+ * reading the field it set.
+ *
+ * `system-wide` is deliberately not spelled as the list of all three tiers.
+ * "The operator stopped everything" and "the operator happened to list every
+ * tier we currently have" are the same set today and different sentences, and a
+ * fourth tier added in 2029 must widen the first and must not widen the second.
+ */
+const scopeStops = (scope: KillSwitchScope, tier: Tier): boolean =>
+  scope.kind === "system-wide" || scope.tiers.includes(tier);
+
+const ALL_TIERS: readonly Tier[] = ["low", "medium", "high"];
+
+/**
+ * The scope, flattened for the trace, and **truthfully**.
+ *
+ * `scopeKind` is what the operator engaged. `scopeTiers` is the tier set it
+ * resolves to, which for `system-wide` is every tier this release has — written
+ * out so that "was high tier stopped at 14:06?" is one string comparison in
+ * 2033 rather than a join against whatever the tier enumeration was that year.
+ * `appliesToTier` is this module's own answer for the effect in hand, which is
+ * the field that distinguishes an enforced control from a recorded one.
+ */
+const scopeFields = (scope: KillSwitchScope, tier: Tier): Fields => ({
+  scopeKind: scope.kind,
+  // Recorded as the reader gave them, sorted by risk so the string is stable
+  // across two readers that list the same tiers in a different order. Nothing
+  // is filtered out: a tier this release does not recognise is a fact about the
+  // control plane, and dropping it from the record would hide exactly the
+  // misconfiguration an operator needs to see.
+  scopeTiers: [...(scope.kind === "system-wide" ? ALL_TIERS : scope.tiers)]
+    .sort((a, b) => (TIER_ORDER[a] ?? 99) - (TIER_ORDER[b] ?? 99))
+    .join(","),
+  appliesToTier: scopeStops(scope, tier),
+});
 
 /* ------------------------------------------------------------------ alerting */
 
@@ -316,6 +365,16 @@ export const createApproval = (deps: ApprovalDeps): Approval => {
 
   const registry = new Map(deps.points.map((point) => [point.id, point]));
   const indexes = parentIndexes(limits.parentIndexCases);
+
+  /**
+   * The abstention-rate watch. One window per declared decision point, bounded
+   * by the registry above, or nothing at all where a deployment declared no
+   * terms — see `AbstentionRateTerms` for why there is no default window.
+   */
+  const abstentionWatch =
+    deps.abstentionRate === undefined
+      ? noAbstentionWatch
+      : createAbstentionWatch(deps.abstentionRate, alerting);
 
   const writerOn = (recorder: Recorder, startedAt: Instant): Writer => ({
     async write(payload, parent) {
@@ -535,26 +594,46 @@ export const createApproval = (deps: ApprovalDeps): Approval => {
     // The kill switch is read HERE — at execute, never at classify. A killed
     // run still records its whole decision, which is the point: the evidence of
     // what the system would have done during the incident is preserved.
-    let engaged = true;
+    //
+    // It is read **for this tier**, and the scope it returns is compared to
+    // this tier by `scopeStops` before anything is stopped. `stopped` is what
+    // this module concluded; `engaged` is what the switch said. They are
+    // separate fields on the node because they are separate facts, and the pair
+    // is what turns a recorded scope into an enforced one.
+    let stopped = true;
     let heldReason = "kill-switch";
     let killPayload: Draft = {
       kind: "approval.kill-switch-read",
       engaged: true,
       readable: false,
+      tier,
     };
     try {
-      const state = await killSwitch();
-      engaged = state.engaged;
+      const state = await killSwitch({ tier });
+      stopped = state.engaged && scopeStops(state.scope, tier);
       killPayload = state.engaged
         ? {
             kind: "approval.kill-switch-read",
             engaged: true,
             readable: true,
-            scope: state.scope,
+            tier,
+            ...scopeFields(state.scope, tier),
+            // Out of scope for this tier and therefore not stopped. The read is
+            // still recorded: "the switch was on and did not cover this effect"
+            // and "the switch was off" are different sentences to an auditor
+            // reading an incident window, and only one of them means nobody had
+            // engaged anything.
+            stopped,
             by: state.by,
             at: state.at,
           }
-        : { kind: "approval.kill-switch-read", engaged: false, readable: true };
+        : {
+            kind: "approval.kill-switch-read",
+            engaged: false,
+            readable: true,
+            tier,
+            stopped: false,
+          };
     } catch (cause) {
       // Fail-closed: an unreadable kill switch is treated as engaged. Cheap;
       // the alternative is paying during an incident.
@@ -565,18 +644,25 @@ export const createApproval = (deps: ApprovalDeps): Approval => {
       // switch that was read and engaged, `kill-switch-unreadable` for one that
       // could not be read at all.
       const failure = new KillSwitchUnreadable(causeRef(cause), cause);
-      engaged = true;
+      // Fail-closed at EVERY tier, and the scope is why: a switch that could not
+      // be read has no readable scope either, so "it was probably only scoped to
+      // high tier" is a guess, and guessing is what per-tier scope must never
+      // become. An unreadable switch stops every effect until it can be read.
+      stopped = true;
       heldReason = "kill-switch-unreadable";
       killPayload = {
         kind: "approval.kill-switch-read",
         engaged: true,
         readable: false,
+        tier,
+        scopeKind: "unreadable",
+        stopped: true,
         error: failure.name,
         ...causeFields("cause", cause),
       };
     }
     const killNode = await writer.write(killPayload, parent);
-    if (engaged) return { held: killNode, reason: heldReason };
+    if (stopped) return { held: killNode, reason: heldReason };
 
     const now = clock.now();
 
@@ -1197,6 +1283,41 @@ export const createApproval = (deps: ApprovalDeps): Approval => {
       () => spec.decide(client, input),
     );
     const decideLatencyUs = (clock.now() - decideStartedAt) * 1_000;
+
+    /**
+     * The eighth silent condition's abstention half, observed here because here
+     * is where a verdict exists.
+     *
+     * Every determination is counted, abstained or not — the denominator is
+     * decisions this point actually reached, so an adapter that threw before
+     * `decide` is not quietly counted as a case that did not abstain. An
+     * abstention is a **verdict**, so it is impossible to see by catching an
+     * exception and impossible to see from one case at all; two hundred
+     * individually correct abstentions in an afternoon are a deployment that
+     * stopped deciding, and each of them returned success.
+     *
+     * Recorded as its own node when a window moved, hanging off the deciding
+     * node, so the movement is a fact on a real case's trace and not only a page
+     * somebody may or may not have received. The node says outright that it is
+     * about a window rather than about this case, because a reader in 2033
+     * finding it on one invoice must not conclude the invoice was the problem.
+     */
+    const moved = await abstentionWatch.observe(
+      spec.id,
+      determination.kind === "abstained",
+      clock.now(),
+    );
+    if (moved !== undefined) {
+      await writer.write(
+        {
+          kind: "approval.abstention-rate-moved",
+          pointId: spec.id,
+          aboutThisCase: false,
+          ...moved,
+        },
+        decideNode,
+      );
+    }
 
     if (determination.kind === "abstained") {
       const node = await writer.write(
@@ -2015,25 +2136,31 @@ export const createApproval = (deps: ApprovalDeps): Approval => {
     const nodes: NodeId[] = [];
 
     /**
-     * The kill switch, read at most once per sweep and only if a held case is
-     * actually found.
+     * The kill switch, read at most once **per tier** per sweep, and only if a
+     * held case at that tier is actually found.
      *
      * Bounded on purpose: a batch of two hundred held cases during an incident
      * would otherwise be two hundred reads of the control plane that is already
-     * having the incident. One read per sweep is enough — the switch cannot
-     * meaningfully change inside one pass, and if it does the next pass sees it.
+     * having the incident. The reader is asked a per-tier question, so the cache
+     * is keyed by tier — **three entries at most, ever**, because `Tier` has
+     * three values and the key comes from the suspension, not from a caller. One
+     * read per tier per sweep is enough: the switch cannot meaningfully change
+     * inside one pass, and if it does the next pass sees it.
      */
-    let switchThisSweep: KillSwitchState | "unreadable" | undefined;
-    const readSwitchOnce = async (): Promise<KillSwitchState | "unreadable"> => {
-      if (switchThisSweep !== undefined) return switchThisSweep;
+    const switchThisSweep = new Map<Tier, KillSwitchState | "unreadable">();
+    const readSwitchFor = async (tier: Tier): Promise<KillSwitchState | "unreadable"> => {
+      const held = switchThisSweep.get(tier);
+      if (held !== undefined) return held;
+      let state: KillSwitchState | "unreadable";
       try {
-        switchThisSweep = await killSwitch();
+        state = await killSwitch({ tier });
       } catch {
-        // Fail-closed: an unreadable switch is treated as engaged, so a hold is
-        // never released on a guess. The reason is recorded per case below.
-        switchThisSweep = "unreadable";
+        // Fail-closed: an unreadable switch is treated as stopping everything,
+        // so a hold is never released on a guess. Recorded per case below.
+        state = "unreadable";
       }
-      return switchThisSweep;
+      switchThisSweep.set(tier, state);
+      return state;
     };
 
     for (const suspension of due) {
@@ -2072,8 +2199,21 @@ export const createApproval = (deps: ApprovalDeps): Approval => {
       /* --------------------- a kill-switch hold is revisited, not buried */
 
       if (suspension.state === "held") {
-        const state = await readSwitchOnce();
-        const stillHeld = state === "unreadable" || state.engaged;
+        const state = await readSwitchFor(suspension.tier);
+        // The same predicate the execute path uses, against the tier the case
+        // was suspended at. A switch narrowed to high tier releases a low-tier
+        // hold on the next sweep, which is the whole point of a per-tier scope:
+        // an incident on disbursements must not keep ticket routing held for a
+        // week after it is over.
+        const stillHeld =
+          state === "unreadable" || (state.engaged && scopeStops(state.scope, suspension.tier));
+        /** The same three facts, flattened for whichever node this visit writes. */
+        const read: Fields =
+          state === "unreadable"
+            ? { scopeKind: "unreadable", appliesToTier: true }
+            : state.engaged
+              ? scopeFields(state.scope, suspension.tier)
+              : { scopeKind: "disengaged", appliesToTier: false };
         if (stillHeld) {
           // The incident is still running. Record the read — "we looked and it
           // was still engaged" is a different fact from "nobody looked" — and
@@ -2084,6 +2224,10 @@ export const createApproval = (deps: ApprovalDeps): Approval => {
               kind: "approval.hold-continues",
               suspension: suspension.id,
               readable: state !== "unreadable",
+              tier: suspension.tier,
+              // What was read and what it means for THIS tier, so a hold that
+              // continued is provably a hold the scope actually covered.
+              ...read,
               heldForMs: now - suspension.awaitingSince,
               nextDueAt: now + ladder.recurrence.every,
             },
@@ -2140,6 +2284,11 @@ export const createApproval = (deps: ApprovalDeps): Approval => {
             kind: "approval.hold-released",
             suspension: suspension.id,
             heldForMs: now - suspension.awaitingSince,
+            tier: suspension.tier,
+            // Why it cleared. A switch narrowed to other tiers and a switch
+            // turned off entirely both release this case, and an operator
+            // reading the incident afterwards must be able to tell which.
+            ...read,
             returnedToSeat: "first",
             // Nothing was executed on release. A fresh approval licenses the
             // effect, or nothing does.

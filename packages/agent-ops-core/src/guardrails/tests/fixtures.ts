@@ -64,6 +64,28 @@ export const manualClock = (start = 1_700_000_000_000): ManualClock => {
 };
 
 /**
+ * The one clock in this file that reads the machine, and the only tests that
+ * use it are the preemption tests.
+ *
+ * It is still hermetic, and the distinction is worth keeping sharp: hermetic
+ * means a test cannot reach a live model, a real database or a real pager with
+ * real credentials in the environment. Reading the wall clock reaches none of
+ * those. What it costs is determinism, which is why every other test drives
+ * `manualClock` — and why this one is reserved for the tests where a worker
+ * thread really is racing a real timer, and a frozen clock would have the engine
+ * report a scan that took four hundred milliseconds as having taken none.
+ */
+export const wallClock = (): ManualClock => ({
+  now: () => Date.now(),
+  advance: () => {
+    throw new Error("wallClock cannot be advanced; use manualClock");
+  },
+  set: () => {
+    throw new Error("wallClock cannot be set; use manualClock");
+  },
+});
+
+/**
  * A timer the test fires. `fire()` settles every outstanding wait, which is how
  * the detector-budget path is exercised without waiting two real seconds — and
  * therefore without the timeout branch being, in practice, untested.

@@ -81,10 +81,12 @@ describe("sweep — the parent index is shared and bounded", () => {
   it("replays a case once, not once per sweep visit", async () => {
     let reads = 0;
     const inner = inMemoryTraceStore();
+    // Spread the real adapter rather than rebuild it. `TraceStore` is branded
+    // and gained `readPage` since this decorator was written; a hand-built
+    // literal silently drifts from the interface, whereas a spread carries the
+    // brand and every verb this test does not care about.
     const counting: TraceStore = {
-      openCase: (id, provenance) => inner.openCase(id, provenance),
-      append: (input) => inner.append(input),
-      closeCase: (id, at, outcome) => inner.closeCase(id, at, outcome),
+      ...inner,
       read: (id) => {
         reads += 1;
         return inner.read(id);

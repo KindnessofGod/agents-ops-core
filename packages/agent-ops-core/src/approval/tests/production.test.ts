@@ -138,6 +138,16 @@ describe("abstention is a verdict, not an error", () => {
           kind: "abstained" as const,
           reason: "fields-illegible",
           evidence: [],
+          // Required, never optional: an abstention still spent whatever it
+          // spent deciding not to decide, and a verdict that omits its cost is
+          // the one shape `DecisionSpend` exists to forbid. Leaving it off made
+          // this literal non-comparable to `base`, and the cast below hid that.
+          spend: {
+            costTenthCents: 0,
+            tokensIn: 0,
+            tokensOut: 0,
+            priceTableVersion: "none",
+          },
         }),
       },
     } as typeof base;

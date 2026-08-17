@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { CASE_A, harness, quietDetector, sameAtEveryTier, scriptedDetector, setOf } from "./fixtures.js";
-import { isFailClosed, type RateAlerting } from "../index.js";
+import { createRateWatch, isFailClosed, type RateAlerting, type RateWatchSpec } from "../index.js";
 import { createAlerts, recordingAlertSink, type Alerts } from "../../alerts/index.js";
 
 /**
@@ -247,5 +247,111 @@ describe("the fail-closed rate window", () => {
     // conclude that claim had something to do with it.
     const kinds = await h.kinds();
     expect(kinds.some((k) => k.includes("rate"))).toBe(false);
+  });
+});
+
+/**
+ * The **other half** of the eighth silent condition.
+ *
+ * `AlertCondition.measure` declares `abstention` or `fail-closed-screening` and
+ * only the second was ever produced. The first cannot be produced here and the
+ * reason is `docs/CONTEXT.md`, not effort: an abstention is a **verdict
+ * disposition**, and this module produces no verdict. A screening that
+ * recommends `abstain` is a recommendation the decision may overrule in either
+ * direction, so counting recommendations under the name "abstention rate" would
+ * name a number after something it does not measure.
+ *
+ * So the watch belongs to `approval`, which sees verdicts, and what is proved
+ * here is that the shape it will call is real, exercised and bounded — not that
+ * `guardrails` has quietly started producing verdicts.
+ */
+describe("the abstention half, which approval must call", () => {
+  /** Stands in for whatever `approval` will pass. Deliberately not a Screening. */
+  interface Settled {
+    readonly decisionPoint: string;
+    readonly disposition: "concluded" | "abstained";
+  }
+
+  const abstentionWatch: RateWatchSpec<Settled> = {
+    measure: "abstention",
+    partition: (settled) => settled.decisionPoint,
+    counts: (settled) => settled.disposition === "abstained",
+    maxPartitions: 4,
+  };
+
+  const settle = async (
+    watch: ReturnType<typeof createRateWatch<Settled>>,
+    at: number,
+    count: number,
+    disposition: Settled["disposition"],
+    decisionPoint = "invoice.pay",
+  ) => {
+    for (let i = 0; i < count; i += 1) {
+      await watch.observe({ decisionPoint, disposition }, at);
+    }
+  };
+
+  it("raises rate-moved-sharply with measure 'abstention'", async () => {
+    const a = alertsFor();
+    const watch = createRateWatch<Settled>(terms(a.alerts), abstentionWatch);
+
+    await settle(watch, 0, 5, "concluded");
+    await settle(watch, WINDOW, 5, "abstained");
+    await settle(watch, WINDOW * 2, 1, "concluded");
+
+    expect(a.sink.delivered).toHaveLength(1);
+    expect(a.sink.delivered[0]?.condition).toMatchObject({
+      kind: "rate-moved-sharply",
+      // The half that was declared and never produced.
+      measure: "abstention",
+      // A real decision point, because `approval` has one. `guardrails` does
+      // not, and says `input:high` rather than inventing one.
+      decisionPoint: "invoice.pay",
+      baselineBasisPoints: 0,
+      observedBasisPoints: 10_000,
+      sampleSize: 5,
+    });
+  });
+
+  it("is one implementation, so it holds steady on the same terms the screening watch does", async () => {
+    const a = alertsFor();
+    const watch = createRateWatch<Settled>(terms(a.alerts), abstentionWatch);
+    for (let window = 0; window < 4; window += 1) {
+      await settle(watch, WINDOW * window, 5, "concluded");
+    }
+    await settle(watch, WINDOW * 4, 1, "concluded");
+    expect(a.sink.delivered).toHaveLength(0);
+  });
+
+  it("folds partitions past its ceiling into one named window rather than growing a map", async () => {
+    const a = alertsFor();
+    const watch = createRateWatch<Settled>(terms(a.alerts), {
+      ...abstentionWatch,
+      maxPartitions: 1,
+    });
+
+    // The first decision point takes the only slot. Everything after it folds
+    // into `(overflow)`, which is still watched — a partition function that
+    // explodes is a wiring defect, and signal that quietly stops arriving is
+    // worse than an alert that names the defect.
+    await settle(watch, 0, 5, "concluded", "invoice.pay");
+    await settle(watch, 0, 5, "concluded", "invoice.approve");
+    await settle(watch, WINDOW, 5, "abstained", "invoice.approve");
+    await settle(watch, WINDOW * 2, 1, "concluded", "invoice.approve");
+
+    expect(a.sink.delivered[0]?.condition).toMatchObject({ decisionPoint: "(overflow)" });
+  });
+
+  it("refuses terms that would make it look monitored without being monitored", () => {
+    const a = alertsFor();
+    expect(() => createRateWatch<Settled>(terms(a.alerts, { minSample: 0 }), abstentionWatch)).toThrow(
+      /minSample/,
+    );
+    expect(() =>
+      createRateWatch<Settled>(terms(a.alerts, { moveBasisPoints: 0 }), abstentionWatch),
+    ).toThrow(/moveBasisPoints/);
+    expect(() =>
+      createRateWatch<Settled>(terms(a.alerts), { ...abstentionWatch, maxPartitions: 0 }),
+    ).toThrow(/maxPartitions/);
   });
 });

@@ -27,6 +27,7 @@
  */
 
 import { ComponentNotWatched, LivenessTermsConflict } from "./errors.js";
+import { assertRecordableBeat, assertRecordableWatch } from "./validate.js";
 import { asLivenessStore } from "./types.js";
 import type {
   Alerts,
@@ -47,18 +48,20 @@ import type { HeartbeatMissed, LastSeen } from "./conditions.js";
 import type { ComponentId, DurationMs, Instant } from "./primitives.js";
 
 /**
- * The shipped adapter.
+ * The fast adapter — **one of two**, which is what makes `LivenessStore` a real
+ * seam by C5 rather than a hypothetical one. The second is
+ * `postgresLivenessStore`, over an injected `SqlExecutor`, and the two are held
+ * to the same obligations by `livenessStoreContract`.
  *
- * **One adapter, so this is a hypothetical seam by C5**, and that is reported
- * rather than dressed up: `postgresLivenessStore` is named and not built,
- * because it needs a migration that does not exist and a driver handle this
- * package may not construct.
- *
- * The limit that follows is real and is stated here rather than discovered:
- * with this adapter, beat history dies with the process. An external watcher
- * polling across a restart sees `never` rather than `beat`, which reads as "not
- * seen" and therefore alerts — the safe direction — but it is a false alarm
- * after every deploy until a durable adapter exists.
+ * The limit of *this* one is unchanged and is stated here rather than
+ * discovered: beat history dies with the process. An external watcher polling
+ * across a restart sees `never` rather than `beat`, which reads as "not seen"
+ * and therefore alerts — the safe direction — but it cannot tell a component
+ * that died from a component that was deployed and never started, and those are
+ * different problems with different fixes. That is the whole reason the durable
+ * adapter exists. Use this one for tests, for a single-process tool, and for a
+ * deployment that has genuinely accepted losing beat history on restart; use the
+ * durable one everywhere a watcher polls across a deploy.
  *
  * **Correct under concurrent writers.** Every mutation below is one synchronous
  * block with no `await` inside it, so two beats landing in the same tick cannot
@@ -100,6 +103,10 @@ export const inMemoryLivenessStore = (): LivenessStore => {
     // escapes `.catch()` and breaks `await Promise.all([...])` in a way that is
     // very hard to see. Every rejection out of this store is a rejection.
     async watch(component, expectedEveryMs, since) {
+      // Obligation 6 of `livenessStoreContract`, enforced identically here and
+      // in the durable adapter so an application cannot discover the difference
+      // by swapping one for the other.
+      assertRecordableWatch(component, expectedEveryMs, since);
       const existing = rows.get(component);
       if (existing !== undefined) {
         // Idempotent on identical terms, loud on contradictory ones: two callers
@@ -126,6 +133,7 @@ export const inMemoryLivenessStore = (): LivenessStore => {
     },
 
     async beat(component, at, run) {
+      assertRecordableBeat(component, at, run);
       const row = rows.get(component);
       if (row === undefined) throw new ComponentNotWatched(component);
       row.beats += 1;

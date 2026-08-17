@@ -104,15 +104,39 @@
  *                  twice.
  *   Kill switch.   Stops effects, never decisions. Read at execute, not at
  *                  classify, so the trace preserves what the system *would*
- *                  have done during the incident.
+ *                  have done during the incident. **Its scope is enforced, not
+ *                  merely recorded.** `KillSwitchScope` is a closed type —
+ *                  `system-wide`, or an explicit list of tiers — the reader is
+ *                  asked a per-tier question, and this module compares the scope
+ *                  it gets back to the tier of the effect in hand. A switch
+ *                  engaged for high tier refuses a disbursement and leaves
+ *                  ticket routing running, and the node carries `scopeKind`,
+ *                  `scopeTiers` and `appliesToTier` so the trace says which of
+ *                  those two happened rather than restating the reader's claim.
+ *                  It was previously a free string written onto the node while
+ *                  every engaged switch stopped every effect at every tier: a
+ *                  safety control that records its own scope without obeying it
+ *                  is the most dangerous kind, because it reports that it
+ *                  worked. An **unreadable** switch still stops everything at
+ *                  every tier — an unreadable scope is a guess, and per-tier
+ *                  scope is the last place to start guessing.
  *   Integers.      Every number crossing into the trace is a safe integer.
  *                  Money in minor units, latency in microseconds, confidence in
  *                  basis points.
  *   Clock.         Injected. No `Date.now()` in this module, ever.
- *   Alerting.      Five of `docs/CONTEXT.md`'s eight **silent** conditions are
+ *   Alerting.      Six of `docs/CONTEXT.md`'s eight **silent** conditions are
  *                  visible only from inside this module — a reserved decision
  *                  completed unassisted, an effect in `unknown`, reminders that
- *                  stopped, a buried case, and `AuthorityUnavailable`. Every one
+ *                  stopped, a buried case, `AuthorityUnavailable`, and the
+ *                  **abstention rate moving sharply**. The last is the eighth
+ *                  condition's other half: an abstention is a *verdict*, so
+ *                  `approval` is the only module that sees one, and a run of two
+ *                  hundred individually correct abstentions is a deployment that
+ *                  stopped deciding while every case behaved as designed. It is
+ *                  a property of a window rather than of a case, so it is wired
+ *                  by `ApprovalDeps.abstentionRate` — window, sharpness and
+ *                  minimum sample, none of them defaulted — and raised through
+ *                  the same `alerting` as the other five. Every one
  *                  of them returns success or returns nothing at all, so none is
  *                  reachable by catching an exception. They are raised through
  *                  the injected `alerting` and what became of each raise is on
@@ -198,12 +222,14 @@ export { inMemoryClientFactory } from "./lib/in-memory-clients.js";
 export type { InMemoryClients, InMemoryClientOptions } from "./lib/in-memory-clients.js";
 
 export type {
+  AbstentionRateTerms,
   Approval,
   ApprovalDeps,
   ApprovalRecord,
   ApprovalStore,
   ApproverAnswer,
   AnyDecisionPoint,
+  NoEffectPayload,
   AnswerReceipt,
   AnsweringContext,
   Authority,
@@ -242,7 +268,9 @@ export type {
   IdempotencyKey,
   IdempotencyState,
   Instant,
+  KillSwitchQuery,
   KillSwitchReader,
+  KillSwitchScope,
   KillSwitchState,
   Licence,
   Limits,

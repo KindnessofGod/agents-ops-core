@@ -207,13 +207,16 @@ export class DetectorSetEmpty extends GuardrailsError {
  * duplicated store-assigned sequence, or a parent the module did not name.
  *
  * Fail-closed at every tier, **incident**, and raised before any detector runs.
- * The reason it exists at all: `GuardrailsDeps.audit` is a structural interface,
- * so `result.recorded === true` is a claim the witness makes about itself, and
- * `docs/design/OPEN-ITEMS-RESOLVED.md` §1 resolved that exact hole with a brand
- * that sits on `TraceStore` and on `Screening` — one layer below this module and
- * one layer above — but not on `Audit`. Until it does, replay is the only proof
- * of a write available here, and this is what refusing to proceed without one
- * looks like.
+ * The reason it exists at all: `result.recorded === true` is a claim the witness
+ * makes about itself. `docs/design/OPEN-ITEMS-RESOLVED.md` §1 resolved the
+ * forgery half of that with a brand on `TraceStore` and on `Screening`, and
+ * `Audit` now carries one too — this note used to say "but not on `Audit`. Until
+ * it does…", and that is no longer the state of the code.
+ *
+ * The brand does not retire this error. It proves the witness came from
+ * `createAudit`; it says nothing about whether the store underneath persisted a
+ * byte. Replay remains the only proof of a write available here, and this is
+ * what refusing to proceed without one looks like.
  */
 export class AuditWitnessUnsound extends GuardrailsError {
   override readonly name = "AuditWitnessUnsound";
@@ -289,6 +292,33 @@ export class LimitsInvalid extends GuardrailsError {
     readonly actual: unknown,
   ) {
     super(`limit ${limit} must be a positive safe integer; got ${String(actual)}`);
+  }
+}
+
+/**
+ * A preemptive scan pool was configured with a bound it cannot honour.
+ *
+ * Fail-closed, at construction, and separate from `LimitsInvalid` because the
+ * resource is different in kind: `Limits` bounds arithmetic inside this process,
+ * and these bound **threads, heaps and a queue**. `maxWorkers: 4096` is not a
+ * wrong answer, it is a machine that stops responding, and the loudest cheap
+ * place to refuse it is boot rather than the first busy afternoon.
+ *
+ * Every field is required and every one has a ceiling as well as a floor. There
+ * is deliberately no unbounded setting and no override: an operator who needs
+ * more throughput adds machines, and an operator who has reached for an
+ * unbounded queue at 4pm on a Friday has converted a slow detector into an
+ * out-of-memory incident.
+ */
+export class ScanPoolInvalid extends GuardrailsError {
+  override readonly name = "ScanPoolInvalid";
+  override readonly incident = false;
+  constructor(
+    readonly setting: string,
+    readonly actual: unknown,
+    readonly detail: string,
+  ) {
+    super(`scan pool setting ${setting} ${detail}; got ${String(actual)}`);
   }
 }
 

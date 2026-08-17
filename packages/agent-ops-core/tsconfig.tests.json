@@ -1,0 +1,25 @@
+// Typecheck the tests.
+//
+// `tsconfig.json` excludes `src/**/tests/**` because tests must not reach the
+// published `dist/`. That exclusion also meant the tests were never typechecked
+// at all, and a test that does not typecheck is a test that can assert against
+// an interface the module no longer has. It hid a real one for a release: when
+// `TraceStore.append` started returning `AppendAck`, a decorator in
+// `guardrails/tests/production.test.ts` still declared `Promise<RecordedNode>`,
+// and `npm run check` was green.
+//
+// So the tests get their own pass: same strictness, no emit, no `composite`,
+// nothing written to disk. It is wired into `npm run check` as
+// `typecheck:tests`, after the build and before the tests themselves run —
+// a type error here fails the gate rather than waiting for someone to notice.
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "composite": false,
+    "declaration": false,
+    "declarationMap": false,
+    "sourceMap": false
+  },
+  "include": ["src/**/*.ts"]
+}

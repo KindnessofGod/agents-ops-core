@@ -7,11 +7,14 @@ import {
   exactVerdict,
   exitCodeFor,
   gate,
+  inMemoryRunLedger,
   judgePanel,
   manualTimers,
   ProviderUnavailable,
   run,
+  runKeyOf,
   scriptedModelBackend,
+  systemTimers,
 } from "../index.js";
 import type { ModelBackend, RunSpec, Subject } from "../index.js";
 import {
@@ -256,5 +259,107 @@ describe("the gate keeps the two causes apart, all the way to the exit code", ()
     // A provider outage is not a standard. Baking one in means every later run
     // is compared against a run that partly did not happen.
     expect(() => accept({ report: throttled, by: "a.engineer", at: 1 })).toThrow();
+  });
+
+  /**
+   * The failure that matters most, and the one this whole separation exists for.
+   *
+   * A storm rarely arrives alone. The interesting run is the one where the
+   * provider refused some cases **and** the subject genuinely got worse on
+   * others: if the gate reports the regression, the build goes red with `1`, the
+   * engineer re-runs, it goes red again for a different reason, and the third
+   * time somebody turns the gate off. The order in `decide` is what stops that,
+   * and an order is only a guarantee if something asserts it with both signals
+   * present at once.
+   */
+  it("reports the storm, not the regression, when a run contains both", async () => {
+    const { recorder } = harness();
+    const good = await run({ ...specFor(echoBackend()), recorder });
+    const baseline = accept({ report: good, by: "a.engineer", at: 1_700_000_000_000 });
+
+    const both = await run({
+      ...specFor(
+        scriptedModelBackend({
+          id: "storm-and-regression",
+          answer: (request) => {
+            // INV-0002: the provider will not serve.
+            if (request.prompt["ref"] === "INV-0002") {
+              throw new ProviderUnavailable("test-model", "429 Too Many Requests", null);
+            }
+            // INV-0001 and INV-0003: served, and the answer is now wrong. Both
+            // were correct in the baseline, so this run really does contain a
+            // two-case regression.
+            return { text: "not-duplicate", tokensIn: 10, tokensOut: 2 };
+          },
+        }),
+      ),
+      recorder: harness().recorder,
+      limits: { ...smallLimits, concurrency: 1, maxCaseFailures: 5 },
+    });
+
+    // Both signals are on the artefact — nothing is hidden, and the regression
+    // is still there to read once the provider is serving again.
+    expect(both.couldNotEvaluateBasisPoints).toBeGreaterThan(0);
+    expect(both.correctBasisPoints).toBeLessThan(10_000);
+
+    const outcome = await gate({ report: both, baseline, floors: DEFAULT_FLOORS, recorder });
+    expect(outcome.kind).toBe("blocked");
+    if (outcome.kind !== "blocked") throw new Error("unreachable");
+    // The storm wins. Nothing downstream of a provider that would not serve is a
+    // statement about the subject, so reporting the regression first would be
+    // reporting the weather as a defect.
+    expect(outcome.reason).toBe("could-not-evaluate");
+    expect(outcome.counts.regressed.length).toBeGreaterThan(0);
+
+    const decision = exitCodeFor({ kind: "gate", outcome });
+    expect(decision.code).toBe(2);
+    expect(decision.kind).toBe("could-not-evaluate");
+    // The word at the top of the continuous-integration log is the thing an
+    // engineer reads at 07:40, and it must not say FAIL.
+    expect(decision.line).toContain("INDETERMINATE");
+    expect(decision.line).not.toContain("FAIL");
+  });
+
+  /**
+   * The second half of "a storm is a fact about ten minutes on a Tuesday".
+   *
+   * `idempotency.test.ts` proves a **partial** run is not memoised. This is the
+   * other shape, and it is the more dangerous one: a run that finished every
+   * case it was going to finish, is not partial, and still could not evaluate
+   * some of them. Memoised, that outage would become a permanent property of the
+   * run key — free, instant and unfalsifiable, with no later run able to re-ask.
+   */
+  it("does not memoise a completed run that could not evaluate part of itself", async () => {
+    const ledger = inMemoryRunLedger();
+    const spec = {
+      ...specFor(refusing("INV-0002")),
+      limits: { ...smallLimits, concurrency: 1, maxCaseFailures: 5 },
+    };
+    const storm = await run({
+      ...spec,
+      recorder: harness(passthroughRedactor, systemTimers(), ledger).recorder,
+    });
+    expect(storm.partial).toBe(false);
+    expect(storm.couldNotEvaluateBasisPoints).toBeGreaterThan(0);
+
+    // Not in the ledger, so the next run re-asks the question rather than being
+    // handed the outage back.
+    expect(await ledger.findCompleted(runKeyOf(spec))).toBeUndefined();
+
+    let served = 0;
+    const recovered = await run({
+      ...spec,
+      models: echoBackend(() => {
+        served += 1;
+        return { text: "duplicate", tokensIn: 10, tokensOut: 2 };
+      }),
+      recorder: harness(passthroughRedactor, systemTimers(), ledger).recorder,
+    });
+    // The refused case was re-executed; the two that succeeded were carried.
+    expect(served).toBe(1);
+    expect(recovered.correctBasisPoints).toBe(10_000);
+    expect(recovered.couldNotEvaluateBasisPoints).toBe(0);
+    // And the recovered run — a real one — is memoised.
+    expect(await ledger.findCompleted(runKeyOf(spec))).toBeDefined();
   });
 });

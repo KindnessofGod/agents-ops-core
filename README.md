@@ -10,18 +10,32 @@ that nineteen callers learn a little and get a lot.
 
 | Module | What a caller gets | Interface / implementation |
 |---|---|---|
-| `audit` | An append-only trace, replayable by correlation identifier, sealed at close and witnessed | 386 / 5,404 lines |
-| `approval` | Everything between a verdict and an effect: tier routing, reserved decisions, the human gate, the escalation ladder, dual control, durable suspension, idempotency, the kill switch | 357 / 6,222 |
-| `guardrails` | Screening before a decision and checking before an effect, with redaction that runs before write | 467 / 5,512 |
-| `evals` | Golden suites, shadow runs, judge panels and a continuous-integration gate | 601 / 7,378 |
-| `alerts` | The eight silent conditions, a severity model, an ordered sink chain, and heartbeats for an external watchdog | 345 / 3,194 |
+| `audit` | An append-only trace, replayable by correlation identifier, sealed at close, witnessed, and idempotent where the caller names the append | 412 / 5,888 lines |
+| `approval` | Everything between a verdict and an effect: tier routing, reserved decisions, the human gate, the escalation ladder, dual control, durable suspension, idempotency, the tier-scoped kill switch | 385 / 6,690 |
+| `guardrails` | Screening before a decision and checking before an effect, with redaction that runs before write and optional preemption of a runaway detector | 570 / 6,533 |
+| `evals` | Golden suites, shadow runs, judge panels and a continuous-integration gate | 601 / 7,391 |
+| `alerts` | The eight silent conditions, a severity model, an ordered sink chain, and durable heartbeats for an external watchdog | 401 / 4,484 |
 
-76 test files, 707 tests, all hermetic: no network, no database, and no real
-clock driving any behaviour under test — `evals/tests/bounds.test.ts` reads the
-wall clock twice, as a coarse ceiling on its own runtime, and nothing else does.
-That is structural, not conventional — no module constructs its own model
-client, database handle, clock or transport, so a test cannot reach a live
-model or a real pager with real credentials sitting in the environment.
+87 test files, 825 tests. 786 are hermetic and run everywhere: no network, no
+database, no real clock driving behaviour under test. That is structural, not
+conventional — no module constructs its own model client, database handle,
+clock or transport, so a test cannot reach a live model or a real pager with
+real credentials sitting in the environment, and
+`audit/tests/hermetic.test.ts` checks that promise against the source on disk
+rather than trusting the paragraph you are reading.
+
+The remaining 39 are **gated live-database tests**, one suite each under
+`approval`, `audit`, `evals` and `guardrails`. They skip cleanly and load no
+driver unless `AGENT_OPS_LIVE_DATABASE_URL` names a throwaway Postgres, so the
+default run is unchanged; set it and they attack the schema's own guarantees
+and assert which SQLSTATE and which named constraint refused each attempt. See
+"Prove it against a real database" below.
+
+Two places read the wall clock, both deliberately:
+`guardrails/tests/preemption.test.ts` measures real elapsed time, because the
+claim under test is that a runaway thread was really terminated, and a virtual
+clock cannot show that; and the gated live suites, which are already talking to
+a real server. Everything else drives an injected clock.
 
 Read `docs/CONTEXT.md` before naming anything. The vocabulary is binding and
 several of its terms overlap in ordinary speech: *unassisted containment* is
@@ -40,74 +54,91 @@ liability the first time a regulator finds the gap.
 
 1. **The watchdog is external and is not here.** `approval.sweep` fires every
    reminder in the system and emits a heartbeat on every run, including empty
-   ones. `alerts` ships the emit side, the store, the verdict
+   ones. `alerts` ships the emit side, both store adapters, the verdict
    (`livenessFindings`) and the query (`livenessQuery`). It does **not** ship
    the watcher, and a watchdog that runs inside the process it watches fails
    silently at the exact moment it is needed. Deploy without an external
    watcher and a stopped sweeper stops chasing every waiting case, with nothing
    thrown and no dashboard red, until a customer telephones.
-   `EXTERNAL_WATCHDOG_REQUIREMENT` is the sentence to carry verbatim.
-2. **Liveness records are held in memory only.** `inMemoryLivenessStore` is the
-   one shipped adapter; `postgresLivenessStore` is named and not built, because
-   it needs a migration that does not exist. Beat history dies with the
-   process, so a watcher polling across a restart sees `never-seen` rather than
-   a real gap. That is the safe direction and it is still a limit.
-3. **`AlertJournal` also has one adapter**, in memory. The `audit`-backed one is
-   named and not built.
+   `EXTERNAL_WATCHDOG_REQUIREMENT` is the sentence to carry verbatim. A durable
+   liveness store makes the watcher's job possible; it does not make the
+   watcher exist, and nothing in continuous integration can prove one is
+   running — it is a second process on a second host.
 
 **Guarantees that stop short of where they sound like they stop.**
 
-4. **`audit.record` is not idempotent.** A retry after a crash appends a second
-   node rather than returning the first. Deduplicating appends needs an
-   idempotency-key column and a partial unique index that
-   `migrations/0002_audit_trace.sql` does not have. At-most-once is about
-   *effects*, and `approval` owns that.
-5. **The Postgres schema's own guarantees are not exercised by any test here.**
-   The primary key, the one-seal partial unique index, the parent foreign key,
-   the immutability triggers and the `INSERT`-only grants are properties of
-   Postgres. No test in this package opens a socket, deliberately, so a green
-   test run is evidence about the adapters' behaviour and is **not** evidence
-   that append-only holds in the database. `sqlExecutorContract` is runnable
-   against a live pool from an operational script; nothing runs it in
-   continuous integration today.
-6. **The witness that would cross a trust boundary is not shipped.**
+2. **The witness that would cross a trust perimeter is not shipped.**
    `inMemoryWitness` and `postgresWitness` both sit inside our own custody, so
    an adversary holding both sets of credentials defeats both. The third
    adapter — a custodian outside this organisation — is named and deliberately
    unbuilt, because shipping it means choosing a custodian for nineteen
    applications.
-7. **Retention is prepared, never performed.** `RetentionRegister` lists sealed
+3. **Retention is prepared, never performed.** `RetentionRegister` lists sealed
    cases past seven years and `Archivist.clearForRemoval` proves an archive copy
    faithful; every verb on both is a read, and the build fails if a removing
    verb is added. The removal itself is a procedure for a separately-authorised
    role against a runbook a person signs, because an `expire()` verb would mean
    nineteen applications holding a `DELETE` grant all day, every day.
-8. **`Audit` is the one unbranded witness.** `TraceStore`, `EvalNodeStore`,
-   `RunLedger` and `Screening` are branded with non-exported symbols, so
-   structural impostors do not typecheck. `GuardrailsDeps.audit` names `Audit`,
-   which is structural: a fully-typed object that acknowledges every write and
-   persists nothing satisfies it. `guardrails` compensates by checking every
-   acknowledgement and proving its first node by replay. A brand on `Audit` is
-   the real fix and is not done.
-9. **Redaction masks detected sites.** A name, address or diagnosis in a shape
+4. **Redaction masks detected sites.** A name, address or diagnosis in a shape
    no pattern matched is recorded in full, bounded by `maxRecordedFieldChars`.
    `Screening.coverage` makes the residue visible — how much was examined,
    masked, and written verbatim — rather than claiming to have closed it.
-10. **A polynomial detector stall is still reachable.** `safePattern` refuses
-    every regular expression capable of exponential backtracking, but an
-    accepted pattern can still cost on the order of `maxFieldChars²` character
-    comparisons on one field, and nothing in this runtime can preempt it. The
-    bound is computable from `Limits`; true preemption needs a worker thread.
-11. **Half of the eighth silent condition is unimplemented.** `docs/CONTEXT.md`
-    names it "abstention rate, **or** fail-closed screening rate, moves
-    sharply". `AlertCondition.measure` declares both; only
-    `fail-closed-screening` is ever produced. Nothing here watches the
-    abstention rate.
-12. **Kill-switch scope is recorded, not enforced.** `CONTEXT.md` says a kill
-    switch stops effects "system-wide or per tier". `KillSwitchReader` takes no
-    tier and asks no per-tier question; `scope` is a string written onto the
-    node. Per-tier behaviour is the reader's own business, and the trace will
-    faithfully record whatever it claims.
+5. **Preemption moves personal data into a heap this module cannot prove it
+   released.** `preemptiveDetector` is opt-in per detector for this reason: the
+   configured fields' text crosses into a worker thread that `guardrails`
+   cannot freeze, deep-copy or prove it has cleared. Four things shrink the
+   window — only configured fields cross, the worker drops its reference on
+   reply, workers retire at `maxTasksPerWorker`, and a preempted worker is
+   terminated immediately — and none of them closes it. The in-process detector
+   remains the default.
+6. **A caller-supplied detector that never yields is still unbounded.**
+   `preemptiveScanPool` bounds the detectors that run in it. A detector that
+   neither awaits, nor reads its deadline, nor runs in a pool has its *answer*
+   refused on time and its *work* bounded by nothing this module can offer.
+   `preemptiveScanPool` also requires the deployment to call `close()` at
+   shutdown; idle workers are unref'd so a process can still exit, but an
+   unclosed pool holds threads, and that is not enforceable from here.
+
+**Duplication and drift we have named rather than fixed.**
+
+7. **The abstention-rate and screening-rate watches are two implementations of
+   one shape.** `guardrails` owns `createRateWatch` and watches the
+   fail-closed screening rate; `approval` has a structurally parallel private
+   one and watches the abstention rate, because an abstention is a *verdict*
+   and only `approval` sees one. They cannot share code without one module
+   reaching into the other's `lib/`. The long-term home for the shape is
+   `alerts`, which owns the condition. Until it moves, a rule changed in one
+   and not the other is a real drift risk.
+8. **`auditBackedAlertJournal` never closes a trace, so it can find one already
+   closed.** Sealing a case is `audit`'s reserved `case.` node and the alerting
+   module has no business doing it. An application whose cases are closed by
+   another path will find the journal opening a sealed case; `audit` raises
+   `CaseAlreadyClosed`, which surfaces as `journalled: false, why:
+   "journal-failed"` on an outcome that still says `delivered`. That is the
+   safe direction and it is still a limit.
+9. **An eval run identifier can collide between two processes.** `runId` is
+   minted from the run key, the opening instant and a counter, so two processes
+   opening the same run key in the same millisecond mint the same identifier
+   and lose to the `eval_run` primary key. A benign concurrent-build race is
+   reported as `EvalStoreUnavailable` — an integrity failure, exit 3. The fix
+   is a design fork (a random suffix weakens content-addressing) and is not
+   made.
+
+**Release engineering that is guarded but not finished.**
+
+10. **There is no publish pipeline.** `npm run check:package` proves the
+    published surface is correct — `dist/` present, no sources, no build state,
+    every export target resolving inside the tarball, zero runtime
+    dependencies — but nothing tags, publishes, attaches provenance or checks
+    the version. The guard exists; the pipeline does not.
+11. **Continuous-integration actions are pinned to major tags, not commit
+    digests.** `actions/checkout@v4` and `actions/setup-node@v4` are mutable
+    references. Digest pinning is the right posture for a regulated library and
+    needs someone with registry access to resolve them — a wrong digest is a
+    workflow that never runs.
+12. **`LICENSE` names no legal entity.** The package declares MIT and now ships
+    the licence text, under the collective holder "the agent-ops-core authors".
+    The real copyright holder must be confirmed before a first publish.
 
 **Adapters the applications must bring.** The library ships no domain, so it
 ships no `TierPolicy`, `ReservedPolicy`, `AuthorityDirectory` or
@@ -137,7 +168,7 @@ Four commands, no account anywhere:
 git clone https://github.com/kindnessofgod/agents-ops-core.git
 cd agents-ops-core && npm install
 npm run db:up          # Postgres 16 + migrations, via docker compose
-npm run check          # typecheck + module boundaries + 707 tests
+npm run check          # typecheck (sources and tests) + boundaries + vocabulary + 786 tests
 ```
 
 `npm run db:up` starts Postgres 16 on host port **5433** (not 5432, so it will
@@ -149,6 +180,46 @@ everyone, secret from nobody. Override the port with `AGENT_OPS_PG_PORT`.
 
 Tests need no database and no network. `npm run db:up` is for running the
 system, not for `npm test`.
+
+---
+
+## Prove it against a real database
+
+`npm run check` is evidence about the adapters. It is **not** evidence that
+append-only holds in Postgres, because the primary key, the one-seal partial
+unique index, the parent foreign key, the immutability triggers and the
+`INSERT`-only grants are properties of the database, not of TypeScript. Four
+gated suites and one script close that, and none of them runs unless you point
+them at a database:
+
+```bash
+npm run db:migrate -- --to postgres://…   # apply ./migrations in filename order
+AGENT_OPS_LIVE_DATABASE_URL=postgres://… npm run test:live
+AGENT_OPS_LIVE_DATABASE_URL=postgres://… npm run verify:liveness
+npm run check:package                      # what the tarball would actually ship
+```
+
+Use a **throwaway** database. Every suite refuses one holding rows it did not
+write, and `verify:liveness` truncates between groups. The connection must be
+the table owner or a superuser: several cases deliberately step out of the
+grants, so that the immutability trigger is the only thing left that can refuse
+the write — a non-owner connection makes those pass for the wrong reason.
+
+`npm run test:live` inverts the gate on purpose. Once the connection string is
+set, a suite that *skips* is a **failure** (`LiveSuiteSkipped`), as is a suite
+that reports no test at all. A live run that quietly skips is the false green
+this whole arrangement exists to remove. Suites are discovered from
+`<module>/tests/live-*.test.ts` rather than listed, so a new one is picked up
+without an edit.
+
+`alerts` has no gated suite and this is deliberate:
+`alerts/tests/production.test.ts` asserts structurally that **no** file under
+`alerts/tests/` reads an environment variable at all, and `alerts` is the module
+that can page a real engineer at 03:00, so it holds the strongest hermetic
+guarantee here. Its live coverage is `scripts/verify-liveness-store.mjs` —
+outside the package, never collected by vitest — which runs the eight
+`livenessStoreContract` obligations, the restart proof, six schema attacks and
+seven concurrency checks against a real cluster.
 
 ---
 

@@ -12,6 +12,7 @@ import {
   createApproval,
   defineDecisionPoint,
   inMemoryApprovalStore,
+  type AbstentionRateTerms,
   type Approval,
   type ApprovalStore,
   type AnyDecisionPoint,
@@ -20,9 +21,13 @@ import {
   type AuthorityPoolId,
   type BriefRenderer,
   type ClientFactory,
+  type EffectCommand,
+  type EvidenceQuery,
+  type ReadOnlyClient,
+  type WriteCapableClient,
   type EscalationLadder,
   type HumanAuthority,
-  type KillSwitchState,
+  type KillSwitchReader,
   type Limits,
   type PolicyFacts,
   type Reminder,
@@ -79,16 +84,24 @@ export const clientFactory = (
   evidence: Readonly<Record<string, unknown>> = {},
   writes: string[] = [],
 ): ClientFactory => ({
-  readOnly: () => ({
-    read: async (query) => evidence[query.ref] as never,
-  }),
-  writeCapable: () => ({
-    read: async (query) => evidence[query.ref] as never,
-    write: async (command) => {
-      writes.push(`${command.kind}:${command.idempotencyKey}`);
-      return { reference: `ref_${writes.length}` } as never;
-    },
-  }),
+  // `Client` carries a phantom `[CAPABILITY]` under a non-exported `unique
+  // symbol` — present at the type level, absent at runtime, and the thing that
+  // makes the read-only and write-capable clients structurally disjoint rather
+  // than merely differently documented. No object literal can supply it, so
+  // every construction site casts; `inMemoryClientFactory` casts in exactly the
+  // same two places, and this fixture matching it is the point.
+  readOnly: () =>
+    ({
+      read: async <E>(query: EvidenceQuery<E>): Promise<E> => evidence[query.ref] as E,
+    }) as unknown as ReadOnlyClient,
+  writeCapable: () =>
+    ({
+      read: async <E>(query: EvidenceQuery<E>): Promise<E> => evidence[query.ref] as E,
+      write: async <R>(command: EffectCommand<R>): Promise<R> => {
+        writes.push(`${command.kind}:${command.idempotencyKey}`);
+        return { reference: `ref_${writes.length}` } as R;
+      },
+    }) as unknown as WriteCapableClient,
 });
 
 export const tierBy = (map: Readonly<Record<string, Tier>>, version = "tier-2026-08"): TierPolicy => ({
@@ -217,7 +230,7 @@ export interface HarnessOptions {
   readonly tierPolicy?: TierPolicy;
   readonly reservedPolicy?: ReservedPolicy;
   readonly members?: readonly HumanAuthority[];
-  readonly killSwitch?: () => Promise<KillSwitchState>;
+  readonly killSwitch?: KillSwitchReader;
   readonly evidence?: Readonly<Record<string, unknown>>;
   readonly limits?: Partial<Limits>;
   readonly startAt?: number;
@@ -232,6 +245,8 @@ export interface HarnessOptions {
    * live credentials present. Hermeticism is a fact about the call graph here.
    */
   readonly alerting?: AlertRaiser;
+  /** Window terms for the abstention-rate watch. Absent, nothing is counted. */
+  readonly abstentionRate?: AbstentionRateTerms;
   readonly heartbeat?: Heartbeat;
   readonly sweeperComponent?: ComponentId;
 }
@@ -269,6 +284,7 @@ const buildOn = (
     limits: { ...DEFAULT_LIMITS, ...options.limits },
     sweeperId: options.sweeperId ?? "sweeper-a",
     alerting: options.alerting,
+    abstentionRate: options.abstentionRate,
     heartbeat: options.heartbeat,
     sweeperComponent: options.sweeperComponent,
   });

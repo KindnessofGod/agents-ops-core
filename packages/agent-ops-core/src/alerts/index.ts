@@ -24,7 +24,8 @@
  *   createAlerts              `raise(condition)` and `health()`. Ordered sink
  *                             chain, bounded, suppressed, journalled, ledgered.
  *   createHeartbeat           `beat({ component, run })`. Every run, including
- *                             the empty ones.
+ *                             the empty ones. Durable across a restart when
+ *                             wired to `postgresLivenessStore`.
  *   createLivenessCheck       `check()`. Reads the store, judges it against an
  *                             injected clock, raises what is overdue.
  *   livenessQuery             What an EXTERNAL watcher polls. See below.
@@ -117,17 +118,23 @@
  *                    `OperationalStream`. `recordingAlertSink` is a third and is
  *                    a test deliverable — `assertProductionAlerting` refuses it
  *                    by name, which is what keeps it from being counted.
- *   `AlertJournal`   **ONE adapter — hypothetical, and reported as such.**
- *                    `inMemoryAlertJournal` ships. The `audit`-backed adapter is
- *                    named and deliberately not built here: wiring two modules
- *                    together is a composition-root decision, and the payload is
- *                    already node-shaped so that it is four lines when it is.
- *   `LivenessStore`  **ONE adapter — hypothetical.** `inMemoryLivenessStore`
- *                    ships; `postgresLivenessStore` is named and not built,
- *                    because it needs a migration that does not exist. The cost
- *                    is stated where the adapter is: beat history dies with the
- *                    process, so a watcher polling across a restart sees `never`
- *                    rather than `beat` — the safe direction, and still a limit.
+ *   `AlertJournal`   **A real seam.** Two shipped adapters:
+ *                    `inMemoryAlertJournal`, and `auditBackedAlertJournal`,
+ *                    which records the alert as a node on the case's own trace.
+ *                    The second takes the trace as a **parameter** rather than
+ *                    importing `audit` — `audit` already imports
+ *                    `raiseAndRecord`, so an import back would be a cycle the
+ *                    boundary lint fails on. `Audit` satisfies the parameter
+ *                    structurally, so the composition root writes one line.
+ *   `LivenessStore`  **A real seam.** Two shipped adapters:
+ *                    `inMemoryLivenessStore`, whose beat history dies with the
+ *                    process, and `postgresLivenessStore` over an injected
+ *                    `SqlExecutor`, whose does not. Both are held to the same
+ *                    obligations by `livenessStoreContract`.
+ *   `SqlExecutor`    **Not a seam — the injection point**, exactly as in
+ *                    `audit`, and structurally the same interface so one
+ *                    composition root hands one object to both. This package
+ *                    imports no driver, shipped or test.
  *   `PageTransport`  **Not a seam — the injection point.** This package may not
  *                    take an HTTP dependency nineteen applications inherit, so
  *                    the transport arrives as a parameter. One shape, no
@@ -158,10 +165,6 @@
  * half is the half an auditor reads.
  *
  * ## What is deliberately not here
- *
- * **`audit` does not back the journal.** The `AlertJournal` seam still ships one
- * adapter. Wiring the audit-backed one is a composition-root decision and the
- * payload is already node-shaped so that it is four lines when someone makes it.
  *
  * **No alert rate limiting by severity, no escalation of an alert to a second
  * rota, no acknowledgement tracking.** Those are a paging product's job, and
@@ -299,8 +302,24 @@ export {
 } from "./lib/sinks.js";
 export type { RecordingAlertSink } from "./lib/sinks.js";
 
-export { inMemoryAlertJournal } from "./lib/journal.js";
-export type { InMemoryAlertJournal } from "./lib/journal.js";
+/**
+ * Journal adapters. Two, which is what makes `AlertJournal` a real seam.
+ *
+ * `auditBackedAlertJournal` takes the trace as a **parameter** rather than
+ * importing `audit`: `audit` already imports `alerts.raiseAndRecord`, so an
+ * import back would be a cycle the boundary lint fails on. `audit`'s `Audit`
+ * satisfies `AlertTraceOpener` structurally, with no adapter and no cast, so the
+ * composition root writes one line. See `lib/journal.ts` for the direction note.
+ */
+export { auditBackedAlertJournal, inMemoryAlertJournal } from "./lib/journal.js";
+export type {
+  AlertCaseTrace,
+  AlertTraceOpener,
+  AuditBackedJournalDeps,
+  AuditBackedJournalLimits,
+  InMemoryAlertJournal,
+} from "./lib/journal.js";
+export { DEFAULT_AUDIT_JOURNAL_LIMITS } from "./lib/journal.js";
 
 export {
   createHeartbeat,
@@ -309,6 +328,39 @@ export {
   inMemoryLivenessStore,
   livenessFindings,
 } from "./lib/heartbeat.js";
+
+/**
+ * The durable liveness store, over an injected `SqlExecutor`. No driver is
+ * imported in this package, in shipped code or in test — see `lib/sql.ts`.
+ *
+ * Needs `migrations/0008_alerts_liveness.sql`. Without the table, `watch` fails
+ * on the composition root's first call rather than at the first incident.
+ */
+export { DEFAULT_POSTGRES_LIVENESS_LIMITS, postgresLivenessStore } from "./lib/postgres-liveness-store.js";
+export type { PostgresLivenessLimits } from "./lib/postgres-liveness-store.js";
+export type { SqlExecutor, SqlRow } from "./lib/sql.js";
+
+/**
+ * The `LivenessStore` contract, as an executable suite.
+ *
+ * Two adapters that quietly disagree are worse than one, and the obligations
+ * that matter here — the monotonic clamp, the store-assigned sequence, the fact
+ * that a never-beaten component still appears in a snapshot — are exactly the
+ * ones a fast adapter gets right by accident and a durable one gets wrong under
+ * concurrency. Framework-free, so it runs under any runner; runnable against a
+ * live pool from an operational script, which is the run that says anything at
+ * all about the schema's own guarantees.
+ */
+export {
+  LivenessStoreContractViolation,
+  livenessStoreContract,
+  runLivenessStoreContract,
+} from "./lib/store-contract.js";
+export type {
+  LivenessStoreContractCase,
+  LivenessStoreContractOutcome,
+  LivenessStoreContractSubject,
+} from "./lib/store-contract.js";
 
 /**
  * What an **external** watcher needs, and nothing that pretends to be one.
@@ -336,10 +388,14 @@ export type { AlertRaiser, AlertRecord, AlertRecordFields } from "./lib/wiring.j
  */
 export {
   AlertError,
+  AlertJournalEntryUnrecordable,
   AlertLimitsUnusable,
   AlertPayloadInvalid,
   AlertingMisconfigured,
   ComponentNotWatched,
+  LivenessBeatUnrecordable,
+  LivenessRecordCorrupt,
+  LivenessStoreUnavailable,
   LivenessTermsConflict,
   UnknownAlertCondition,
 } from "./lib/errors.js";

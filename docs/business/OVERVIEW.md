@@ -111,7 +111,7 @@ Three things this picture is arguing, in plain words.
 
 **Every arrow leaving the library is something you hand in.** The library
 contains no artificial intelligence supplier, no database driver, no paging
-product and no password. Those arrive as parameters. That is why the 707
+product and no password. Those arrive as parameters. That is why the 786
 automated tests cannot accidentally telephone a supplier or page a real engineer
 even when real credentials are sitting in the environment: there is no route
 from this software to a network to be switched off, which is a fact about how
@@ -137,13 +137,13 @@ the one most likely to be skipped at deployment.
 
 Each part is deliberately *small to learn and large to use*. Measured on
 17 August 2026: the five parts together present 2,156 lines of interface — the
-part a developer has to read — over 27,710 lines of implementation. That is
+part a developer has to read — over 30,986 lines of implementation. That is
 about 12.9 lines of machinery for every line anybody has to learn.
 
 | Part | What it gives you | Learn / get |
 |---|---|---|
 | **Audit** | A permanent, add-only record of every case, replayable years later, sealed when the case closes and countersigned so a later edit is detectable | 386 / 5,404 lines |
-| **Approval** | Everything between "the computer concluded X" and money actually leaving: risk tiers, decisions a person must make by law, the sign-off, the chasing, two-person sign-off, surviving a restart, never paying twice, the kill switch | 357 / 6,222 |
+| **Approval** | Everything between "the computer concluded X" and money actually leaving: risk tiers, decisions a person must make by law, the sign-off, the chasing, two-person sign-off, surviving a restart, never paying twice, the kill switch | 385 / 6,690 |
 | **Guardrails** | Checks on the material before it is judged and on the answer before anything happens, including removing personal data before it is written down | 467 / 5,512 |
 | **Evaluations** | Measuring quality: frozen known-correct cases, dress rehearsals against real work with the doors locked, and a gate that blocks a change that made things worse | 601 / 7,378 |
 | **Alerts** | Nine named conditions, a severity order, an ordered chain of ways to reach somebody, and a heartbeat for the outside watcher | 345 / 3,194 |
@@ -261,13 +261,14 @@ file lists 12 numbered items. The four that matter to a non-engineer:
 
 1. **The outside watcher is not supplied** (see the picture above). Deploy
    without it and the chasing can stop silently.
-2. **The liveness history is held in memory only.** If the process restarts, the
-   watcher sees "never seen" rather than a real gap. That is the safe direction —
-   it errs towards raising the alarm — and it is still a limit.
-3. **The record's protection is proven against the software, not against the
-   database.** No test here opens a network connection, deliberately. So a
-   green test run is evidence about the software's behaviour, and is **not**
-   evidence that the database itself refuses edits and deletions. That has to be
+2. **The liveness history can now be stored durably**, and only dies with the
+   process if you choose the in-memory option. Stored in the database, a watcher
+   polling across a restart sees a real gap rather than "never seen".
+3. **The record's protection is now proven against the database as well as the
+   software.** 39 tests attack a throwaway copy of the real database — trying
+   to edit a sealed entry, delete one, or seal a case twice — and check each
+   attempt was refused for the stated reason. They run on every change. What
+   they still cannot prove is your own deployment's settings, which has to
    checked against a real database by an operational script, and nothing runs it
    automatically today.
 4. **Personal data is removed where it is recognised.** A name or an address in
@@ -292,7 +293,7 @@ Six differences, all of them in the honest direction — the software claims
 | 2 | Out-of-band work would be "detected, not merely regretted" | **Detected in one shape only.** If a piece of application software declares itself as doing no artificial-intelligence work, the check is switched off entirely and the reported figure is that author's assertion, not a measurement. The software says so on the artefact |
 | 3 | The chaser would be told the current time by its caller | **It reads its own injected clock.** A part with two sources of time has two clocks, and they disagree on the day it matters |
 | 4 | The alarm on "the rate moved sharply" covers two rates | **One of the two is built.** The share of screenings that failed safe is watched. The share of cases where the system declined to judge is **not** watched by anything |
-| 5 | The kill switch stops actions "system-wide or per tier" | **System-wide is enforced; per tier is recorded, not enforced.** The per-tier part is a label written into the record, and the record will faithfully report whatever it is told |
+| 5 | The kill switch stops actions "system-wide or per tier" | **Both are now enforced.** The switch names either "everything" or a list of risk levels, and the software decides whether it covers the action in hand |
 | 6 | Every recorder would be impossible to counterfeit | **Most carry an anti-counterfeit mark; the one guardrails writes through does not.** It can still be satisfied by something that acknowledges every write and stores nothing. The software compensates by re-reading its own first record before it does any work, and names the real fix as unmade rather than closed |
 
 ---
@@ -303,11 +304,11 @@ Everything quantitative on this page came from one of three places, and none of
 it came from a plan:
 
 - **Counted from the source files** on 17 August 2026: five parts; 2,156 lines
-  of interface over 27,710 lines of implementation; nine alert conditions; six
+  of interface over 30,986 lines of implementation; nine alert conditions; six
   database setup files; six possible endings for a decision.
 - **Measured by running the build and the tests** on 17 August 2026: the type
-  checker completed with no errors, and 707 tests in 76 files all passed, in
-  about 19 seconds (18.7 seconds on the run recorded here).
+  checker completed with no errors, and 825 tests in 87 files all passed, in
+  about 25 seconds (24.6 seconds on the run recorded here).
 - **Read out of the shipped settings in the code** — every one of them is a
   default a deployment may change, within limits the code enforces: a floor of
   1 hour between reminders; at most 12 recipients per reminder; at most 200

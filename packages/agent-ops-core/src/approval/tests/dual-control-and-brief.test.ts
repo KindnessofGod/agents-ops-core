@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { AuthorityNotOffered, DualControlSelfApproval } from "../index.js";
+import {
+  AuthorityNotOffered,
+  DualControlSelfApproval,
+  type KillSwitchReader,
+} from "../index.js";
 import { CASE, harness, human, neverReserved, tierBy } from "./fixtures/harness.js";
 import { INVOICE, gatedDisbursement } from "./fixtures/points.js";
 import { compileFixture } from "./typecheck.js";
@@ -12,16 +16,14 @@ import { compileFixture } from "./typecheck.js";
  * decisions; it is Jane's decision with an echo.
  */
 
-const setup = (killSwitch?: () => Promise<{ engaged: boolean }>) =>
+const setup = (killSwitch?: KillSwitchReader) =>
   harness({
     points: [gatedDisbursement()],
     tierPolicy: tierBy({ disburse: "high" }),
     reservedPolicy: neverReserved(),
     evidence: { [INVOICE.id]: { matched: true } },
     members: [human("auth_jane"), human("auth_ravi"), human("auth_dowen")],
-    ...(killSwitch === undefined
-      ? {}
-      : { killSwitch: killSwitch as Parameters<typeof harness>[0]["killSwitch"] }),
+    ...(killSwitch === undefined ? {} : { killSwitch }),
   });
 
 const suspend = async (h: ReturnType<typeof setup>, id: string) => {
@@ -31,9 +33,14 @@ const suspend = async (h: ReturnType<typeof setup>, id: string) => {
 };
 
 describe("dual control — the second seat cannot see the first's verdict", () => {
+  // A generous timeout, not a slow test. This case runs the TypeScript
+  // compiler in-process over a fixture; under `vitest`'s default parallelism
+  // several such cases compile at once and the 5s default is a coin flip on a
+  // loaded machine. A flaky gate is worse than a slow one — it teaches people
+  // to re-run rather than to read.
   it("has no representation for it, proved by the compiler", () => {
     expect(compileFixture("dual-control-rejected.ts")).toEqual([]);
-  });
+  }, 30_000);
 
   it("serves a second brief carrying who and when, and nothing about what", async () => {
     const h = setup();
@@ -267,7 +274,7 @@ describe("kill switch — stops effects, never decisions", () => {
   it("records the whole decision and both approvals, and moves no money", async () => {
     const h = setup(async () => ({
       engaged: true,
-      scope: "tier:high",
+      scope: { kind: "tiers", tiers: ["high"] },
       by: "auth_ops_lead",
       at: 1_700_000_000_000,
     }));

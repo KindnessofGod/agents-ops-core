@@ -155,16 +155,30 @@
  * removal itself is a documented procedure run by a separately-authorised role
  * against a runbook a person signs. See `lib/retention.ts`.
  *
+ * ## Idempotent append, where the caller names the append
+ *
+ * `record` takes an optional `idempotencyKey`. Supplied, a retry after a crash
+ * returns the **first** node with `deduplicated: true` and writes nothing;
+ * omitted, an append is an append. There is no content-derived deduplication
+ * anywhere here, because two identical payloads in one case can be two real
+ * events and collapsing them would lose one — the library refuses to guess which
+ * the caller meant, exactly as it refuses to guess a resolution evidence source.
+ *
+ * It is enforced in the **database**, by a column and a partial unique index in
+ * `migrations/0007_audit_idempotency.sql`, not by a cache the writer forgets on
+ * restart — and both adapters hold it, through one shared expression of the rule
+ * in `lib/idempotency.ts`, because adding it to one adapter only would recreate
+ * the exact defect this module has spent its releases removing. A key reused for
+ * a *different* append raises `IdempotencyKeyConflict` rather than quietly
+ * returning the first node, because a caller who reused a key by mistake must
+ * not have their second event disappear.
+ *
+ * C2's at-most-once requirement is still about *effects*, which `approval` owns.
+ *
  * ## What is not here
  *
- * **Idempotent append.** `record` is not idempotent: a retry after a crash
- * writes a second node rather than returning the first. C2's at-most-once
- * requirement is about *effects*, which `approval` owns; two appends genuinely
- * happened and the trace is evidence of what happened. Making it idempotent
- * needs an `idempotency_key` column and a partial unique index that
- * `migrations/0002_audit_trace.sql` does not have, and adding it to one adapter
- * only would recreate the exact defect this release spent its time removing —
- * two adapters that do not hold the same invariants.
+ * **A witness under separate custody**, and the three qualifications on the
+ * capture guarantee above.
  *
  * ## Seam accounting, honestly
  *
@@ -207,9 +221,10 @@
  *     instead of a second adapter is `sqlExecutorContract` — an executable suite
  *     with no test-framework dependency, runnable in CI against an in-memory
  *     implementation and against a live pool from an operational script. It is
- *     the answer to the honest note at the foot of `tests/postgres-store.test.ts`:
- *     the schema's guarantees still need a real database, but the fifteen lines
- *     every composition root writes no longer need to be taken on trust.
+ *     the answer to the honest note at the foot of `tests/postgres-store.test.ts`.
+ *     `tests/live-postgres.test.ts` now runs that suite against a live pool as
+ *     well, alongside the schema attacks — so both halves are checked rather
+ *     than one being described.
  *   - **`DIGEST_ALGORITHM` — fixed, not a seam**, and versioned instead.
  *
  * See `docs/CONTEXT.md` for the vocabulary and
@@ -220,6 +235,7 @@ export type { Clock } from "./lib/clock.js";
 export { systemClock } from "./lib/clock.js";
 
 export type {
+  AppendAck,
   Audit,
   AuditDeps,
   AuditLimits,
@@ -264,6 +280,14 @@ export type {
 } from "./lib/types.js";
 
 export { createAudit } from "./lib/audit.js";
+
+/**
+ * The ceiling on an idempotency key, exported because a caller deriving one
+ * needs to know the bound before it hits it — and because the same number is a
+ * check constraint in `migrations/0007_audit_idempotency.sql`, so a reader
+ * finding one should be able to find the other.
+ */
+export { MAX_IDEMPOTENCY_KEY_CHARS } from "./lib/types.js";
 
 /** Store adapters. Two, which is what makes `TraceStore` a real seam. */
 export { inMemoryTraceStore } from "./lib/in-memory-store.js";
@@ -363,6 +387,8 @@ export {
   NoSuchCase,
   CaseAlreadyClosed,
   CaseNotClosed,
+  IdempotencyKeyConflict,
+  IdempotencyKeyUnusable,
   ParentNotOfThisCase,
   PayloadTooLarge,
   ProvenanceConflict,

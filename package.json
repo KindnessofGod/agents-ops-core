@@ -11,18 +11,25 @@
   "scripts": {
     "build": "tsc --build",
     "typecheck": "tsc --build --force",
+    "typecheck:tests": "tsc -p packages/agent-ops-core/tsconfig.tests.json",
     "test": "vitest run --passWithNoTests",
+    "test:live": "node scripts/run-live-postgres.mjs",
+    "verify:liveness": "node scripts/verify-liveness-store.mjs",
     "test:watch": "vitest",
     "lint:boundaries": "depcruise packages/agent-ops-core/src",
     "lint:vocabulary": "node scripts/lint-vocabulary.mjs",
-    "check": "npm run typecheck && npm run lint:boundaries && npm run lint:vocabulary && npm run test",
+    "check": "npm run typecheck && npm run typecheck:tests && npm run lint:boundaries && npm run lint:vocabulary && npm run test",
+    "check:package": "node scripts/check-package-surface.mjs",
     "db:up": "docker compose up -d --wait",
     "db:down": "docker compose down",
+    "db:migrate": "node scripts/apply-migrations.mjs",
     "db:reset": "docker compose down -v && docker compose up -d --wait"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
+    "@types/pg": "8.15.5",
     "dependency-cruiser": "^16.0.0",
+    "pg": "8.16.3",
     "typescript": "~5.9.3",
     "vitest": "^4.1.10"
   }

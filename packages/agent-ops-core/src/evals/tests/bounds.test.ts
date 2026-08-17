@@ -8,16 +8,18 @@ import {
   gate,
   goldenSuite,
   LimitOutOfRange,
+  manualTimers,
   run,
   scriptedModelBackend,
   SuiteEmpty,
   SuiteUnversioned,
   SuiteVersionMismatch,
 } from "../index.js";
-import type { CaseSource, Limits } from "../index.js";
+import type { CaseSource, Limits, ManualTimers } from "../index.js";
 import {
   echoBackend,
   harness,
+  passthroughRedactor,
   PROMPT_V1,
   priceTable,
   smallLimits,
@@ -60,44 +62,124 @@ const callingSubject = defineSubject({
   },
 });
 
+/**
+ * Virtual time, moved by hand.
+ *
+ * `manualTimers` starts at zero and advances only under `advance`, so a subject
+ * that "takes ten seconds" costs no wall time and the elapsed figure a test
+ * asserts against is the same one the module's own `runMillis` deadline is
+ * driven from. The quantum is small against the per-case latency below, so a
+ * wave lands exactly on its due instant rather than overshooting to the next
+ * tick; the tick budget is a ceiling, because a pump that could spin for ever is
+ * exactly the unbounded thing this file is about.
+ */
+const pumped = async <T>(
+  timers: ManualTimers,
+  quantumMillis: number,
+  body: () => Promise<T>,
+): Promise<T> => {
+  let running = true;
+  let ticks = 0;
+  const MAX_TICKS = 100_000;
+  const tick = (): void => {
+    if (!running) return;
+    ticks += 1;
+    if (ticks > MAX_TICKS) {
+      running = false;
+      return;
+    }
+    timers.advance(quantumMillis);
+    setImmediate(tick);
+  };
+  setImmediate(tick);
+  try {
+    return await body();
+  } finally {
+    running = false;
+  }
+};
+
 describe("bounded concurrency", () => {
-  it("never exceeds the declared concurrency, and clears 200 cases at 8", async () => {
+  it("never exceeds the declared concurrency, and clears 200 cases inside runMillis at 8", async () => {
     let inFlight = 0;
     let peak = 0;
+    // Ten seconds a case, against the shipped 12-second per-case budget. The
+    // shipped bounds are the 200-cases-in-five-minutes target — 200/8 = 25 waves
+    // — so this is that arithmetic executed rather than asserted in a comment.
+    const PER_CASE_MILLIS = 10_000;
+    const timers = manualTimers();
     const backend = scriptedModelBackend({
       id: "counting",
       answer: async () => {
         inFlight += 1;
         peak = Math.max(peak, inFlight);
-        await new Promise((resolve) => setTimeout(resolve, 1));
+        // The injected timers, not ambient `setTimeout`. Nothing in this test
+        // reads a clock, so the elapsed figure below is a property of the bound
+        // and not of the machine the suite ran on.
+        await timers.sleep(PER_CASE_MILLIS, new AbortController().signal);
         inFlight -= 1;
         return { text: "duplicate", tokensIn: 1_000, tokensOut: 20 };
       },
     });
 
-    const { recorder } = harness();
-    const started = Date.now();
-    const report = await run({
-      label: "pre-merge",
-      cases: suiteOf(200),
-      subject: callingSubject,
-      scorers: [exactVerdict],
-      models: backend,
-      recorder,
-      seed: testSeed,
-      limits: DEFAULT_LIMITS,
-      priceTable,
-    });
+    const { recorder } = harness(passthroughRedactor, timers);
+    const report = await pumped(timers, 250, () =>
+      run({
+        label: "pre-merge",
+        cases: suiteOf(200),
+        subject: callingSubject,
+        scorers: [exactVerdict],
+        models: backend,
+        recorder,
+        seed: testSeed,
+        limits: DEFAULT_LIMITS,
+        priceTable,
+      }),
+    );
 
-    // The target is 200 golden cases under 5 minutes at concurrency 8. What is
-    // asserted here is the mechanism — the pool is bounded and the run
-    // completes — because the wall clock is dominated by the subject, which in
-    // production is a model call and here is a millisecond.
     expect(peak).toBeLessThanOrEqual(DEFAULT_LIMITS.concurrency);
     expect(peak).toBeGreaterThan(1);
     expect(report.casesRun).toBe(200);
     expect(report.correctBasisPoints).toBe(10_000);
-    expect(Date.now() - started).toBeLessThan(DEFAULT_LIMITS.runMillis);
+
+    // The ceiling, read off the same clock the run's own deadline was armed
+    // against. `partial: false` is the deadline never having fired; the elapsed
+    // figure is how much of the budget 25 waves actually spent.
+    expect(report.partial).toBe(false);
+    expect(timers.now()).toBeGreaterThanOrEqual(25 * PER_CASE_MILLIS);
+    expect(timers.now()).toBeLessThan(DEFAULT_LIMITS.runMillis);
+  });
+
+  it("stops at the ceiling when the same suite is slower than the run budget allows", async () => {
+    // The other side of the same bound: the ceiling is only evidence if it can
+    // be reached. Twenty-six waves of 12 seconds do not fit in five minutes, and
+    // the run must stop and say so rather than run long.
+    const PER_CASE_MILLIS = 11_000;
+    const timers = manualTimers();
+    const { recorder } = harness(passthroughRedactor, timers);
+    const report = await pumped(timers, 250, () =>
+      run({
+        label: "pre-merge",
+        cases: suiteOf(200),
+        subject: callingSubject,
+        scorers: [exactVerdict],
+        models: scriptedModelBackend({
+          id: "slow",
+          answer: async () => {
+            await timers.sleep(PER_CASE_MILLIS, new AbortController().signal);
+            return { text: "duplicate", tokensIn: 1_000, tokensOut: 20 };
+          },
+        }),
+        recorder,
+        seed: testSeed,
+        limits: { ...DEFAULT_LIMITS, runMillis: 120_000, determinismSampleCases: 0 },
+        priceTable,
+      }),
+    );
+    expect(report.partial).toBe(true);
+    expect(report.partialReason).toContain("wall-clock");
+    expect(report.casesRun).toBeLessThan(200);
+    expect(report.casesDeclared).toBe(200);
   });
 
   it("refuses a limit outside its range before anything runs", async () => {

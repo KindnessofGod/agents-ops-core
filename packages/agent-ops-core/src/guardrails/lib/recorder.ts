@@ -41,10 +41,11 @@ import {
  *
  * 3. **An acknowledgement is checked, and the first write of a case is proven.**
  *    See `proveWrite` below. This is the residue of the hole
- *    `docs/design/OPEN-ITEMS-RESOLVED.md` §1 declared closed: the brand it
- *    resolved on sits on `TraceStore` and on `Screening`, not on `Audit`, so the
- *    witness `GuardrailsDeps.audit` names is a structural interface any caller
- *    can satisfy.
+ *    `docs/design/OPEN-ITEMS-RESOLVED.md` §1 declared closed. `Audit` is now
+ *    branded too, so the structural half of that residue is gone — a caller
+ *    cannot hand-build a witness. What remains is behavioural: a genuine
+ *    `Audit` over a `TraceStore` that persists nothing still acknowledges
+ *    writes, and only replay catches that.
  */
 export interface Recorder {
   readonly correlationId: CorrelationId;
@@ -169,10 +170,15 @@ export const recorderFor = async (
      * **What this does not prove, stated rather than implied.** It proves the
      * witness returns a coherent trace containing the node it acknowledged. A
      * witness that maintains a coherent in-memory trace and never writes a byte
-     * still passes, exactly as `audit` says of its own store contract check. The
-     * airtight fix is a brand on `Audit`, minted only by `createAudit`, which is
-     * `audit`'s interface to change and is reported upward rather than
-     * approximated here.
+     * still passes, exactly as `audit` says of its own store contract check.
+     *
+     * `Audit` now carries a brand minted only by `createAudit`, which this
+     * comment once named as the airtight fix and reported upward. It landed,
+     * and it is narrower than that sentence promised: it rules out a *forged*
+     * witness, not a *forgetful* one. `createAudit` over `inMemoryTraceStore`
+     * is branded, legitimate, and persists nothing past the process — which is
+     * the right call for a library that must not decide where evidence lives,
+     * and exactly why this replay stays.
      */
     async proveWrite(node) {
       if (ledger.proven(correlationId)) return "proven-earlier-in-process";

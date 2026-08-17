@@ -48,34 +48,34 @@ library deliberately adds rather than removes.
 | What | Count | How it was counted |
 |---|---|---|
 | Parts making up the library | 5 | Folders under the source directory |
-| Lines a developer must read to use it | 2,197 | Line count of the five published files plus the entry point |
-| Lines of machinery behind them | 27,710 | Line count of the private implementation files |
-| Lines of automated tests | 20,510 | Line count of the test files |
-| Total lines of source | 50,417 | All of the above together |
-| Automated tests | 707, in 76 files | Running the test suite |
-| Tests passing on 17 August 2026 | 707 of 707 | Running the test suite |
-| Time for the whole suite to run | about 19 seconds | Running the test suite |
+| Lines a developer must read to use it | 2,411 | Line count of the five published files plus the entry point |
+| Lines of machinery behind them | 30,986 | Line count of the private implementation files |
+| Lines of automated tests | 25,848 | Line count of the test files |
+| Total lines of source | 59,245 | All of the above together |
+| Automated tests | 825, in 87 files | Running the test suite |
+| Tests passing on 17 August 2026 | 825 of 825 | Running the test suite: 786 need nothing but the code, and 39 need a throwaway copy of the database |
+| Time for the whole suite to run | about 25 seconds | Running the test suite |
 | Outside pieces of software the published library depends on at runtime | **0** | Its manifest lists no runtime dependencies |
 | Outside tools used only to build and test it | 4 | Its manifest lists four development tools |
-| Database setup files | 6 | Files in the migrations folder |
-| Written decision records | 13 | Files in the decision-record folder |
-| Numbered items the project itself lists as unfinished | 12 | The project's own read-me file |
+| Database setup files | 8 | Files in the migrations folder |
+| Written decision records | 17 | Files in the decision-record folder |
+| Numbered items the project itself lists as unfinished | 12 | The project's own read-me file. Eight of the twelve listed a month ago are now finished and have been struck out; four new ones have been added, because a list that only ever grows shorter is a list nobody is checking |
 
 The ratio in the first three rows is the argument for building this once rather
-than nineteen times: **about 12.6 lines of machinery for every line anybody has
-to learn** (27,710 divided by 2,197). A team adopting the library reads the
+than nineteen times: **about 12.9 lines of machinery for every line anybody has
+to learn** (30,986 divided by 2,411). A team adopting the library reads the
 small number and inherits the large one.
 
 Tests by part, all passing:
 
 | Part | Test files | Tests |
 |---|---|---|
-| Audit — the permanent record | 13 | 164 |
-| Evaluations — is it any good | 16 | 148 |
-| Approval — everything before money moves | 15 | 144 |
-| Guardrails — checks before and after | 20 | 129 |
-| Alerts — telling an engineer | 12 | 122 |
-| **Total** | **76** | **707** |
+| Audit — the permanent record | 16 | 203 |
+| Approval — everything before money moves | 18 | 163 |
+| Evaluations — is it any good | 17 | 159 |
+| Alerts — telling an engineer | 14 | 151 |
+| Guardrails — checks before and after | 22 | 149 |
+| **Total** | **87** | **825** |
 
 ### Things the software makes impossible rather than discouraged
 
@@ -97,7 +97,7 @@ than by a rule somebody is trusted to follow.
 5. **"Ran out of time with nobody answering" is a separate ending from "a person
    refused".** They are 2 of the 6, and they cannot be collapsed into one.
 6. **There is no general-purpose "success" field, anywhere.**
-7. **There is no resolution field anywhere in 50,417 lines of source.** Not
+7. **There is no resolution field anywhere in 59,245 lines of source.** Not
    empty — absent. Whether the person actually got what they were owed cannot be
    recorded without a named outside evidence source and a stated waiting period,
    and the library will not invent either on your behalf.
@@ -173,14 +173,14 @@ the reasoning.
 **The claim.** Nineteen applications each need a permanent record, risk
 grading, a sign-off step, a chasing sequence, protection against paying twice, a
 quality measurement, and an alarm path. Built separately, that is nineteen
-versions of the same 27,710 lines of machinery.
+versions of the same 30,986 lines of machinery.
 
 **The reasoning.** This is the strongest available argument and it is still
 weaker than it sounds, for two reasons worth stating:
 
-- Nobody rebuilding this would write 27,710 lines. Most teams would write a much
+- Nobody rebuilding this would write 30,986 lines. Most teams would write a much
   smaller version that handles the ordinary path and none of the 86 failure
-  states. So the honest comparison is not "19 × 27,710 lines saved". It is "19
+  states. So the honest comparison is not "19 × 30,986 lines saved". It is "19
   smaller, cheaper, less careful versions **avoided**" — and the value of that
   depends entirely on whether the careful parts ever matter, which is unproven
   because nothing has run.
@@ -247,7 +247,7 @@ and the library ships no version of 4 of them:
 Items 2 and 6 block production use rather than the build. Until they are
 supplied, the relevant fields stay empty rather than being filled with a guess.
 
-**(ESTIMATE) The time.** A developer must read 2,197 lines of interface and
+**(ESTIMATE) The time.** A developer must read 2,411 lines of interface and
 write the six things above. There is no measured figure, because **zero
 applications have adopted it**. Any range offered here would be a guess dressed
 as a plan, so treat the shape of the work — six named deliverables, four of them
@@ -343,14 +343,19 @@ was due" and "I did not run" are deliberately different records — and somethin
 outside it must watch. That watcher is **not supplied**, and it is item 1 of the
 12 unfinished items.
 
-Two known limits of the shipped liveness records, both stated by the project
-rather than discovered later:
+The liveness records can now be stored durably. There are 2 shipped ways to
+store them: in memory, and in the database, the second using the 8th database
+setup file. Stored in the database, a watcher that polls across a restart sees a
+real gap with a real "last seen" time and a real count of how many times the
+machinery reported in — proven against a real database on 17 August 2026, along
+with 50 simultaneous reports arriving at once and being counted exactly once
+each.
 
-- **They are held in memory only.** If the process restarts, the watcher sees
-  "never seen" rather than a real gap. That errs towards raising the alarm,
-  which is the safe direction, and it is still a limit.
-- The durable version needs a database setup file that does not exist among the
-  6 that do.
+The remaining limit is stated rather than discovered later: stored in memory,
+the history still dies with the process, and after a restart the watcher sees
+"never seen" rather than a real gap. That errs towards raising the alarm, which
+is the safe direction. It is now a deployment choice rather than the only
+option.
 
 (ESTIMATE) The engineering cost of the watcher is small — it polls two published
 queries. The cost of **not** deploying it is every waiting case, silently, and
@@ -462,7 +467,7 @@ pessimistic.
 |---|---|---|---|
 | 1 | Four parts would survive the design review | **Five.** Alerts was added afterwards, from the question "are the right engineers told before a customer telephones?" The honest answer at the time was no | The counts on this page are of 5 parts, not 4 |
 | 2 | The alarm on "a rate moved sharply" covers 2 rates | **1 of the 2 is built.** The share of safety checks that failed safe is watched. The share of cases where the system declined to judge is watched by **nothing** | An application that needs the second must compute it itself |
-| 3 | The kill switch stops actions "system-wide or per tier" | **System-wide is enforced. Per tier is recorded, not enforced** — it is a label written into the record, and the record will faithfully report whatever it is told | Do not budget for a per-risk-level kill switch. You have an all-or-nothing one |
+| 3 | The kill switch stops actions "system-wide or per tier" | **Both are now enforced.** The switch states either "everything" or a named list of risk levels, and the software — not the setting it reads — decides whether the switch covers the action in hand. A switch it cannot read stops every risk level | You may budget for a per-risk-level kill switch. Note it is a breaking change for anything already reading the old switch |
 | 4 | Every recorder would be impossible to counterfeit | **Most carry an anti-counterfeit mark; the one the guardrails part writes through does not.** It can still be satisfied by something that acknowledges every write and stores nothing | The software compensates by re-reading its own first record before doing any work, and names the real fix as unmade rather than closed |
 | 5 | The schema's own protections "are verified by applying the setup file to a real database and running assertions against it" | **No such assertion set exists.** Nothing runs it | The largest untested surface in the repository. A green test run is evidence about the software, never about the database |
 | 6 | Decisions "are tracked as written records once decided" | **7 settled decisions are still awaiting promotion** into the 13 records that exist | The design papers remain the only written record of those seven |
@@ -476,19 +481,21 @@ pessimistic.
 Every quantitative statement above came from one of four places, and none of it
 came from a plan.
 
-1. **Counted from the source files** on 17 August 2026: 5 parts; 2,197 lines of
-   interface; 27,710 lines of implementation; 20,510 lines of tests; 50,417
+1. **Counted from the source files** on 17 August 2026: 5 parts; 2,411 lines of
+   interface; 30,986 lines of implementation; 25,848 lines of tests; 59,245
    lines in total; 9 alarm conditions; 4 severity bands split 1 / 5 / 2 / 1;
    6 endings for a decision; 7 required items in an approval brief; 3 idempotency
    states; 6 database setup files; 13 written decision records; 2 places that
    read the machine clock; 0 runtime dependencies and 4 development tools.
-2. **Summed from the source files**: 86 named failure states — 25 in the approval
-   part, 24 in evaluations, 18 in the record-keeping part, 13 in guardrails and
-   6 in alerts.
+2. **Summed from the source files**: 93 named failure states — 25 in the approval
+   part, 24 in evaluations, 20 in the record-keeping part, 14 in guardrails and
+   10 in alerts.
 3. **Measured by running the build and the tests** on 17 August 2026: the type
-   checker completed with no errors, and 707 tests in 76 files all passed in
-   about 19 seconds. The per-part split was produced by running each part's
-   tests separately: 164, 148, 144, 129 and 122, which sum to 707.
+   checker completed with no errors, and 825 tests in 87 files all passed in
+   about 25 seconds. Of those, 786 ran against nothing but the code; the other
+   39 ran against a throwaway copy of the database, created and thrown away for
+   the purpose. The per-part split was produced by running each part's tests
+   separately: 203, 163, 159, 151 and 149, which sum to 825.
 4. **Read out of the shipped default settings**, every one of which a deployment
    may change within limits the code enforces: a floor of 1 hour between
    reminders; at most 12 recipients per reminder; at most 200 waiting cases

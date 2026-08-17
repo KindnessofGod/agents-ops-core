@@ -3,8 +3,8 @@ import {
   createAudit,
   inMemoryTraceStore,
   redactFields,
+  type AppendAck,
   type AppendInput,
-  type RecordedNode,
   type TraceStore,
 } from "../../audit/index.js";
 import {
@@ -41,7 +41,7 @@ const failingStore = (failOn: number): TraceStore => {
   // along with the methods. Rebuilding by hand does not satisfy `TraceStore`.
   return {
     ...inner,
-    async append(input: AppendInput): Promise<RecordedNode> {
+    async append(input: AppendInput): Promise<AppendAck> {
       appends += 1;
       if (appends === failOn) throw new Error("trace store connection reset");
       return inner.append(input);

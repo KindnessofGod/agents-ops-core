@@ -254,8 +254,22 @@ export const runScreening = async (run: ScreeningRun): Promise<Screening> => {
     // exists to prevent.
     state.grounds.push({ ground: "sources-missing", why: sources.why });
   }
+  // **One ground per rule that fired, not one per site.** A ground names the
+  // rule, the detector, the category and the severity and carries no
+  // coordinates, so four thousand sites of one rule produced four thousand
+  // identical objects: a `grounds` array a caller has to deduplicate itself, a
+  // `groundKinds` string of tens of kilobytes on the settled node, and a real
+  // risk of `audit`'s own `PayloadTooLarge` refusing the node that explains the
+  // screening. Deduplicating cannot change the recommendation — `recommend`
+  // filters these and takes a maximum — and `Screening.findings` still carries
+  // every site, so nothing observable is lost. The set is bounded by the number
+  // of distinct rules wired in, which is a wiring fact rather than a payload one.
+  const groundsSeen = new Set<string>();
   for (const finding of state.drafts) {
     if (finding.severity === "escalate" || finding.severity === "block") {
+      const key = [finding.detector, finding.rule, finding.category, finding.severity].join(" ");
+      if (groundsSeen.has(key)) continue;
+      groundsSeen.add(key);
       state.grounds.push({
         ground: "finding",
         detector: finding.detector,

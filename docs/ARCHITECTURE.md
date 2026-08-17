@@ -540,11 +540,21 @@ erDiagram
     }
 ```
 
-**What is not in Postgres.** `alerts`' `LivenessStore` and `AlertJournal` ship
-only in-memory adapters; `postgresLivenessStore` is named and not built because
-it needs a migration that does not exist. Heartbeat history therefore dies with
-the process, and an external watcher polling across a restart sees `never-seen`
-rather than a real gap — the safe direction, and still a limit.
+**What is in Postgres for `alerts`.** `postgresLivenessStore` ships over
+`migrations/0008_alerts_liveness.sql`, one row per watched piece of machinery,
+every instant a `bigint` of milliseconds so the server's `now()` never enters a
+comparison a watcher makes against its own injected clock. `SELECT, INSERT,
+UPDATE` to `agent_ops_alerts_writer`; no `DELETE`, ever. Wired to it, a watcher
+polling across a restart reads a real gap with a real last-seen instant, which
+is the whole reason the table exists — held in memory, beat history died with
+the process and every deploy looked identical to a genuine death. Wired to
+`inMemoryLivenessStore` it still does; that is now a deployment choice.
+
+`AlertJournal` likewise has two adapters — `inMemoryAlertJournal` and
+`auditBackedAlertJournal`, the second recording the alert as a node on the
+case's own trace. It takes the trace as a *parameter* rather than importing
+`audit`, because `audit` already imports `alerts.raiseAndRecord` and an import
+back would be a cycle the boundary lint fails on.
 
 **Why `text` and not `jsonb`.** `jsonb` reorders keys and normalises numbers.
 That would destroy the byte-stable serialisation replay and the digest chain
@@ -878,14 +888,26 @@ concurrently. `evals` assigns node sequences inside a per-run advisory lock.
 | `evals` | none, on every path including scoring | An unrecorded eval run produces a number nobody can check, and no customer is waiting |
 | `alerts` | none; delivery failures are recorded outcomes, not errors | So a swallowed exception cannot turn a failed alert back into a silent one |
 
-**Hermeticity.** 707 tests across 76 files, none of which can open a socket.
-This is not a flag and not an environment variable: no module constructs its own
-model client, clock, database handle, HTTP client or pager transport, so there
-is no code path from this package to a network to be disabled. `audit`'s
-Postgres test file states what that costs — the schema's own guarantees are
-properties of Postgres and are verified by an operational step outside the test
-suite, so a green run is evidence about the adapter and *not* evidence that
-append-only holds in the database.
+**Hermeticity.** 786 tests across 83 files that cannot open a socket. This is
+not a flag: no module constructs its own model client, clock, database handle,
+HTTP client or pager transport, so there is no code path from this package to a
+network to be disabled.
+
+A further 39 tests in 4 files *can* open a socket, to a database and nothing
+else. They are gated on `AGENT_OPS_LIVE_DATABASE_URL` — no default, no
+fallback, the driver imported dynamically inside the gate — so an ungated run
+never loads one. They exist because the schema's own guarantees are properties
+of Postgres: a green hermetic run is evidence about the adapters and is not
+evidence that append-only holds in the database. Now something asserts that,
+and names the SQLSTATE and the constraint that refused each attempt.
+
+The exemption is bounded by a test rather than by a comment.
+`audit/tests/hermetic.test.ts` reads the source on disk and asserts that exactly
+those four files may name a driver, that no shipped file may, and that
+`packages/agent-ops-core/package.json` declares zero runtime and peer
+dependencies. `pg` is a devDependency of the workspace root only. What a gated
+file can reach is a database — no model client and no pager transport is
+constructible from anything it imports.
 
 **Boundaries.** `npm run lint:boundaries` (dependency-cruiser) forbids any
 import into a module's subfolders from outside it — including from
@@ -984,11 +1006,13 @@ otherwise be misled.
 | `PHASE-2`: `Audit` is "three verbs a caller learns" | Five: `open`, `replay`, `walk`, `witness`, `verifyAgainstWitness` (plus `record`/`close` on `CaseTrace`). | `walk` exists because `replay` is the wrong verb at the 100,000-node ceiling; the witness verbs exist because tamper detection computed from the rows has a ceiling. Both are documented additions, not drift. |
 | `OPEN-ITEMS-RESOLVED.md` item 2: "an honest fourth entry point: `approval.sweep(now)`" | `sweep({ limit })`, reading `now` from the injected clock. | Stated in `approval/index.ts`: a module with two sources of time has two clocks, and they disagree on the day it matters. Ageing stays fully testable because the clock is a constructor parameter. |
 | `OPEN-ITEMS-RESOLVED` item 0's sketch uses `Duration`, `ReservedStatus` as `{ reserved: true }` | `DurationMs`, and `ReservedStatus` is a discriminated union whose `NotReserved` arm carries a `basis` and a `policyVersion`. | The sketch's shape would let "we checked and it is not reserved" and "nobody thought about it" produce byte-identical nodes; the code refuses an empty fact set with `ReservedFactsEmpty` for the same reason. |
-| `OPEN-ITEMS-RESOLVED` item 1: the recorder is branded so a caller cannot supply an impostor | Branded on `TraceStore`, `EvalNodeStore`, `RunLedger` and `Screening` — **not** on `Audit`, which is what `GuardrailsDeps.audit` names. | The one place the resolution is not implemented. `guardrails` compensates by checking every acknowledgement and proving its first node by replay, and reports the brand upward as the real fix. Item 1 is not fully delivered. |
+| `OPEN-ITEMS-RESOLVED` item 1: the recorder is branded so a caller cannot supply an impostor | Branded on `TraceStore`, `EvalNodeStore`, `RunLedger`, `Screening` **and now `Audit`** — a non-exported `unique symbol` minted only by `createAudit`. | **No longer a divergence.** Item 1 is delivered. The brand rules out a *forged* witness, not a *forgetful* one: `createAudit` over `inMemoryTraceStore` is branded, legitimate and persists nothing past the process, so `guardrails` still checks every acknowledgement and still proves its first node by replay. |
 | `evals/index.ts` and `guardrails/index.ts`: "`evals` consumes [`Groundedness`] as a scorer; `guardrails` wraps it as a detector. One implementation, two callers." | Only `guardrails` uses it. `evals` does not import `guardrails` and ships no adapter converting a `Groundedness` into a `Scorer`. | The interface is *shaped* to be usable as a scorer — pure, integer result, no correlation identifier, no recorder, no tier — and a caller can write the four-line adapter. As shipped it has one caller. |
-| `OPEN-ITEMS-RESOLVED` item 6: an `AlertSink` seam with "two real adapters" and alerting driven by absence | Delivered — two sink adapters, nine conditions, severity proved in the type. But `AlertJournal` and `LivenessStore` each ship **one** adapter, and `postgresLivenessStore` needs a migration that does not exist. | Item 6's alerting is real; its durability is not. Heartbeat history dies with the process. |
-| `docs/CONTEXT.md`'s eighth silent condition: "**Abstention rate**, or fail-closed screening rate, moves sharply" | `AlertCondition.measure` declares `"abstention" \| "fail-closed-screening"`, and only the second is ever produced — by `guardrails`' rate watch. Nothing in this library watches the abstention rate. | Half of that condition is unimplemented. An application relying on abstention-rate alerting must compute it itself. |
-| `docs/CONTEXT.md`: a kill switch stops effects "system-wide **or per tier**" | `KillSwitchReader` is `() => Promise<KillSwitchState>` — it takes no tier and asks no per-tier question. `scope` is a string recorded on the node. | Scope is recorded, not enforced. A per-tier kill switch is the reader's own business today, and the trace will faithfully record whatever it says. |
+| `OPEN-ITEMS-RESOLVED` item 6: an `AlertSink` seam with "two real adapters" and alerting driven by absence | Delivered in full. `AlertJournal` has `inMemoryAlertJournal` and `auditBackedAlertJournal`; `LivenessStore` has `inMemoryLivenessStore` and `postgresLivenessStore` over `migrations/0008_alerts_liveness.sql`. `livenessStoreContract` holds both store adapters to the same eight obligations. | **No longer a divergence.** Durability is now a deployment choice rather than the only option: wired to the in-memory adapter, beat history still dies with the process. |
+| `docs/CONTEXT.md`'s eighth silent condition: "**Abstention rate**, or fail-closed screening rate, moves sharply" | Both arms are produced. `guardrails` watches the fail-closed screening rate; `approval` watches the abstention rate, wired by `ApprovalDeps.abstentionRate` and observed on every settled verdict. | **No longer a divergence.** The split is deliberate: an abstention is a verdict disposition and only `approval` sees one — a screening that *recommends* abstaining is a recommendation the decision may overrule. The residual is duplication, not absence: the two rate watches are structurally parallel and independently maintained. |
+| `docs/CONTEXT.md`: a kill switch stops effects "system-wide **or per tier**" | `KillSwitchScope` is a closed type (`{kind:"system-wide"}` \| `{kind:"tiers", tiers}`), `KillSwitchReader` takes `{tier}`, and `scopeStops(scope, tier)` — owned by the module, never by the reader — decides whether the switch covers the effect in hand. Enforced at execute and at hold-release. | **No longer a divergence.** An unreadable switch still stops every tier. Breaking for callers: nineteen `KillSwitchReader` implementations change signature and return shape. |
 | `docs/CONTEXT.md` open question 1: "Does `verdict` survive as a separate term from `decision`?" | It survives. `Verdict` is the content and a `Determination` produces exactly one, immutably. | Settled by the code; not yet written back into `CONTEXT.md`'s open-questions list. |
-| `docs/CONTEXT.md` and `OPEN-ITEMS-RESOLVED`: decisions "are tracked as ADRs once decided" | `docs/adr/` holds thirteen records, one per settled decision. | No divergence. Retained as a row because the promotion is the thing a reader checks. |
-| `audit/tests/postgres-store.test.ts`: the schema's guarantees "are verified by applying `migrations/0002_audit_trace.sql` to a real database and running the assertions from `docs/RUNBOOK.md` against it" | No such assertion set exists. The runbook covers the watchdog, the eight silent conditions, digest verification and reconciliation; it does not carry a grants-and-triggers verification procedure. | The primary key, the one-seal index, the parent foreign key, the immutability triggers and the `INSERT`-only grants are asserted by nothing that runs. This is the largest untested surface in the repository. |
+| `docs/CONTEXT.md` and `OPEN-ITEMS-RESOLVED`: decisions "are tracked as ADRs once decided" | `docs/adr/` holds seventeen records, one per settled decision. The four settled in this hardening release are 0014 (idempotency is caller-named, not content-derived), 0015 (kill-switch scope is a closed type), 0016 (preemption needs a worker thread — and it reverses a position this module previously argued at length), and 0017 (the abstention rate is watched by `approval`). | No divergence. Retained as a row because the promotion is the thing a reader checks, and because 0016 is a reversal: an ADR that records only additions is a record of what went well. |
+| `CLAUDE.md`: hermeticity is structural, "not by convention and **not by an environment variable**" | Four test files read `AGENT_OPS_LIVE_DATABASE_URL` and dynamically import a driver inside the gate. | A **narrowed** divergence, stated rather than hidden. The library is untouched: no module imports a driver, `SqlExecutor` is still injected, and `audit/tests/hermetic.test.ts` enforces from the source that only these four files may name a driver, that no shipped file may, and that the package declares zero runtime dependencies. What those files can reach is a database and nothing else — no model client and no pager transport is constructible from anything they import — so the guarantee that matters, *a test cannot reach a live model or a real pager with real credentials present*, is unchanged. `alerts` declined the exemption entirely and keeps its no-environment-variable assertion. |
+| `packages/agent-ops-core/tsconfig.json` excludes `src/**/tests/**` | It still does, for the build — tests must not reach `dist/`. But `tsconfig.tests.json` now typechecks them under the same strictness, wired into `npm run check` as `typecheck:tests`. | **No longer a divergence**, and it had teeth: the exclusion hid 33 type errors, including a decorator asserting against a `TraceStore.append` signature the interface no longer had, while `npm run check` was green. |
+| `audit/tests/postgres-store.test.ts`: the schema's guarantees "are verified by applying the migrations to a real database and running the assertions against it" | They are, and it is executable. Four gated suites (`approval`, `audit`, `evals`, `guardrails`) apply every migration to the target database and attack the schema, asserting the SQLSTATE and the named constraint that refused each attempt; `scripts/verify-liveness-store.mjs` does the same for `alerts`. `npm run test:live` runs them and treats a *skip* as a failure. | **No longer a divergence**, and it was the largest untested surface in the repository. The gate is one environment variable: unset, every suite skips cleanly and no driver is loaded, so the hermetic path is unchanged. |

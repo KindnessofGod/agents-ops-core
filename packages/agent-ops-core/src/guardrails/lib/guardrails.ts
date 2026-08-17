@@ -4,7 +4,7 @@ import {
   LocaleUnsupported,
   OutputCheckOutOfOrder,
 } from "./errors.js";
-import { createRateWatch } from "./rate-watch.js";
+import { createRateWatch, screeningRateWatch } from "./rate-watch.js";
 import { recorderFor, witnessLedger } from "./recorder.js";
 import { SETTLED_NODE, runScreening } from "./screening.js";
 import type { NodeId } from "../../audit/index.js";
@@ -57,7 +57,7 @@ export const createGuardrails = (deps: GuardrailsDeps): Guardrails => {
   const rates =
     deps.rateAlerting === undefined
       ? undefined
-      : createRateWatch(deps.rateAlerting);
+      : createRateWatch(deps.rateAlerting, screeningRateWatch);
 
   /**
    * Every screening passes through here on its way back to the caller.

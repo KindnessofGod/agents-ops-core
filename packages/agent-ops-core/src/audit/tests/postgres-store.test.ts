@@ -108,9 +108,20 @@ const recordingExecutor = (): Recorder => {
           payload_canonical: params[9],
           node_canonical: params[10],
           is_seal: params[11],
+          idempotency_key: params[12],
         });
         nodes.set(correlationId, forCase);
         return { rows: [] };
+
+      case "read-by-idempotency-key":
+        // `WHERE correlation_id = $1 AND idempotency_key = $2`, faithfully
+        // enough to hold the adapter to invariant 8. It is NOT the partial
+        // unique index — a stand-in cannot be — so a duplicate written past the
+        // adapter would be found here rather than refused, which is exactly why
+        // `live-postgres.test.ts` exists.
+        return {
+          rows: forCase.filter((row) => row["idempotency_key"] === params[1]),
+        };
 
       case "read-case": {
         const row = cases.get(correlationId);
@@ -190,6 +201,25 @@ describe("audit — Postgres adapter, statement discipline", () => {
     expect(tags.filter((t) => t === "lock")).toHaveLength(2);
   });
 
+  it("takes the lock before the deduplication lookup as well, and takes it once", async () => {
+    // The lookup and the insert that may follow it are one critical section. A
+    // lookup outside the lock is a race, not a check: two concurrent retries of
+    // one crashed append would both miss and both write.
+    const { audit, statements } = pgHarness();
+    const trace = await audit.open(CASE_A);
+    await trace.record({ kind: "a", v: 1 }, { tier: "low", idempotencyKey: "attempt-1" });
+
+    const tags = statements.map(tagOf);
+    const lookup = tags.indexOf("read-by-idempotency-key");
+    expect(lookup).toBeGreaterThan(0);
+    expect(tags[lookup - 1]).toBe("lock");
+    // Once per append. `pg_advisory_xact_lock` is re-entrant, so taking it twice
+    // would be harmless and would also mean the lock had quietly stopped being
+    // one thing a reader can find.
+    expect(tags.filter((t) => t === "lock")).toHaveLength(1);
+    expect(tags.slice(lookup).indexOf("next-sequence")).toBeGreaterThan(0);
+  });
+
   it("parameterises everything, so a correlation identifier cannot be SQL", async () => {
     const { audit, statements } = pgHarness();
     const trace = await audit.open(CASE_A);
@@ -257,6 +287,36 @@ describe("audit — Postgres adapter, behaviour", () => {
     await expect(trace.close({ unassistedContainment: true })).rejects.toThrow(
       /closed/i,
     );
+  });
+
+  it("deduplicates a retry, and agrees node-for-node with the in-memory adapter", async () => {
+    // Invariant 8 held by the second adapter, not only by the first. Two
+    // adapters claiming one invariant and holding different ones is this
+    // module's oldest defect; for deduplication the divergence would be
+    // invisible on replay, because the node that would show it was never
+    // written.
+    const { audit: pg } = pgHarness();
+    const { harness } = await import("./fixtures.js");
+    const { audit: mem, clock } = harness();
+
+    for (const [audit, tick] of [
+      [pg, undefined],
+      [mem, clock],
+    ] as const) {
+      const trace = await audit.open(CASE_A);
+      const first = mustRecord(
+        await trace.record({ kind: "a", v: 1 }, { tier: "low", idempotencyKey: "k" }),
+      );
+      tick?.advance(1_000);
+      const retry = mustRecord(
+        await trace.record({ kind: "a", v: 1 }, { tier: "low", idempotencyKey: "k" }),
+      );
+
+      expect(first.deduplicated).toBe(false);
+      expect(retry.deduplicated).toBe(true);
+      expect(retry.node.canonical).toBe(first.node.canonical);
+      expect((await audit.replay(CASE_A)).nodes).toHaveLength(1);
+    }
   });
 
   it("refuses to record against a sealed case", async () => {
@@ -402,7 +462,24 @@ describe("audit — Postgres adapter, bounded reads and evolving bytes", () => {
 });
 
 /**
- * There is deliberately no live-database block in this file any more.
+ * There is deliberately no live-database block in this file, and there is now a
+ * separate file that is nothing else.
+ *
+ * **Where the schema's own guarantees are proved.**
+ * `tests/live-postgres.test.ts` applies every migration to a real Postgres and
+ * attacks the schema: it issues the `UPDATE`, the `DELETE`, the `TRUNCATE`, the
+ * second seal, the duplicate `(correlation_id, sequence)`, the parent from
+ * another case and the duplicate idempotency key, and asserts which SQLSTATE and
+ * which named constraint refused each one. It is gated on an explicit
+ * `AGENT_OPS_LIVE_DATABASE_URL`, imports its driver dynamically inside that
+ * gate, and skips cleanly with nothing loaded and no socket opened when the
+ * variable is absent — which is every default run of `npm test` and
+ * `npm run check`.
+ *
+ * That file is the *only* place in this package that can reach a network, it can
+ * reach a database and nothing else, and `tests/hermetic.test.ts` fails the
+ * build if a second one ever appears. Everything below this line is unchanged
+ * and still true of *this* file.
  *
  * There used to be one: it read `AGENT_OPS_TEST_DATABASE_URL` and
  * `AGENT_OPS_TEST_PG_MODULE`, dynamically imported a driver and constructed a

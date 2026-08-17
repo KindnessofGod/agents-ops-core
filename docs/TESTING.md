@@ -35,25 +35,62 @@ npx vitest run -t "surfaces a split panel as contested"   # one test
 npx vitest                                                # watch mode
 ```
 
-The last full run in this repository:
+The last full run in this repository, with no database reachable:
 
 ```
-Test Files  76 passed (76)
-     Tests  707 passed (707)
-  Duration  18.14s
+Test Files  83 passed | 4 skipped (87)
+     Tests  786 passed | 39 skipped (825)
+  Duration  19.73s
 ```
 
-and `depcruise` reported `no dependency violations found (185 modules, 461
-dependencies cruised)`.
+and `depcruise` reported `no dependency violations found (205 modules, 546
+dependencies cruised)`. The 4 skipped files are the gated live-database suites
+described below. With `AGENT_OPS_LIVE_DATABASE_URL` set at a throwaway
+Postgres 16, the same tree runs 825 passed / 0 skipped.
 
-### There are no Postgres-dependent tests, and that is the design
+### The default suite needs no Postgres. Four gated suites use one.
 
 **This is a place where the natural reading of the repository is wrong, so it is
 stated first.** `docker-compose.yml`, `migrations/` and `npm run db:up` exist,
-and none of them is needed to run the suite. No test in this package opens a
-socket, reads a connection string, or imports a database driver — so there is
-nothing to skip when no database is reachable, and no failure mode to describe.
-Stop the container and the suite is unchanged: 76 files, 707 tests, green.
+and none of them is needed to run `npm run check`. 786 tests across 83 files
+cannot open a socket at all: no module constructs its own database handle, and
+`SqlExecutor` arrives as a parameter. Stop the container and those are
+unchanged, green.
+
+Four files are different, and they are named one at a time rather than matched
+by a pattern:
+
+| Suite | Tests | What only a real cluster can answer |
+|---|---|---|
+| `audit/tests/live-postgres.test.ts` | 23 | 19 attacks on the append-only schema, each asserting the SQLSTATE and the named constraint that refused it; `runSqlExecutorContract` against a real pool |
+| `approval/tests/live-postgres.test.ts` | 7 | Durable resume across process death, a resumable kill-switch hold, licence freshness across a restart, `reconcile`, an idempotency claim raced by eight pools |
+| `evals/tests/live-postgres.test.ts` | 7 | The node store and run ledger as the least-privileged role; kill-and-rebuild resume; a dense gap-free sequence under eight concurrent writers |
+| `guardrails/tests/live-postgres.test.ts` | 2 | Redaction proved by grepping every byte of the trace in the table; a preempted detector's abstention read back out of Postgres |
+
+They are gated on `AGENT_OPS_LIVE_DATABASE_URL`, with **no default and no
+fallback**. Unset — every ordinary run, including `npm run check` — the
+`describe` body never executes and `pg` is never imported. Set, each suite
+applies every migration to the target database itself, so it proves the
+migrations too, and refuses a database holding rows it did not write.
+
+Run them with `npm run test:live`, which **inverts the gate**: once the
+connection string is set, a suite that skips is a failure (`LiveSuiteSkipped`),
+and so is a suite reporting no test. A live run that quietly skips is the false
+green the arrangement exists to remove.
+
+`alerts` deliberately has no gated suite. `alerts/tests/production.test.ts`
+asserts structurally that no file under `alerts/tests/` reads an environment
+variable at all — and `alerts` is the module that can page a real engineer, so
+it holds the strongest hermetic guarantee here. Its live coverage is
+`scripts/verify-liveness-store.mjs` (`npm run verify:liveness`), outside the
+package and never collected by vitest: eight contract obligations, the restart
+proof, six schema attacks and seven concurrency checks.
+
+The exemption is itself tested. `audit/tests/hermetic.test.ts` reads the source
+on disk and asserts that exactly those four files may name a driver, that no
+shipped file may, and that the published package declares zero runtime and peer
+dependencies — so `pg` cannot drift out of the workspace root's devDependencies
+without failing the build.
 
 `npm run db:up` starts Postgres 16 on host port **5433** and applies everything
 in `./migrations` in filename order the first time the volume is created. It is
@@ -629,12 +666,14 @@ safe direction and it is still a limit.
 Written from the code. Each is a place where a document promises more than what
 ships, or describes something that is not there.
 
-1. **There are no Postgres-dependent tests.** The task that produced this
-   document, and the presence of `docker-compose.yml` and `migrations/`, suggest
-   a suite with a database-backed half. There is none, by design (§1, §7).
+1. **Most of the suite is not Postgres-dependent; a named minority is.** The
+   presence of `docker-compose.yml` and `migrations/` suggests a suite with a
+   database-backed half. 786 of 825 tests need no database and cannot open a
+   socket; the other 39 sit in four gated suites that skip cleanly without one
+   (§1, §7).
 2. **`docs/RUNBOOK.md` §10 item 8 says `README.md` is stale** — that it states
    "there is no implementation code". The `README.md` in this repository today
-   describes five shipped modules and 707 tests. The runbook's note is the thing
+   describes five shipped modules and 825 tests. The runbook's note is the thing
    that is out of date.
 4. **`vitest.config.ts` points at this file before it existed** — *"See
    docs/TESTING.md once modules land."* It has landed; the comment is now

@@ -25,34 +25,45 @@ import { isBasisPoints } from "./canonical.js";
  *   2. **The shipped scan checks a deadline between every pattern and every
  *      field**, so an accepted-but-slow pattern costs one scan rather than a
  *      whole screening. See `deterministicDetector`.
+ *   3. **A scan can now be preempted outright**, in a bounded worker pool that
+ *      terminates the thread when the budget is spent. Opt-in per detector; see
+ *      `lib/preemption.ts`, and see below for the reversal that is.
  *
- * ## What remains possible, stated as a bound rather than as a shrug
+ * ## What remains possible, and the reversal that closes it
  *
- * A pattern this analyser accepts can still be **polynomial** in the length of
- * the field. `[\p{L}\p{N}.-]+\.[\p{L}]{2,}` — the tail of the shipped email
- * pattern — is ambiguous on `.`, so a long non-matching run costs roughly one
- * pass per starting position. The worst case is therefore on the order of
- * `maxFieldChars²` character comparisons for **one** pattern against **one**
- * field: about 10⁹ at the default 32,768, which is on the order of a second of
- * one core.
+ * A pattern this analyser accepts can still be far worse than linear in the
+ * length of the field. `[\p{L}\p{N}.-]+\.[\p{L}]{2,}` — the tail of the shipped
+ * email pattern — is ambiguous on `.`, so a long non-matching run costs roughly
+ * one pass per starting position: on the order of `maxFieldChars²` character
+ * comparisons for **one** pattern against **one** field.
  *
- * That is a stall, not a hang, and it is the honest statement of the residual:
+ * This file used to call that a bounded stall, quote `maxFieldChars²` as the
+ * bound, and conclude that a worker thread was the wrong trade for closing it.
+ * **That conclusion is reversed, and the premise was the part that was wrong.**
+ * `a*a*a*b` carries no backreference, no alternation and no quantified group;
+ * this analyser accepts it, correctly by the rules below; and it is
+ * superpolynomial — two hundred characters cost hundreds of milliseconds and two
+ * thousand cost hours. The analyser cannot prove a pattern linear, so it cannot
+ * put a number on what it accepts, and a bound nobody can compute in advance is
+ * not a bound. An event loop held for an unknown period on the hot path of every
+ * decision is not something a regulated deployment should be asked to accept.
  *
- *   - it is bounded, and the bound is computable from `Limits` — halve
- *     `maxFieldChars` and you quarter it;
+ * So `lib/preemption.ts` ships `preemptiveDetector`: the same scan in a bounded
+ * worker pool, with the timeout **terminating the thread** rather than rejecting
+ * a promise beside one that spins on. What survives of the old argument is the
+ * shape rather than the verdict — the caller's text really does live in a second
+ * heap this module cannot freeze, deep-copy or prove it has released, which is
+ * why preemption is **opt-in per detector** and why `deterministicDetector`
+ * remains the default. `lib/preemption.ts` states that residue in full.
+ *
+ * What is still true here, unchanged:
+ *
+ *   - halving `maxFieldChars` quarters the in-process worst case for an
+ *     ambiguous-but-polynomial pattern;
  *   - the deadline check stops the *next* scan, so a pack of twelve patterns
- *     over sixty-four fields cannot compound it;
- *   - it cannot be preempted in-process, because no in-process timer can
- *     preempt central-processing-unit-bound work in this runtime. True
- *     preemption needs a worker thread or a separate process.
- *
- * **Why not a worker thread.** `node:worker_threads` is a built-in, so it is not
- * a dependency argument. It is a personal-data argument: bounding the scan that
- * way means serialising the caller's unredacted payload across a thread
- * boundary and holding it in a second heap this module cannot freeze, deep-copy
- * or prove it has released — to bound a stall that is already bounded. What
- * would change our mind: a measured production stall past a second on a pattern
- * this analyser accepted, on a field a caller cannot shorten.
+ *     over sixty-four fields cannot compound one slow scan into a slow screening;
+ *   - nothing in-process can preempt a scan already under way, at any budget, by
+ *     any design of timer. That is a property of the runtime, not of this module.
  *
  * ## The rules, and that they are conservative
  *

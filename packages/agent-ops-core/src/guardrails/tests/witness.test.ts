@@ -14,25 +14,39 @@ import type {
   TraceDigest,
 } from "../../audit/index.js";
 import { CASE_A, harness, quietDetector, sameAtEveryTier, setOf } from "./fixtures.js";
-import { AuditWitnessUnsound, NODE, createGuardrails, DEFAULT_LIMITS } from "../index.js";
+import {
+  AuditWitnessUnsound,
+  NODE,
+  createGuardrails,
+  DEFAULT_LIMITS,
+  type DetectorReport,
+} from "../index.js";
 import { EN_GB, manualClock, manualTimer } from "./fixtures.js";
 
 /**
  * The recording **witness**, and the hole `OPEN-ITEMS-RESOLVED.md` §1 declared
  * closed and this module inherited open.
  *
- * `GuardrailsDeps.audit` is a structural interface. The brand that §1 resolved
- * on sits on `Screening` — the artefact this module mints — and on `TraceStore`,
- * one layer below. It does **not** sit on `Audit`, so a caller can hand
- * `createGuardrails` a fully-typed object that acknowledges every write and
- * persists nothing, and receive a real branded `Screening` back with zero bytes
- * in any store. `result.recorded === true` is a claim the witness makes about
- * itself.
+ * `GuardrailsDeps.audit` used to be a purely structural interface: the brand
+ * that §1 resolved on sat on `Screening` — the artefact this module mints — and
+ * on `TraceStore` one layer below, but **not** on `Audit`. A caller could hand
+ * `createGuardrails` a fully-typed object that acknowledged every write and
+ * persisted nothing, and receive a real branded `Screening` back with zero
+ * bytes in any store. `result.recorded === true` was a claim the witness made
+ * about itself.
  *
- * A brand on `Audit` is `audit`'s interface to change and is reported upward.
- * What this module can do without it is refuse to trust an acknowledgement:
- * **replay is the proof of a write**, in `audit`'s own words, so the first node
- * of a case is proven by replay before any detector runs.
+ * `Audit` is now branded — `audit` mints one only through `createAudit`, so the
+ * impostor below no longer typechecks as an `Audit` and needs an explicit
+ * `as unknown as Audit` to exist at all. That cast is the brand working, not a
+ * wart: an application cannot reach this shape by accident, and the reversal is
+ * named here because this file previously argued the brand did not exist.
+ *
+ * The brand closes the structural hole. It does not close the behavioural one —
+ * a caller can still hand in a *real* `Audit` over a store that lies — so what
+ * this module does regardless is refuse to trust an acknowledgement: **replay
+ * is the proof of a write**, in `audit`'s own words, so the first node of a
+ * case is proven by replay before any detector runs. That is what these cases
+ * exercise, and it is why the impostor is still worth constructing.
  */
 
 const impostorAudit = (options: { readonly replay?: readonly RecordedNode[] } = {}): Audit => {
@@ -87,7 +101,10 @@ const impostorAudit = (options: { readonly replay?: readonly RecordedNode[] } = 
         verify: () => true,
       };
     },
-  };
+    // The brand. `audit` mints it in `asAudit()` and exports no way to forge it,
+    // which is the point — this cast is the only route to an impostor, it is
+    // spelled out loudly, and it is confined to this fixture.
+  } as unknown as Audit;
 };
 
 const withAudit = (audit: Audit) =>
@@ -120,7 +137,7 @@ describe("guardrails — the recording witness is not taken at its word", () => 
         setOf("counting", [
           {
             ...quietDetector(),
-            screen: () => {
+            screen: async (): Promise<DetectorReport> => {
               ran += 1;
               return { outcome: "searched-and-found-none", costTenthCents: 0, modelCalls: 0 };
             },

@@ -402,6 +402,27 @@ export interface DelegationGrant {
   readonly grantedAt: Instant;
 }
 
+/**
+ * The effect payload type for a decision point that takes **no** effect.
+ *
+ * A point declaring `effect: { kind: "no-effect" }` never constructs an
+ * `EffectDeclaration`, so its payload parameter is unused and a caller has to
+ * put *something* in the third slot of `DecisionPoint<Input, Verdict, P>`. The
+ * instinctive spelling is `never` — "there is no payload" — and it does not
+ * work: `EffectDeclaration<P>` mentions `P` only in argument position
+ * (`redact(payload: P)`, `execute(…, payload: P)`), so it is contravariant in
+ * `P`, while `AnyDecisionPoint` — the erased type `ApprovalDeps.points` holds —
+ * instantiates it at `any`. `any` is assignable to every type except `never`,
+ * so a point parameterised at `never` will not fit the registry it is written
+ * for, and the compiler explains it as ten lines of nested variance.
+ *
+ * `void` fits, and is the same statement. This alias exists so the working
+ * spelling has a name and a reason rather than being folklore recovered from a
+ * type error — nineteen applications write ungated points, and this is the
+ * first thing each of them writes.
+ */
+export type NoEffectPayload = void;
+
 export type UngatedEffect<P> =
   | { readonly kind: "no-effect" }
   | {
@@ -541,16 +562,60 @@ export interface BriefRenderer {
   readonly remind: (reminder: Reminder, to: readonly HumanAuthority[]) => Promise<void>;
 }
 
+/**
+ * What an engaged kill switch stops.
+ *
+ * `docs/CONTEXT.md`: a kill switch stops effects *"system-wide or per tier"*.
+ * This type is the "or", and it is a **closed** type rather than the free
+ * string it used to be, for one reason: a scope this module cannot read is a
+ * scope this module cannot enforce. The previous shape wrote whatever the
+ * reader claimed onto the node and then stopped every effect at every tier
+ * regardless — so a switch engaged for high tier alone silently stopped
+ * low-tier work too, and the trace faithfully recorded a scope nothing obeyed.
+ * A safety control that records its own scope without enforcing it is the most
+ * dangerous kind, because it reports that it worked.
+ *
+ * Two shapes and no third:
+ *
+ *   `system-wide`  Every effect, at every tier. The incident switch.
+ *   `tiers`        Exactly the tiers listed. `["high"]` stops disbursements and
+ *                  leaves ticket routing running. There is no "and above":
+ *                  an explicit list cannot be misread, and `["medium","high"]`
+ *                  says "and above" without needing a second shape to mean it.
+ *
+ * The scope is evaluated **here**, by this module, against the tier of the
+ * effect about to be taken — never by the reader. A reader that answers a
+ * per-tier question with its own opinion is the failure this closes.
+ */
+export type KillSwitchScope =
+  | { readonly kind: "system-wide" }
+  | { readonly kind: "tiers"; readonly tiers: NonEmpty<Tier> };
+
 export type KillSwitchState =
   | { readonly engaged: false }
   | {
       readonly engaged: true;
-      readonly scope: string;
+      readonly scope: KillSwitchScope;
       readonly by: string;
       readonly at: Instant;
     };
 
-export type KillSwitchReader = () => Promise<KillSwitchState>;
+/**
+ * What the reader is asked. An object rather than a bare `Tier` so that the
+ * question can gain a field without nineteen adapters changing signature.
+ *
+ * The tier is passed so a reader backed by a control plane that stores one row
+ * per tier can answer accurately in one round trip. It is **not** passed so the
+ * reader can decide whether the switch applies: the returned `scope` is
+ * evaluated against this tier by the module, so a reader that ignores the
+ * question entirely and always returns the whole switch is still enforced
+ * correctly.
+ */
+export interface KillSwitchQuery {
+  readonly tier: Tier;
+}
+
+export type KillSwitchReader = (query: KillSwitchQuery) => Promise<KillSwitchState>;
 
 /* ------------------------------------------------------------- durable storage */
 
@@ -898,9 +963,71 @@ export interface Limits {
  * non-`any` supertype to erase to; the erasure is confined to this alias and
  * the registry lookup, and the recovered spec is used only through the fields
  * `answer` needs.
+ *
+ * The effect payload erases to `never`, **not** to `any`, and the difference is
+ * load-bearing rather than stylistic. `EffectDeclaration<P>` mentions `P` only
+ * in argument position — `redact(payload: P)` and `execute(…, payload: P)` — so
+ * it is contravariant in `P`, and the supertype of every `EffectDeclaration<P>`
+ * is therefore `EffectDeclaration<never>`. Erasing to `any` inverts that: it
+ * asks for a declaration whose `redact` accepts `any`, and `any` is assignable
+ * to every type except `never`, so a point declaring **no effect at all** —
+ * spelled `DecisionPoint<Input, Verdict, never>`, which is what an ungated
+ * point is — did not fit its own registry.
+ *
+ * Nothing caught that, because `never` is the one payload the shipped code
+ * never constructs and the tests that do construct it were not typechecked
+ * until this release wired `src/**\/tests/**` into `npm run check`.
  */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export type AnyDecisionPoint = DecisionPoint<any, any, any>;
+
+/**
+ * What a deployment must state before this module can judge that an abstention
+ * rate *moved*.
+ *
+ * `docs/CONTEXT.md`'s eighth silent condition is *"abstention rate, or
+ * fail-closed screening rate, moves sharply — every individual case behaved
+ * exactly as designed"*. This is the abstention half. It is the only condition
+ * in this module that is a property of a **window** rather than of a case: a
+ * model that started timing out at noon produces two hundred abstentions that
+ * are each individually correct, each a working system declining to guess, and
+ * together mean this deployment stopped deciding anything.
+ *
+ * **None of the three has a default, and the whole object is optional.** The
+ * right window for a deployment handling eleven cases an hour and one handling
+ * eleven thousand are not the same window, and a default here would be this
+ * library deciding on nineteen applications' behalf what counts as a sharp move
+ * in their domain. Absent, nothing is counted and no window exists; present, the
+ * raise goes through `ApprovalDeps.alerting` like every other condition this
+ * module detects — including saying `alerted: "not-configured"` on the node when
+ * that is absent, rather than looking monitored.
+ */
+export interface AbstentionRateTerms {
+  /**
+   * How long a window is, in integer milliseconds. Windows close **lazily** —
+   * by the first determination to arrive after the window's end — so a
+   * deployment that stops deciding entirely never closes another window and
+   * never raises from here. That is correct: **no decisions at all is not a rate
+   * movement**, it is a stopped component, and the sweeper's heartbeat and its
+   * external watcher are what detect that. Two mechanisms for two different
+   * failures.
+   */
+  readonly windowMs: number;
+  /**
+   * How big a move is sharp, in basis points of the abstention rate. A move from
+   * 4% to 11% is 700. Absolute, so a rate that *collapses* also raises — a
+   * deployment that suddenly stops abstaining is either a fix or a confidence
+   * floor that quietly went missing, and an operator should decide which.
+   */
+  readonly moveBasisPoints: number;
+  /**
+   * The fewest determinations a window must hold before its rate is believed.
+   * **Both** windows must reach it: a quiet night followed by a busy morning is
+   * not evidence of anything, and an alert built from noise is an alert that
+   * gets muted.
+   */
+  readonly minSample: number;
+}
 
 export interface ApprovalDeps {
   /** The trace. Injected, never constructed here. */
@@ -951,6 +1078,16 @@ export interface ApprovalDeps {
    * refuse a chain that pages nobody.
    */
   readonly alerting?: import("../../alerts/index.js").AlertRaiser | undefined;
+  /**
+   * The window terms for the **sixth** silent condition this module can see:
+   * the abstention rate moving sharply. Absent, nothing is counted.
+   *
+   * Wired here rather than as its own alert seam because the raise goes through
+   * `alerting` above — one module paging two different places about conditions
+   * drawn from the same case is how an operator ends up with a channel they
+   * trust and a channel they do not.
+   */
+  readonly abstentionRate?: AbstentionRateTerms | undefined;
   /**
    * ⚠ **The sweeper's dead-man's switch, and the watcher for it is external.**
    *

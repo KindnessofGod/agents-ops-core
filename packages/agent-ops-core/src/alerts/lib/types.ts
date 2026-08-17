@@ -230,12 +230,13 @@ export interface OperationalRecord {
  * is written *after* the chain has been walked, so that what is recorded is the
  * delivery outcome — including every degradation — rather than an intention.
  *
- * **Seam accounting, honestly.** One adapter ships here: `inMemoryAlertJournal`.
- * The second is the `audit`-backed one, which turns `AlertJournalEntry` into a
- * node on the case's own trace; it is deliberately **not built in this module**,
- * because wiring the two together is a composition-root decision and this module
- * must not import another. Named, not built — the same standard `approval`
- * applied to `postgresApprovalStore` rather than counting a test fixture.
+ * **Seam accounting: two adapters, so this is a real seam by C5.**
+ * `inMemoryAlertJournal` is the fast one. `auditBackedAlertJournal` turns an
+ * `AlertJournalEntry` into a node on the case's own trace — and takes the trace
+ * as a **parameter** rather than importing `audit`, because `audit` already
+ * imports `alerts.raiseAndRecord` and an import back would be a cycle the
+ * boundary lint fails on. `audit`'s `Audit` satisfies the parameter structurally,
+ * with no adapter and no cast; see `lib/journal.ts` for the direction note.
  */
 declare const alertJournalBrand: unique symbol;
 
@@ -430,17 +431,18 @@ declare const livenessStoreBrand: unique symbol;
 /**
  * Where beats are kept.
  *
- * **Seam accounting, honestly: ONE adapter, so this is a hypothetical seam by
- * this project's own rule (C5).** `inMemoryLivenessStore` ships. A durable
- * adapter is named — `postgresLivenessStore` — and not built, because it needs a
- * migration that does not exist and a store handle this module must not
- * construct. Reported, not dressed up as two by counting a test fixture.
+ * **Seam accounting: two adapters, so this is a real seam by C5.**
+ * `inMemoryLivenessStore` is the fast one and its beat history dies with the
+ * process. `postgresLivenessStore` is the durable one, over an injected
+ * `SqlExecutor` — no driver is imported anywhere in this package — and it is
+ * what makes a heartbeat mean anything across a restart: a watcher polling
+ * across a deploy reads a real gap with a real `lastSeenAt`, rather than
+ * `never-seen`, which it cannot tell from a component that was never started.
  *
- * The consequence is stated rather than hidden: with the in-memory adapter, a
- * process restart loses the beat history, so an external watcher polling across
- * a restart sees `never` rather than `beat`. That is the safe direction — it
- * reads as "not seen", which alerts — but it is a real limit and the durable
- * adapter is what removes it.
+ * The two are held to the same obligations by `livenessStoreContract`, which is
+ * runnable with no database (both shipped adapters, in continuous integration)
+ * and against a live pool from an operational script. Two adapters that quietly
+ * disagree would be worse than one.
  *
  * Every adapter owes:
  *
@@ -451,6 +453,9 @@ declare const livenessStoreBrand: unique symbol;
  *      recorded last-beat never moves backwards.
  *   3. **Store-assigned sequence**, incremented inside the same critical section
  *      that writes, exactly as `audit` assigns node sequences.
+ *   4. **Refusal of a beat that cannot be recorded byte-stably** — a fractional
+ *      instant, an unsafe integer, a negative item count. See
+ *      `LivenessBeatUnrecordable`, and obligation 6 of the contract.
  */
 export interface LivenessStore {
   readonly [livenessStoreBrand]: true;

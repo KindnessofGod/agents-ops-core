@@ -43,7 +43,7 @@ describe("a kill-switch hold is resumable, not a grave", () => {
   it("returns the case to an approver once the switch is off, and asks again", async () => {
     let state: KillSwitchState = {
       engaged: true,
-      scope: "all-effects",
+      scope: { kind: "system-wide" },
       by: "ops",
       at: 1_700_000_000_000,
     };
@@ -148,7 +148,7 @@ describe("a kill-switch hold is resumable, not a grave", () => {
       points: [point, gatedDisbursement({ id: "invoices.disburse_other" })],
       killSwitch: async () => {
         reads += 1;
-        return { engaged: true, scope: "all", by: "ops", at: 1 };
+        return { engaged: true, scope: { kind: "system-wide" }, by: "ops", at: 1 };
       },
     });
 

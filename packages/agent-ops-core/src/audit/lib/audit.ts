@@ -45,6 +45,7 @@ import type {
   WitnessReceipt,
   WitnessRecord,
 } from "./types.js";
+import { asAudit } from "./types.js";
 
 const DEFAULT_LIMITS: AuditLimits = {
   // 64 KiB of canonical bytes. A trace records what happened, not the documents
@@ -159,6 +160,13 @@ interface Asked {
   readonly redaction: string;
   readonly parent: NodeId | undefined;
   readonly telemetry: NodeTelemetry | undefined;
+  /**
+   * Present where the caller named this append. A deduplicated acknowledgement
+   * legitimately carries a **different clock reading** from the one we asked
+   * for — it is the first node's, from the attempt that crashed — so the `at`
+   * check below is relaxed for exactly that case and for no other.
+   */
+  readonly idempotencyKey: string | undefined;
 }
 
 /**
@@ -181,10 +189,19 @@ const verifyAcknowledgement = (
   asked: Asked,
   node: RecordedNode,
   seen: Set<number>,
+  deduplicated: boolean,
 ): void => {
   const wrong = (detail: string): never => {
     throw new StoreContractViolated(asked.correlationId, detail);
   };
+
+  // A store may only claim a deduplication where one was asked for. Otherwise
+  // "I already had this" becomes a way for an adapter to acknowledge anything
+  // at all without writing it — the exact hole the acknowledgement check exists
+  // to close, reopened by a boolean.
+  if (deduplicated && asked.idempotencyKey === undefined) {
+    wrong("claimed to deduplicate an append that carried no idempotency key");
+  }
 
   if (node.correlationId !== asked.correlationId) {
     wrong(`acknowledged a node for case ${String(node.correlationId)}`);
@@ -192,13 +209,18 @@ const verifyAcknowledgement = (
   if (!Number.isSafeInteger(node.sequence) || node.sequence < 0) {
     wrong(`assigned sequence ${String(node.sequence)}, which is not an ordinal`);
   }
-  if (seen.has(node.sequence)) {
+  // A deduplicated node is one this process may well have seen before — that is
+  // what deduplication means — so a repeated sequence is expected there and is a
+  // broken contract everywhere else.
+  if (!deduplicated && seen.has(node.sequence)) {
     wrong(`assigned sequence ${node.sequence} twice on the same case`);
   }
   if (typeof node.canonical !== "string" || node.canonical.length === 0) {
     wrong("acknowledged a node with no canonical bytes");
   }
-  if (node.at !== asked.at) wrong("acknowledged a node with a different timestamp");
+  if (!deduplicated && node.at !== asked.at) {
+    wrong("acknowledged a node with a different timestamp");
+  }
   if (node.tier !== asked.tier) wrong("acknowledged a node with a different tier");
   if (String(node.redaction) !== asked.redaction) {
     wrong("acknowledged a node with a different redactor");
@@ -313,7 +335,13 @@ export const createAudit = ({
     }
   };
 
-  return {
+  // `asAudit` mints the brand, and this is the only call site in the library.
+  // A structural object that acknowledges every write and persists nothing no
+  // longer satisfies `Audit` — README item 8, and the reason `guardrails` had
+  // to prove its first node by replay to find out whether its recorder was
+  // real. Those runtime checks stay exactly where they are: the brand removes
+  // the accident, not the adversary.
+  return asAudit({
     async open(correlationId) {
       await store.openCase(correlationId, {
         // The honest scope statement, stamped onto the case rather than asserted
@@ -335,6 +363,7 @@ export const createAudit = ({
           readonly tier: RiskTier;
           readonly parent?: RecordedNode;
           readonly telemetry?: NodeTelemetry;
+          readonly idempotencyKey?: string;
         },
       ): Promise<Recorded | Degraded> => {
         // Caller defects first, before the redactor and before the store. Each
@@ -372,11 +401,12 @@ export const createAudit = ({
           redaction: String(redact.id),
           parent: options.parent?.id,
           telemetry: options.telemetry,
+          idempotencyKey: options.idempotencyKey,
         };
 
-        let node: RecordedNode;
+        let ack: { readonly node: RecordedNode; readonly deduplicated: boolean };
         try {
-          node = await store.append({
+          ack = await store.append({
             correlationId,
             at,
             tier: options.tier,
@@ -384,6 +414,7 @@ export const createAudit = ({
             redaction: redact.id,
             parent: asked.parent,
             telemetry: options.telemetry,
+            idempotencyKey: options.idempotencyKey,
           });
         } catch (error) {
           const failure = named(error, correlationId);
@@ -434,8 +465,8 @@ export const createAudit = ({
 
         // Outside the catch on purpose: a store that broke its contract must
         // not be able to have that reported as an outage and degraded away.
-        verifyAcknowledgement(asked, node, sequencesSeen);
-        return { recorded: true, node };
+        verifyAcknowledgement(asked, ack.node, sequencesSeen, ack.deduplicated);
+        return { recorded: true, node: ack.node, deduplicated: ack.deduplicated };
       };
 
       const close = async (
@@ -557,5 +588,5 @@ export const createAudit = ({
       const held = await witness.lookUp(correlationId);
       return witnessVerdict(verdict.digest, held);
     },
-  };
+  });
 };
