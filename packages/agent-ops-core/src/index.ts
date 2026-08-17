@@ -20,11 +20,13 @@ export type {
   Audit,
   CaseTrace,
   Clock,
-  Containment,
   CorrelationId,
   NodeId,
   NodePayload,
   RecordedNode,
   ReplayedCase,
   TraceStore,
+  // `docs/CONTEXT.md` rule 4: bare `containment` is not a valid identifier
+  // anywhere, so the exported type carries the qualifier the field always did.
+  UnassistedContainment,
 } from "./audit/index.js";

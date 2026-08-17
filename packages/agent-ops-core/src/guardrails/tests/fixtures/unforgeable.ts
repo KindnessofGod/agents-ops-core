@@ -1,0 +1,104 @@
+/**
+ * Every marked line here is expected to be a compile error. The test asserts
+ * this file produces **zero** diagnostics, which — given `@ts-expect-error` —
+ * is true only if each marked line errors. If a guarantee ever weakens,
+ * `TS2578: Unused '@ts-expect-error' directive` fails the build.
+ *
+ * A type-level guarantee asserted in prose is exactly the failure the design
+ * review caught: a design quoted a compiler error it had never seen. So these
+ * are compiled by this repository's own TypeScript under its own strict
+ * settings, and the diagnostics are asserted.
+ *
+ * Literals are kept on one line on purpose: `@ts-expect-error` suppresses the
+ * line that follows it, and a multi-line literal scatters its diagnostics
+ * across the property lines.
+ */
+import type {
+  Detector,
+  DetectorReport,
+  Findings,
+  Guardrails,
+  Screening,
+  ScreenedPayload,
+  Source,
+  Sources,
+} from "../../index.js";
+
+declare const guardrails: Guardrails;
+declare const source: Source;
+declare const real: Screening;
+
+// Correctly branded parts, so the only thing missing below is the brand on the
+// `Screening` itself. Even holding every ingredient, a caller cannot assemble one.
+declare const correlationId: Screening["correlationId"];
+declare const node: Screening["nodes"]["opened"];
+declare const detectorSet: Screening["detectorSet"];
+declare const locale: Screening["locale"];
+declare const detectorRun: Screening["detectors"][number];
+declare const findings: Screening["findings"];
+declare const screened: ScreenedPayload;
+
+/* 1. A `Screening` cannot be constructed. Its brand is a non-exported `unique
+      symbol`, so no external object literal satisfies it — which is what makes
+      `checkOutput`'s ordering constraint structural rather than documentary:
+      there is no way to check an output that was never preceded by a screened
+      input. */
+// prettier-ignore
+// @ts-expect-error a Screening cannot be constructed outside the module
+export const forged: Screening = { correlationId, phase: "input", tier: "low", locale, detectorSet, at: 0, nodes: { opened: node, settled: node }, detectors: [detectorRun], findings, recommended: { recommend: "allow" }, cost: { costTenthCents: 0, latencyMicros: 0, modelCalls: 0 }, payload: screened };
+
+/* 2. Nor can the screened payload, which is the only form of a payload this
+      module lets out. A caller cannot fabricate one and claim it was screened. */
+// @ts-expect-error a ScreenedPayload has no public constructor
+export const fakePayload: ScreenedPayload = { fields: { a: "b" }, maskedSites: 0 };
+
+/* 3. `checkOutput` cannot be called without the input screening. Ordering is
+      not a rule a caller remembers; it is a required parameter. */
+// prettier-ignore
+// @ts-expect-error `after` is required
+export const unordered = (): Promise<Screening> => guardrails.checkOutput({ tier: "high", output: { answer: "pay it" }, sources: { available: true, items: [source] } });
+
+/* 4. "No sources" cannot be spelled as an empty array. A caller with nothing to
+      check against says so in words, and the screening recommends abstain —
+      "we could not check, so we allowed it" is not expressible. */
+// @ts-expect-error Sources has no empty-array branch
+export const noSources: Sources = { available: true, items: [] };
+
+/* 5. Neither can "nothing found". Absence of a finding is not a finding, and an
+      empty array cannot say whether anybody looked. */
+// @ts-expect-error Findings has no empty-array branch
+export const noFindings: Findings = { found: [] };
+
+/* 6. A detector cannot report a find with nothing in it. */
+// prettier-ignore
+// @ts-expect-error `found` requires at least one finding
+export const emptyFind: DetectorReport = { outcome: "found", findings: [], costTenthCents: 0, modelCalls: 0 };
+
+/* 7. A detector cannot classify its own incident. Only "declared" is available
+      to it: "timed-out" and "malformed" are the engine's observations about a
+      detector, not claims a detector may make about itself. */
+// prettier-ignore
+// @ts-expect-error a detector may only declare itself unavailable
+export const selfDiagnosis: DetectorReport = { outcome: "unavailable", reason: "timed-out", detail: "not my call to make" };
+
+/* 8. A detector receives no client, no store, no recorder and no clock. There
+      is nothing in a subject to have an effect with. */
+export const noCapability: Detector["screen"] = (subject) => {
+  // @ts-expect-error a ScreeningSubject carries no client of any kind
+  subject.client;
+  // @ts-expect-error nor a recorder
+  subject.recorder;
+  // @ts-expect-error nor a clock
+  subject.clock;
+  return { outcome: "searched-and-found-none", costTenthCents: 0, modelCalls: 0 };
+};
+
+/* 9. A real screening is of course accepted — the fixture would prove nothing
+      if the parameter simply rejected everything. */
+export const accepted = (): Promise<Screening> =>
+  guardrails.checkOutput({
+    after: real,
+    tier: "high",
+    output: { answer: "pay it" },
+    sources: { available: false, why: "policy store returned 503" },
+  });
