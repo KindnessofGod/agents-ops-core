@@ -59,7 +59,10 @@ describe("the node handle is the capability", () => {
 
     const kinds = new Set(nodes.map((n) => n.kind));
     expect([...kinds].sort()).toEqual(
-      ["aggregate", "case", "decision", "model.call", "run", "scoring"].sort(),
+      // `source` joined the set: the cohort's own assembly — which adapter named
+      // the human decisions, over what window, how many cases were dropped — is a
+      // recorded fact rather than a value in a caller's variable.
+      ["aggregate", "case", "decision", "model.call", "run", "scoring", "source"].sort(),
     );
 
     // Three cases, each with a decision, a model call and one scoring node —

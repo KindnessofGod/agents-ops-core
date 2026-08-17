@@ -14,6 +14,8 @@ import {
   judgeGroundedness,
   overlapGroundedness,
   sentenceClaims,
+  type GroundednessScore,
+  type GroundednessSubject,
   type NonEmpty,
   type Screening,
   type Source,
@@ -138,6 +140,18 @@ describe("guardrails — checkOutput", () => {
   });
 });
 
+/**
+ * `Groundedness.score` may return a promise or a value, because
+ * `overlapGroundedness` is synchronous and `judgeGroundedness` is not. The
+ * deterministic adapter is the one under test here, so this narrows the union
+ * once rather than at every call.
+ */
+const scoreNow = (subject: GroundednessSubject): GroundednessScore => {
+  const score = overlapGroundedness().score(subject);
+  if (score instanceof Promise) throw new Error("overlapGroundedness must be synchronous");
+  return score;
+};
+
 describe("guardrails — groundedness as a reusable shape", () => {
   it("scores the weakest claim, not the mean", () => {
     // One unsupported sentence in an otherwise grounded paragraph is the
@@ -145,9 +159,13 @@ describe("guardrails — groundedness as a reusable shape", () => {
     const claims = sentenceClaims({
       answer: "The excess is £250. We will also reimburse hotel and taxi fares.",
     });
-    const score = overlapGroundedness().score({
+    const score = scoreNow({
       claims: claims as unknown as NonEmpty<(typeof claims)[number]>,
       sources: SOURCES,
+      // Required on the subject, so a `Groundedness` implementation that makes
+      // model calls has a bound to divide. The deterministic adapter does no
+      // I/O and ignores it.
+      budgetMicros: 1_000_000,
     });
     expect(score.supportedBasisPoints).toBe(0);
     expect(score.claims).toHaveLength(2);
@@ -156,9 +174,13 @@ describe("guardrails — groundedness as a reusable shape", () => {
 
   it("spells an unsupported claim as a search performed over named sources", () => {
     const claims = sentenceClaims({ answer: "We will reimburse hotel and taxi fares." });
-    const score = overlapGroundedness().score({
+    const score = scoreNow({
       claims: claims as unknown as NonEmpty<(typeof claims)[number]>,
       sources: SOURCES,
+      // Required on the subject, so a `Groundedness` implementation that makes
+      // model calls has a bound to divide. The deterministic adapter does no
+      // I/O and ignores it.
+      budgetMicros: 1_000_000,
     });
     expect(score.claims[0]).toMatchObject({
       supportedBasisPoints: 0,
@@ -168,9 +190,13 @@ describe("guardrails — groundedness as a reusable shape", () => {
 
   it("reports integers only, at every scale", () => {
     const claims = sentenceClaims({ answer: "The excess is £250 at 14 Bramble Way." });
-    const score = overlapGroundedness().score({
+    const score = scoreNow({
       claims: claims as unknown as NonEmpty<(typeof claims)[number]>,
       sources: SOURCES,
+      // Required on the subject, so a `Groundedness` implementation that makes
+      // model calls has a bound to divide. The deterministic adapter does no
+      // I/O and ignores it.
+      budgetMicros: 1_000_000,
     });
     expect(Number.isSafeInteger(score.supportedBasisPoints)).toBe(true);
     expect(score.supportedBasisPoints).toBeGreaterThan(0);
@@ -190,6 +216,7 @@ describe("guardrails — groundedness as a reusable shape", () => {
     const score = await judge.score({
       claims: claims as unknown as NonEmpty<(typeof claims)[number]>,
       sources: SOURCES,
+      budgetMicros: 1_000_000,
     });
     expect(judge.costClass).toBe("model");
     expect(score.modelCalls).toBe(1);

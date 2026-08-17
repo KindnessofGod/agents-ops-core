@@ -30,6 +30,7 @@ import type {
   EvalNodeId,
   Limits,
   PriceTable,
+  RecordedProvenance,
   ScoreOutcome,
   Scorer,
   Seed,
@@ -151,6 +152,12 @@ interface CaseRun {
  * and a hung one.
  */
 const raceAbort = async <T>(work: Promise<T>, signal: AbortSignal, what: string): Promise<T> => {
+  // Attached **first**, before any path that can leave. The caller has already
+  // invoked the work by the time this function is entered, so an early throw
+  // that skipped this would abandon a live promise with no handler — an
+  // unhandled rejection surfacing minutes later, in a process that has moved on,
+  // pointing at a run that finished.
+  void work.catch(() => undefined);
   if (signal.aborted) throw new DOMException(what, "AbortError");
   let onAbort: (() => void) | undefined;
   try {
@@ -163,9 +170,6 @@ const raceAbort = async <T>(work: Promise<T>, signal: AbortSignal, what: string)
     ]);
   } finally {
     if (onAbort !== undefined) signal.removeEventListener("abort", onAbort);
-    // The loser of the race is unreachable but still live. Swallow its rejection
-    // here rather than leave an unhandled one behind a run that has finished.
-    void work.catch(() => undefined);
   }
 };
 
@@ -338,10 +342,14 @@ export const run = async <K extends SourceKind>(spec: RunSpec<K>): Promise<Repor
     { length: Math.min(spec.limits.concurrency, queue.length) },
     () => worker(),
   );
-  try {
-    await Promise.all(pool);
-  } finally {
-    cancelRunTimer();
+  // `allSettled`, not `all`: one worker failing must not leave the other seven
+  // rejecting into nothing. The first failure is rethrown once every worker has
+  // stopped, so the run aborts with one named error and no stray rejections.
+  const settled = await Promise.allSettled(pool);
+  cancelRunTimer();
+  const firstFailure = settled.find((r) => r.status === "rejected");
+  if (firstFailure !== undefined && firstFailure.status === "rejected") {
+    throw firstFailure.reason as Error;
   }
 
   // Safety net. Any path that left cases unrun — the wall clock, an abort that
@@ -361,7 +369,20 @@ export const run = async <K extends SourceKind>(spec: RunSpec<K>): Promise<Repor
 
   const attributedCases = ordered.filter((r) => r.status !== "unattributed").length;
   const unattributedCases = ordered.filter((r) => r.status === "unattributed").map((r) => r.ref);
-  const attribution: Attribution = unattributedCases.length === 0 ? "complete" : "partial";
+  // Three values, and the third is the correction. A `"pure"` subject with no
+  // recorded model calls is `declared-pure`, not `complete`, and its coverage is
+  // 0 rather than 10000: nothing was attributed by evidence. A genuine rules
+  // engine and a subject that did its thinking through a provider SDK look
+  // identical from here, so the report says which claim it is resting on rather
+  // than presenting an assertion as a measurement.
+  const attribution: Attribution =
+    unattributedCases.length > 0
+      ? "partial"
+      : spec.subject.purity === "pure"
+        ? "declared-pure"
+        : "complete";
+  const coverageBasisPoints =
+    attribution === "declared-pure" ? 0 : basisPoints(attributedCases, ordered.length);
 
   const aggregate = await scope.runNode.open({
     kind: "aggregate",
@@ -418,7 +439,7 @@ export const run = async <K extends SourceKind>(spec: RunSpec<K>): Promise<Repor
     scorers: spec.scorers.map((s) => s.descriptor),
     determinism,
     attribution,
-    attributionCoverageBasisPoints: basisPoints(attributedCases, ordered.length),
+    attributionCoverageBasisPoints: coverageBasisPoints,
     unattributedCases,
     partial: partialReason !== null,
     partialReason,
@@ -433,6 +454,7 @@ export const run = async <K extends SourceKind>(spec: RunSpec<K>): Promise<Repor
     finishedAt,
     traceDigest: trace.digest,
     nodes: trace.nodes,
+    redaction: internals.redact.id,
     capturedVia: "injected-client-only",
   };
 
@@ -462,6 +484,8 @@ export const run = async <K extends SourceKind>(spec: RunSpec<K>): Promise<Repor
         },
         node: r.node,
         detail: r.detail,
+        modelCalls: r.modelCalls,
+        costTenthCents: r.costTenthCents,
       };
     });
     return mintAccuracyReport(
@@ -474,6 +498,7 @@ export const run = async <K extends SourceKind>(spec: RunSpec<K>): Promise<Repor
         contestedBasisPoints: rate((r) => r.status === "contested"),
       },
       cases,
+      internals.redact,
     ) as ReportOf<K>;
   }
 
@@ -499,6 +524,8 @@ export const run = async <K extends SourceKind>(spec: RunSpec<K>): Promise<Repor
       correlationId: expectation?.correlationId ?? "",
       node: r.node,
       detail: r.detail,
+      modelCalls: r.modelCalls,
+      costTenthCents: r.costTenthCents,
     };
   });
   const disagreements: Disagreement[] = cases
@@ -524,6 +551,7 @@ export const run = async <K extends SourceKind>(spec: RunSpec<K>): Promise<Repor
     },
     disagreements,
     cases,
+    internals.redact,
   ) as ReportOf<K>;
 };
 
@@ -534,11 +562,15 @@ const runCase = async <K extends SourceKind>(
   spec: RunSpec<K>,
   evalCase: EvalCase<K>,
   runSignal: AbortSignal,
+  timers: Timers,
 ): Promise<CaseRun> => {
   const caseNode = await scope.runNode.open({
     kind: "case",
     name: evalCase.ref,
     v: 1,
+    // Set here and inherited by every node beneath, so an incident raised in a
+    // scorer's judge sample names the case, not the node it happened at.
+    caseRef: evalCase.ref,
     payload: {
       ref: evalCase.ref,
       digest: evalCase.digest,
@@ -551,8 +583,7 @@ const runCase = async <K extends SourceKind>(
   const controller = new AbortController();
   const onRunAbort = (): void => controller.abort();
   runSignal.addEventListener("abort", onRunAbort, { once: true });
-  const caseTimer = setTimeout(() => controller.abort(), spec.limits.perCaseMillis);
-  caseTimer.unref?.();
+  const cancelCaseTimer = timers.deadline(spec.limits.perCaseMillis, () => controller.abort());
 
   const caseSeed = `${spec.seed}:${evalCase.ref}` as Seed;
 
@@ -570,21 +601,34 @@ const runCase = async <K extends SourceKind>(
     let detail: string | null = null;
 
     try {
-      observed = await spec.subject.decide({
-        node: decisionNode.context.node,
-        client: decisionNode.context.client,
-        input: evalCase.input,
-        tier: evalCase.tier,
-        seed: caseSeed,
-        now: decisionNode.context.now,
-        signal: controller.signal,
-      });
+      // Raced against the case budget. A subject that ignores `ctx.signal` — and
+      // application code routinely does — used to hang the case, the worker and
+      // the whole run for ever, with both wall clocks set and neither able to
+      // stop anything.
+      observed = await raceAbort(
+        spec.subject.decide({
+          node: decisionNode.context.node,
+          client: decisionNode.context.client,
+          input: evalCase.input,
+          tier: evalCase.tier,
+          seed: caseSeed,
+          now: decisionNode.context.now,
+          signal: controller.signal,
+        }),
+        controller.signal,
+        `case budget spent (perCaseMillis=${spec.limits.perCaseMillis})`,
+      );
     } catch (cause) {
       if (cause instanceof SubjectAttemptedWrite) {
         await decisionNode.settle({ outcome: "error", closing: { attemptedWrite: true } });
         await caseNode.settle({ outcome: "error", closing: { attemptedWrite: true } });
         throw cause;
       }
+      // An incident is never a case-level failure. `EvalStoreUnavailable` is
+      // fail-closed at every tier with no configuration key: the run aborts and
+      // no report is produced, because an unrecorded eval run is a number nobody
+      // can check.
+      if (cause instanceof EvalsError && cause.incident) throw cause;
       failed = true;
       detail = controller.signal.aborted ? "case budget spent" : describe(cause);
       // Fail-closed per case, fail-open per run. One crashing case must not
@@ -597,7 +641,18 @@ const runCase = async <K extends SourceKind>(
     }
 
     const modelCalls = decisionNode.modelCalls();
-    const unattributed = spec.subject.purity === "calls-models" && modelCalls === 0 && !failed;
+    // The declaration is checked in **both** directions. It used to be checked
+    // in one: `"calls-models"` with no recorded call was caught, and `"pure"`
+    // with recorded calls was not — so the one thing the purity declaration can
+    // actually be falsified against went unchecked. A subject that says it calls
+    // no model and then calls one has misdeclared itself, and a misdeclared
+    // subject's other claim ("the thinking you cannot see does not exist") is
+    // worth nothing.
+    const misdeclared =
+      !failed &&
+      ((spec.subject.purity === "calls-models" && modelCalls === 0) ||
+        (spec.subject.purity === "pure" && modelCalls > 0));
+    const unattributed = misdeclared;
 
     if (observed !== null) {
       await decisionNode.settle({
@@ -628,17 +683,19 @@ const runCase = async <K extends SourceKind>(
         scoreBasisPoints: 0,
         detail,
         failed: true,
+        modelCalls,
+        costTenthCents: caseNode.costTenthCents(),
       };
     }
 
     if (unattributed) {
-      // An `UnattributedDecision`. The subject said it calls models and then
-      // recorded none: it thought somewhere this module cannot see. Unscored,
-      // counted against the coverage floor, and it fails the build — silent
-      // under-recording becomes a red build rather than a quiet green one.
+      // An `UnattributedDecision`: the subject contradicted its own purity
+      // declaration in one direction or the other. Unscored, counted against the
+      // coverage floor, and it fails the build — silent under-recording becomes
+      // a red build rather than a quiet green one.
       await caseNode.settle({
         outcome: "unattributed",
-        closing: { status: "unattributed", modelCalls: 0, purity: spec.subject.purity },
+        closing: { status: "unattributed", modelCalls, purity: spec.subject.purity },
       });
       return {
         ref: evalCase.ref,
@@ -647,8 +704,13 @@ const runCase = async <K extends SourceKind>(
         matched: false,
         status: "unattributed",
         scoreBasisPoints: 0,
-        detail: "decision subtree recorded no model call and the subject is not declared pure",
+        detail:
+          spec.subject.purity === "pure"
+            ? `the subject declared purity "pure" and recorded ${String(modelCalls)} model call(s)`
+            : "decision subtree recorded no model call and the subject is not declared pure",
         failed: false,
+        modelCalls,
+        costTenthCents: caseNode.costTenthCents(),
       };
     }
 
@@ -670,15 +732,33 @@ const runCase = async <K extends SourceKind>(
       });
       let outcome: ScoreOutcome;
       try {
-        outcome = await scorer.score({
-          node: scoringNode.context.node,
-          judge: scoringNode.context.client,
-          observed,
-          expected: evalCase.expectation.verdict,
-          seed: caseSeed,
-          signal: controller.signal,
-        });
+        // Raced, like the subject. A scorer is application code too, and a judge
+        // panel that never returns bounded nothing.
+        outcome = await raceAbort(
+          scorer.score({
+            node: scoringNode.context.node,
+            judge: scoringNode.context.client,
+            observed,
+            expected: evalCase.expectation.verdict,
+            seed: caseSeed,
+            signal: controller.signal,
+          }),
+          controller.signal,
+          `case budget spent (perCaseMillis=${spec.limits.perCaseMillis})`,
+        );
       } catch (cause) {
+        // The scoring path's blanket catch was the second place an incident got
+        // downgraded to an outcome: `EvalStoreUnavailable` became `unscored` and
+        // the run completed, and a rogue scorer's `SubjectAttemptedWrite` — an
+        // effect possibly already committed through a channel this module does
+        // not own — became a detail string. Both abort the run.
+        if (cause instanceof EvalsError && cause.incident) {
+          await scoringNode.settle({
+            outcome: "error",
+            closing: { kind: "incident", reason: cause.name },
+          });
+          throw cause;
+        }
         outcome = { kind: "unscored", reason: describe(cause) };
       }
       await scoringNode.settle({
@@ -711,9 +791,11 @@ const runCase = async <K extends SourceKind>(
       scoreBasisPoints: combined.scoreBasisPoints,
       detail: combined.detail,
       failed: false,
+      modelCalls,
+      costTenthCents: caseNode.costTenthCents(),
     };
   } finally {
-    clearTimeout(caseTimer);
+    cancelCaseTimer();
     runSignal.removeEventListener("abort", onRunAbort);
   }
 };
@@ -791,12 +873,3 @@ const sumTokens = (
 
 const describe = (cause: unknown): string =>
   cause instanceof Error ? `${cause.name}: ${cause.message}` : String(cause);
-
-/**
- * Run identity is random, node identity is store-assigned, and neither is
- * caller-assigned. The *content* address of what was run is the `runKey`, which
- * is recorded on the run node — so two runs of the same suite, subject, scorers,
- * seed, price table and limits are recognisable as repeats without pretending
- * they are the same execution.
- */
-const randomSuffix = (): string => Math.floor(Math.random() * 0xffffffff).toString(16).padStart(8, "0");

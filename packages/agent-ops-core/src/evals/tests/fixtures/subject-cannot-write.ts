@@ -2,7 +2,12 @@
  * Fixture: the subject cannot write, and a recorder cannot arrive from outside.
  */
 import { defineSubject, determine, subjectVersion } from "../../index.js";
-import type { EvalRecorder, ReadOnlyClient, WriteCapableClient } from "../../index.js";
+import type {
+  EvalNodeStore,
+  EvalRecorder,
+  ReadOnlyClient,
+  WriteCapableClient,
+} from "../../index.js";
 
 // The legitimate subject compiles.
 void defineSubject({
@@ -52,3 +57,18 @@ void b;
 // @ts-expect-error a hand-rolled no-op recorder is not an EvalRecorder
 const impostor: EvalRecorder = { append: async () => ({ sequence: 0 }) };
 void impostor;
+
+// And neither is a hand-rolled **store**, which is where the forgery moved to
+// once the recorder was branded. A structurally complete store — every method,
+// every signature, no cast — produced a green report with nothing written
+// anywhere, because `EvalNodeStore` was a plain exported interface. It carries
+// its own non-exported unique symbol now, so this does not typecheck either.
+// @ts-expect-error a structurally complete store is not an EvalNodeStore
+const forgedStore: EvalNodeStore = {
+  openRun: async () => undefined,
+  append: async () => ({}) as never,
+  settle: async () => ({}) as never,
+  read: async () => undefined,
+  expireBefore: async () => ({ runs: 0, nodes: 0 }),
+};
+void forgedStore;

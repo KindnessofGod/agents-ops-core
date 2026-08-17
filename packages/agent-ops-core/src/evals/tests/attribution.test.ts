@@ -114,6 +114,9 @@ describe("unattributed decisions", () => {
     if (outcome.kind !== "blocked") throw new Error("unreachable");
     expect(outcome.reason).toBe("unattributed-decisions");
     expect(outcome.remedy).toContain('purity: "pure"');
+    // And the remedy says what declaring "pure" actually buys, which is not
+    // coverage.
+    expect(outcome.remedy).toContain("declared-pure");
   });
 
   it("scores a subject that declared itself pure, because the two are different claims", async () => {
@@ -130,9 +133,13 @@ describe("unattributed decisions", () => {
       priceTable,
     });
     // "We are a rules engine" and "we thought somewhere you cannot see" must not
-    // share a representation, and the declaration is what separates them.
-    expect(report.attribution).toBe("complete");
-    expect(report.attributionCoverageBasisPoints).toBe(10_000);
+    // share a representation — and the declaration does not *separate* them, it
+    // only names which claim is being made. So the report says `declared-pure`
+    // with coverage 0 rather than `complete` with coverage 10000: nothing was
+    // attributed by evidence, and presenting an assertion as a measurement is the
+    // thing this value exists to stop.
+    expect(report.attribution).toBe("declared-pure");
+    expect(report.attributionCoverageBasisPoints).toBe(0);
     // INV-0003 is £9.00, under the rule's threshold, so it concludes "clean".
     expect(report.correctBasisPoints).toBe(6_667);
     expect(report.incorrectBasisPoints).toBe(3_333);

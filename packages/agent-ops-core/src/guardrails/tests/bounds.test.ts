@@ -1,7 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
   CASE_A,
-  DEFAULT_LIMITS_FOR_TESTS,
   EN_GB,
   harness,
   manualClock,
@@ -13,6 +12,7 @@ import {
   setOf,
 } from "./fixtures.js";
 import {
+  DEFAULT_LIMITS,
   LimitsInvalid,
   NODE,
   createGuardrails,
@@ -54,39 +54,34 @@ describe("guardrails — every bound is a bound", () => {
           timer: manualTimer(),
           locale: EN_GB,
           detectorSets: sameAtEveryTier(setOf("q", [quietDetector()])),
-          limits: { ...DEFAULT_LIMITS_FOR_TESTS, ...bad },
+          limits: { ...DEFAULT_LIMITS, ...bad },
         }),
       ).toThrow(LimitsInvalid);
     }
   });
 
-  it("never lets truncating the finding list soften the recommendation", async () => {
+  it("builds the grounds from every finding, not from the truncated report", async () => {
     // The finding list is a *report*, and a report is not where a disposition
-    // comes from. Grounds are built from every draft; only the report is
-    // truncated, and the settled node says how much of it was cut.
+    // comes from. Two sanctions hits, a report bounded to one: the screening
+    // still stands on both, and the settled node says how much of the report
+    // was cut. Reading the disposition off the truncation is how a `block`
+    // became an `allow` at `maxFindingsPerScreening: 0` — a value that is now
+    // refused outright, and would still be wrong at any other value.
     const text = "one two three";
+    const site = (start: number) => ({
+      category: "prohibited-content" as const,
+      severity: "escalate" as const,
+      rule: `sanctions-hit-${start}`,
+      at: { field: "narrative", startCodeUnit: start, lengthCodeUnits: 3 },
+      confidenceBasisPoints: 9_900,
+    });
     const h = harness({
       limits: { maxFindingsPerScreening: 1 },
       detectorSets: sameAtEveryTier(
         setOf("noisy", [
           scriptedDetector("noisy", () => ({
             outcome: "found",
-            findings: [
-              {
-                category: "prohibited-content",
-                severity: "advisory",
-                rule: "chatter",
-                at: { field: "narrative", startCodeUnit: 0, lengthCodeUnits: 3 },
-                confidenceBasisPoints: 100,
-              },
-              {
-                category: "prohibited-content",
-                severity: "block",
-                rule: "sanctions-hit",
-                at: { field: "narrative", startCodeUnit: 4, lengthCodeUnits: 3 },
-                confidenceBasisPoints: 9_900,
-              },
-            ] as unknown as NonEmpty<never>,
+            findings: [site(0), site(4)] as unknown as NonEmpty<never>,
             costTenthCents: 0,
             modelCalls: 0,
           })),
@@ -100,9 +95,12 @@ describe("guardrails — every bound is a bound", () => {
       payload: { narrative: text },
     });
 
-    expect(screening.recommended.recommend).toBe("abstain");
+    expect(screening.recommended.recommend).toBe("escalate");
+    expect(
+      screening.recommended.recommend === "escalate" ? screening.recommended.grounds : [],
+    ).toHaveLength(2);
     const settled = (await h.nodes()).find((n) => n.payload.kind === NODE.settled);
-    expect(settled?.payload["recommend"]).toBe("abstain");
+    expect(settled?.payload["findingCount"]).toBe(1);
     expect(settled?.payload["findingsTruncated"]).toBe(1);
     expect(settled?.payload["searched"]).toBe("");
   });

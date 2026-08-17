@@ -2,7 +2,6 @@ import { describe, expect, it } from "vitest";
 import { createAudit, inMemoryTraceStore, redactAllExcept } from "../../audit/index.js";
 import {
   CASE_A,
-  DEFAULT_LIMITS_FOR_TESTS,
   EN_GB,
   harness,
   manualClock,
@@ -14,6 +13,7 @@ import {
   setOf,
 } from "./fixtures.js";
 import {
+  DEFAULT_LIMITS,
   GUARDRAILS_TRACE_FIELDS,
   NODE,
   createGuardrails,
@@ -182,7 +182,7 @@ describe("guardrails — under `audit`'s deny-by-default redactor", () => {
       timer: manualTimer(),
       locale: EN_GB,
       detectorSets: sameAtEveryTier(setOf("quiet", [quietDetector()])),
-      limits: DEFAULT_LIMITS_FOR_TESTS,
+      limits: DEFAULT_LIMITS,
     });
 
     await guardrails.screenInput({

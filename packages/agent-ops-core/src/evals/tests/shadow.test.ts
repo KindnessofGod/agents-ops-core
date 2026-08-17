@@ -92,7 +92,7 @@ describe("the shadow path", () => {
 
     expect(cohort.kind).toBe("recorded");
     expect(cohort.size).toBe(3);
-    expect(cohort.withoutHumanDecision).toBe(0);
+    expect(cohort.provenance.withoutHumanDecision).toBe(0);
 
     const subject = defineSubject({
       version: testSubjectVersion,
@@ -170,8 +170,11 @@ describe("the shadow path", () => {
     });
     expect(cohort.size).toBe(1);
     // Visible rather than flattering: an agreement figure computed over a
-    // quietly shrinking cohort is exactly the number nobody can audit.
-    expect(cohort.withoutHumanDecision).toBe(1);
+    // quietly shrinking cohort is exactly the number nobody can audit. It lives
+    // on `provenance`, so `run` reads it and puts it on the report — it used to
+    // be an extra property on this object that nothing downstream ever looked at.
+    expect(cohort.provenance.withoutHumanDecision).toBe(1);
+    expect(cohort.provenance.considered).toBe(2);
     expect(cohort.provenance.humanDecisionSource).toBe("legacy-export:underwriting-2025-export");
   });
 
@@ -224,7 +227,7 @@ describe("the shadow path", () => {
     // did run are written, parented and replayable. `expireBefore` is the eval
     // store's retention verb — the one `audit`'s store refuses to have — and
     // here it doubles as proof that the nodes existed.
-    const expired = await store.expireBefore(Number.MAX_SAFE_INTEGER);
-    expect(expired).toBeGreaterThan(0);
+    const expired = await store.expireBefore(Number.MAX_SAFE_INTEGER, 10);
+    expect(expired.nodes).toBeGreaterThan(0);
   });
 });

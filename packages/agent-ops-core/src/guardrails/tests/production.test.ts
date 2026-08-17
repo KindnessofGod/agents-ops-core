@@ -36,8 +36,11 @@ import {
 const failingStore = (failOn: number): TraceStore => {
   const inner = inMemoryTraceStore();
   let appends = 0;
+  // Spread the real adapter rather than rebuild it: `audit` says a delegating
+  // wrapper is a legitimate thing to build, and spreading carries the brand
+  // along with the methods. Rebuilding by hand does not satisfy `TraceStore`.
   return {
-    openCase: (id, provenance) => inner.openCase(id, provenance),
+    ...inner,
     async append(input: AppendInput): Promise<RecordedNode> {
       appends += 1;
       if (appends === failOn) throw new Error("trace store connection reset");

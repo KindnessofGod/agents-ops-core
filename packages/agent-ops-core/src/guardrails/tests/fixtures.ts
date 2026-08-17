@@ -38,9 +38,6 @@ import {
  */
 
 export const CASE_A = "case-guardrails-a" as CorrelationId;
-
-/** The shipped bounds, re-exported so a test can build guardrails by hand. */
-export const DEFAULT_LIMITS_FOR_TESTS: Limits = DEFAULT_LIMITS;
 export const EN_GB: Locale = localeOf("en-GB");
 export const EN_US: Locale = localeOf("en-US");
 

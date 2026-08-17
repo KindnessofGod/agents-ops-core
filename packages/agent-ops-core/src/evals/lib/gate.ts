@@ -3,6 +3,7 @@ import type { ModelBackend } from "./clients.js";
 import type { EvalRecorder } from "./recorder.js";
 import { recorderInternals } from "./recorder.js";
 import type { AccuracyCaseStatus, AccuracyReport } from "./report.js";
+import { reopenAccuracyReport } from "./report.js";
 import type { CaseDigest, CaseRef, EvalNodeId, RunId, SourceDigest, SubjectVersion } from "./types.js";
 
 /**
@@ -66,6 +67,7 @@ export const accept = (input: {
       `${input.report.unattributedCases.length} decision(s) were unattributed`,
     );
   }
+  reopenAccuracyReport(input.report);
   return {
     schema: "baseline/1",
     acceptedBy: input.by,
@@ -113,6 +115,19 @@ export type GateBlockReason =
   | "unattributed-decisions"
   /** The cheapest way to make a gate green is to delete the failing evidence. */
   | "dropped-cases"
+  /**
+   * The **second** cheapest way, and until now the cheaper of the two: keep the
+   * reference, rewrite the golden case's expected verdict to match whatever the
+   * subject now says, and the gate compares like for like and passes.
+   *
+   * `BaselineCase.digest` and `Baseline.suiteDigest` were recorded by `accept`
+   * and read by nothing. A regression to `not-duplicate` plus an in-place edit
+   * of the expected verdict, same reference, moved the case digest from
+   * `5c8d2040…` to `1e69fa57…` and the gate passed. Rewriting a failing golden
+   * case was strictly cheaper than deleting one, which is precisely what
+   * `dropped-cases` exists to prevent.
+   */
+  | "edited-cases"
   | "regression"
   | "unscored-rate"
   | "contested-rate";
@@ -124,6 +139,8 @@ export interface GateCounts {
   /** Reported, never gated. New golden cases are not regressions. */
   readonly newCases: readonly CaseRef[];
   readonly dropped: readonly CaseRef[];
+  /** Same reference, different content address: the case itself was rewritten. */
+  readonly edited: readonly CaseRef[];
 }
 
 export type GateOutcome =
@@ -175,17 +192,23 @@ const noModels: ModelBackend = {
 };
 
 export const gate = async (input: GateInput): Promise<GateOutcome> => {
-  const { report } = input;
+  // Validated at runtime, not only at compile time. The report brands are
+  // phantom `unique symbol`s and do not survive a process boundary, so the
+  // continuous-integration flow this gate exists for — run in job A, JSON, gate
+  // in job B — could only re-enter through a cast, and this function checked
+  // nothing. `reopenAccuracyReport` checks the literal schema, checks every
+  // figure is a safe integer, and recomputes the rates from the cases.
+  const report = reopenAccuracyReport(input.report);
   const internals = recorderInternals(input.recorder);
   // A distinct run per gate decision. Gating the same report twice — a
   // re-triggered continuous-integration job — records two decisions rather than
-  // colliding, and each is replayable on its own.
-  const gateRun = `gate-${report.runId}-${Math.floor(Math.random() * 0xffffffff)
-    .toString(16)
-    .padStart(8, "0")}` as RunId;
+  // colliding, and each is replayable on its own. The suffix comes from the
+  // recorder's injected clock and counter; it used to be `Math.random()`.
   const scope = await internals.beginRun({
+    idPrefix: `gate-${report.runId}`,
+    costCeilingTenthCents: 0,
+    onCostCeiling: () => undefined,
     header: {
-      runId: gateRun,
       label: `gate:${report.label}`,
       sourceKind: "golden",
       sourceDigest: report.suiteDigest,
@@ -203,6 +226,7 @@ export const gate = async (input: GateInput): Promise<GateOutcome> => {
       traceDigest: report.traceDigest,
     },
   });
+  const gateRun = scope.runId;
 
   const counts = compare(report, input.baseline);
   const decision = decide(report, input.baseline, input.floors, counts);
@@ -221,6 +245,11 @@ export const gate = async (input: GateInput): Promise<GateOutcome> => {
       unchanged: counts.unchanged,
       newCases: counts.newCases.length,
       dropped: counts.dropped.length,
+      edited: counts.edited.length,
+      baselineSuiteDigest: input.baseline?.suiteDigest ?? null,
+      runSuiteDigest: report.suiteDigest,
+      attribution: report.attribution,
+      subjectPurity: report.subjectPurity,
       correctBasisPoints: report.correctBasisPoints,
       unscoredBasisPoints: report.unscoredBasisPoints,
       contestedBasisPoints: report.contestedBasisPoints,
@@ -253,6 +282,14 @@ const passing = (status: AccuracyCaseStatus): boolean => status === "correct";
  * suite hash. Adding a golden case therefore does not invalidate the baseline
  * and does not read as a suite-wide regression; the new case is reported as new.
  * Removing one is a different matter — see `dropped-cases`.
+ *
+ * **And a reference alone is not a match.** `accept` records a content address
+ * per case and a digest for the whole suite, and this function used to read
+ * neither: matching was on `CaseRef` and nothing else, so editing a failing
+ * golden case's expected verdict in place — same reference, new content — made
+ * the gate compare a case against a baseline for a *different* case and pass.
+ * A reference is an identity; the digest is what makes two things with the same
+ * identity the same thing.
  */
 const compare = (report: AccuracyReport, baseline: Baseline | undefined): GateCounts => {
   if (baseline === undefined) {
@@ -262,6 +299,7 @@ const compare = (report: AccuracyReport, baseline: Baseline | undefined): GateCo
       unchanged: 0,
       newCases: report.cases.map((c) => c.ref),
       dropped: [],
+      edited: [],
     };
   }
   const before = new Map(baseline.cases.map((c) => [c.ref, c]));
@@ -270,11 +308,19 @@ const compare = (report: AccuracyReport, baseline: Baseline | undefined): GateCo
   const improved: CaseRef[] = [];
   const newCases: CaseRef[] = [];
   const dropped: CaseRef[] = [];
+  const edited: CaseRef[] = [];
   let unchanged = 0;
   for (const current of report.cases) {
     const previous = before.get(current.ref);
     if (previous === undefined) {
       newCases.push(current.ref);
+      continue;
+    }
+    if (previous.digest !== current.digest) {
+      // Same name, different case. Comparing their statuses would be comparing
+      // two different questions, so it is not done: the edit is reported and
+      // the gate blocks on it.
+      edited.push(current.ref);
       continue;
     }
     if (passing(previous.status) && !passing(current.status)) regressed.push(current.ref);
@@ -284,7 +330,7 @@ const compare = (report: AccuracyReport, baseline: Baseline | undefined): GateCo
   for (const previous of baseline.cases) {
     if (!now.has(previous.ref)) dropped.push(previous.ref);
   }
-  return { regressed, improved, unchanged, newCases, dropped };
+  return { regressed, improved, unchanged, newCases, dropped, edited };
 };
 
 type Decision =
@@ -321,16 +367,32 @@ const decide = (
       remedy: "raise the run budget or reduce the suite, then re-run; a partial run is a biased sample",
     };
   }
+  // `declared-pure` is exempt from the coverage floor and from nothing else. A
+  // genuine rules engine records no model call and is a legitimate, common
+  // subject; blocking it by default would be wrong. What is *not* done is
+  // presenting it as coverage: the report says `declared-pure` with coverage 0,
+  // the gate node records the purity declaration, and a reader can see that the
+  // run rests on an assertion by the subject's author rather than on evidence.
   if (
     report.attribution === "partial" ||
-    report.attributionCoverageBasisPoints < floors.attributionFloorBasisPoints
+    (report.attribution === "complete" &&
+      report.attributionCoverageBasisPoints < floors.attributionFloorBasisPoints)
   ) {
     return {
       kind: "blocked",
       reason: "unattributed-decisions",
-      detail: `${report.unattributedCases.length} decision subtree(s) recorded no model call while the subject declared purity "calls-models": ${report.unattributedCases.join(", ")}`,
+      detail: `${report.unattributedCases.length} decision subtree(s) contradicted the subject's declared purity "${report.subjectPurity}": ${report.unattributedCases.join(", ")}`,
       remedy:
-        'route the subject\'s model calls through ctx.client so they are recorded, or declare the subject purity: "pure" if it genuinely calls no model',
+        'route the subject\'s model calls through ctx.client so they are recorded, or declare the subject purity: "pure" if it genuinely calls no model — and note that "pure" is a declaration this module cannot verify, so it is reported as declared-pure rather than as coverage',
+    };
+  }
+  if (counts.edited.length > 0) {
+    return {
+      kind: "blocked",
+      reason: "edited-cases",
+      detail: `${counts.edited.length} case(s) kept their reference but changed content address since the baseline: ${counts.edited.join(", ")}`,
+      remedy:
+        "restore the cases, or re-accept the baseline in a reviewed commit — rewriting a failing golden case to match the subject is cheaper than deleting one and hides more",
     };
   }
   if (counts.dropped.length > 0) {

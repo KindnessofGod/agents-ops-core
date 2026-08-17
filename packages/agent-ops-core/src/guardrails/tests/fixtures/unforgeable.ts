@@ -14,6 +14,7 @@
  * across the property lines.
  */
 import type {
+  ClassifierResponse,
   Detector,
   DetectorReport,
   Findings,
@@ -93,8 +94,28 @@ export const noCapability: Detector["screen"] = (subject) => {
   return { outcome: "searched-and-found-none", costTenthCents: 0, modelCalls: 0 };
 };
 
-/* 9. A real screening is of course accepted — the fixture would prove nothing
-      if the parameter simply rejected everything. */
+/* 9. A model call cannot decline to say what it consumed. C2 names four things
+      per node — cost, tokens, latency and the price-table version — and a cost
+      figure nobody can reprice in 2033 is not evidence. Tokens and the table are
+      required on a response, not optional. */
+// prettier-ignore
+// @ts-expect-error a ClassifierResponse must carry tokens and the price table
+export const untraceableCost: ClassifierResponse = { scores: { injection: 100 }, costTenthCents: 45 };
+
+/* 10. A caller cannot name the slot a `Screening` carries its settled node in,
+       so `under` still cannot be forged into something that skips a screening.
+       The `Screening` form of `under` is the cheap one; a bare `NodeId` is the
+       one that costs a replay. Both are accepted, neither is constructible. */
+export const reScreen = (): Promise<Screening> =>
+  guardrails.screenInput({
+    correlationId,
+    tier: "low",
+    payload: { narrative: "second attempt after redaction" },
+    under: real,
+  });
+
+/* 11. A real screening is of course accepted — the fixture would prove nothing
+       if the parameter simply rejected everything. */
 export const accepted = (): Promise<Screening> =>
   guardrails.checkOutput({
     after: real,

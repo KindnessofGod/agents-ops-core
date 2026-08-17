@@ -10,6 +10,7 @@ import {
   RecorderNotMinted,
   run,
   sqlEvalNodeStore,
+  systemTimers,
 } from "../index.js";
 import type { EvalRecorder, SqlExecutor, SqlRow } from "../index.js";
 import {
@@ -277,6 +278,7 @@ describe("the SQL store adapter", () => {
       store: sqlEvalNodeStore(sql),
       clock,
       redact: passthroughRedactor,
+      timers: systemTimers(),
     });
     const report = await run({
       label: "pre-merge",
@@ -345,7 +347,12 @@ describe("retention", () => {
   it("expires whole runs before a cutoff — the verb audit's store refuses to have", async () => {
     const store = inMemoryEvalNodeStore();
     const clock = manualClock(1_000_000);
-    const recorder = createEvalRecorder({ store, clock, redact: passthroughRedactor });
+    const recorder = createEvalRecorder({
+      store,
+      clock,
+      redact: passthroughRedactor,
+      timers: systemTimers(),
+    });
     const first = await run({
       label: "day-one",
       cases: threeInvoices(),
@@ -371,8 +378,9 @@ describe("retention", () => {
       priceTable,
     });
 
-    const removed = await store.expireBefore(cutoff);
-    expect(removed).toBeGreaterThan(0);
+    const removed = await store.expireBefore(cutoff, 10);
+    expect(removed.nodes).toBeGreaterThan(0);
+    expect(removed.runs).toBe(1);
     expect(await store.read(first.runId)).toBeUndefined();
     // The newer run survives, and the reports of both survive independently:
     // an eval run's evidentiary value decays with the code it evaluated.

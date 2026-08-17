@@ -12,12 +12,24 @@
  *   gate    The continuous-integration regression gate. Accepts **only** an
  *           `AccuracyReport`. Passing an `AgreementReport` is a compile error.
  *
- * `accept`, `goldenSuite`, `recordedCases`, `defineSubject`, `exactVerdict` and
- * `judgePanel` are constructors of argument types: they evaluate nothing, open
- * no node and reach no store. A third *executing* entry point is a signal to
- * **split the module**, not to extend it — and the accounting above is stated
- * plainly because that distinction is exactly the one somebody will use next
- * year to add `generateSuite()` as "just a constructor".
+ * `accept`, `goldenSuite`, `defineSubject`, `exactVerdict` and `judgePanel` are
+ * constructors of argument types: they evaluate nothing, open no node and reach
+ * no store. A third *executing* entry point is a signal to **split the module**,
+ * not to extend it — and the accounting is stated plainly because that
+ * distinction is exactly the one somebody will use next year to add
+ * `generateSuite()` as "just a constructor".
+ *
+ * **`recordedCases` is not in that list, and the earlier version of this comment
+ * put it there.** It is `async`; it calls `humanDecisions.decisionFor` once per
+ * case; and the shipped `humanDecisionsFromAuditTrace` adapter replays against
+ * the **audit store**, so it performs up to `maxCases` sequential round trips
+ * before any run exists. It opens no node — no run is open yet, and a trace
+ * never spans both stores — which is why `run` writes a `source` node carrying
+ * what it found: the named adapter, the window, how many cases were considered
+ * and how many were dropped for having no human decision. The cohort's assembly
+ * is in the trace; the I/O that produced it is not, and saying otherwise was a
+ * claim about the strongest constraint in this project that the code did not
+ * deliver.
  *
  * ## The three things this interface makes impossible
  *
@@ -34,6 +46,13 @@
  * with a non-exported `unique symbol`, so a caller-supplied no-op does not
  * typecheck, and it arrives as a parameter of `run` from the composition root —
  * never through the subject. `SubjectSpec` has no `deps` field at all.
+ * **`EvalNodeStore` is branded the same way**, because the recorder's brand on
+ * its own only moved the forgery one layer down: a genuine recorder over an
+ * object-literal store that echoed the header and returned `{ header, nodes: []
+ * }` produced `correctBasisPoints: 10000`, attribution `complete`, a
+ * valid-looking trace digest and a passing gate, with no cast anywhere. An
+ * application brings its own database through `sqlEvalNodeStore`'s injected
+ * `SqlExecutor`, not by implementing this interface.
  *
  * **3. A subject that writes.** `Client<"read">` and `Client<"write">` are
  * disjoint in both directions, so a `decide` that asks for a write-capable
@@ -54,11 +73,14 @@
  *   Baseline.      `BaselineMissing` is an explicit non-passing gate outcome.
  *                  A gate that silently passes because it had nothing to
  *                  compare against is worse than no gate.
- *   Attribution.   A decision subtree with zero model calls, where the subject
- *                  has not declared itself `"pure"`, is an
- *                  `UnattributedDecision`: unscored, counted against the
- *                  coverage floor, and it **fails the gate**. Silent
- *                  under-recording is a red build, not a quiet green one.
+ *   Attribution.   A decision subtree that **contradicts its own purity
+ *                  declaration** — `"calls-models"` with no recorded call, or
+ *                  `"pure"` with one — is an `UnattributedDecision`: unscored,
+ *                  against the coverage floor, and it fails the gate. A
+ *                  `"pure"` subject that records nothing is `declared-pure`
+ *                  with coverage `0`, **not** `complete` with coverage `10000`:
+ *                  the check is a declaration, not a measurement, and the
+ *                  report says which. See the honesty note at the foot.
  *   Judges.        Non-deterministic and they say so. Model and prompt version
  *                  recorded per sample; aggregated over an odd n ≥ 3; a panel
  *                  that splits beyond its declared band is `contested`, carrying
@@ -68,21 +90,48 @@
  *   Partial.       A run that stopped early is `partial: true` and **cannot pass
  *                  a gate**. A biased sample published as a pass invites being
  *                  read as complete.
- *   Bounded.       Concurrency 1..32, per-case and per-run wall clocks, a cost
- *                  ceiling, retries 0..5, a bounded store. No unbounded
- *                  anything. Target: 200 golden cases under 5 minutes at
- *                  concurrency 8.
+ *   Bounded.       Concurrency 1..32, retries 0..5, a bounded store, and — the
+ *                  three that were claimed and absent — **wall clocks that
+ *                  terminate something**, a cost ceiling checked *inside* a
+ *                  case, and a batch-limited `expireBefore`. Both wall clocks
+ *                  race the subject and the scorers, so a subject that ignores
+ *                  `ctx.signal` bounds the run instead of hanging it; the
+ *                  ceiling is checked after every recorded model call rather
+ *                  than between cases; retention takes a required batch limit.
+ *                  Target: 200 golden cases under 5 minutes at concurrency 8.
+ *                  What is *not* bounded, stated because JavaScript cannot:
+ *                  the subject's own promise. Nothing here kills it. The run
+ *                  terminates, the node is settled `timeout`, the report is
+ *                  `partial`, and the abandoned work runs on.
  *   Integers.      Every number in a payload is a safe integer — cost in
  *                  tenth-cents, latency in micros, scores in basis points. No
  *                  IEEE-754 anywhere, because byte-stable serialisation is what
  *                  makes replay possible and floats are how it dies quietly.
- *   Clock.         Injected. `Date.now()` does not appear in this module.
+ *   Clock.         Injected, and so is the **passage** of time: `Timers` drives
+ *                  both wall clocks and the retry backoff, so neither reaches
+ *                  for ambient `setTimeout`. `Date.now()` and `Math.random()`
+ *                  do not appear in this module — run identifiers come from the
+ *                  injected clock plus a per-recorder counter, which is why a
+ *                  test can drive a backoff sequence rather than wait for it.
  *   Fail policy.   `EvalStoreUnavailable` is fail-closed at every tier with no
- *                  configuration key. This is deliberately the **opposite** of
- *                  `audit`'s per-tier policy: `audit` lets a low-tier decision
- *                  proceed unrecorded because a real customer is waiting, and an
- *                  eval run has no customer. An unrecorded eval run produces a
- *                  number nobody can check.
+ *                  configuration key, **on every path including scoring**. It
+ *                  was not: `judgePanel`'s bare `catch {}` and the runner's
+ *                  scorer catch both swallowed it, so a store failing only on
+ *                  `judge.sample` yielded `unscored: judge-unavailable` and a
+ *                  report. Both now rethrow any `EvalsError` whose `incident`
+ *                  is true — which covers `SubjectAttemptedWrite` from a rogue
+ *                  scorer as well, documented as aborting the whole run and
+ *                  previously reduced to a detail string. This is deliberately
+ *                  the **opposite** of `audit`'s per-tier policy: `audit` lets
+ *                  a low-tier decision proceed unrecorded because a real
+ *                  customer is waiting, and an eval run has no customer. An
+ *                  unrecorded eval run produces a number nobody can check.
+ *   Redaction.     Applied to **reports as well as nodes**, under the policy the
+ *                  nodes used, with `redaction` stamped on the report. Reports
+ *                  outlive the node graph — the graph expires at 90 days — and
+ *                  they used to carry `authority` (a named person), the
+ *                  correlation identifier and every verdict conclusion
+ *                  unredacted into the long-lived artefact.
  *
  * ## Its own store, and why
  *
@@ -124,7 +173,15 @@
  *
  * Nothing is ever rewritten in place. Upcasting happens on read, because a
  * migration that touches history makes the trace evidence of the migration
- * rather than of the run.
+ * rather than of the run — and there is now code that does it. `lib/upcast.ts`
+ * is the reader: both store adapters decode every row through it, a known
+ * envelope passes, a known older envelope goes through a registered upcaster,
+ * and an unknown envelope, node kind or outcome is `UnreadableEnvelope` rather
+ * than a plausible-looking node. `READABLE_ENVELOPES` says what this build can
+ * decode. Until that existed the three version stamps were written by
+ * everything and read by nothing, and the SQL adapter cast its `outcome` and
+ * `kind` columns straight through — which is a stamp, not a schema-evolution
+ * story.
  *
  * The `priceTableVersion` is stamped on every node rather than on the run, so a
  * mid-run price change is visible instead of smoothed. Without it the 2033 view
@@ -143,7 +200,16 @@
  *                          runner.
  *   `EvalNodeStore`        `inMemoryEvalNodeStore` / `sqlEvalNodeStore`. The
  *                          in-memory one is a deliverable, not a mock: it is
- *                          what makes hermeticity structural.
+ *                          what makes hermeticity structural. Both are branded,
+ *                          so this seam's extension point for an application is
+ *                          `sqlEvalNodeStore`'s injected `SqlExecutor` — its
+ *                          own pool, its own database — not a third
+ *                          implementation of the interface.
+ *   `Timers`               `systemTimers` / `manualTimers`. Reading the clock
+ *                          and waiting on it are different dependencies and
+ *                          only the first was injected, so the wall clocks and
+ *                          the backoff were the one part of this module with
+ *                          real timing behaviour that no test could drive.
  *   `HumanDecisionSource`  `humanDecisionsFromAuditTrace` / `legacyReviewerExport`.
  *                          The second is not hypothetical — every one of the
  *                          nineteen has a first shadow run, and at that point
@@ -157,6 +223,9 @@
  * hermeticism requirement; a seam is a place behaviour genuinely varies with a
  * second shipped adapter. Counting a fake clock as an adapter would let anyone
  * call any injected dependency a seam, and then the rule stops meaning anything.
+ * `Timers` is counted as a seam on the same test and passes it: the two adapters
+ * genuinely differ in behaviour — one advances by itself and one does not — and
+ * both ship.
  *
  * Marked **speculative — do not build**: a report renderer (formatting a value
  * the caller already holds needs no seam, and giving this module an output
@@ -177,10 +246,29 @@
  *
  * Three responses, in descending order of strength, and the first is not a type:
  *
- *   1. **Detection, not prevention.** A decision subtree with no recorded model
- *      call, from a subject that did not declare itself pure, is an
- *      `UnattributedDecision` — unscored, against the coverage floor, and it
- *      fails the gate. Out-of-band work is *detected*, not merely regretted.
+ *   1. **Detection, and only of one shape of it.** A decision subtree with no
+ *      recorded model call, from a subject that did not declare itself pure, is
+ *      an `UnattributedDecision` — unscored, against the coverage floor, and it
+ *      fails the gate. That is the whole of the detection, and this used to be
+ *      written as "out-of-band work is *detected*, not merely regretted", which
+ *      overstates it in two directions that both matter:
+ *
+ *      - **`purity: "pure"` turns the check off.** A subject that declares
+ *        itself pure and does all of its thinking through a provider SDK
+ *        produced attribution `complete`, coverage `10000`, cost `0`, tokens
+ *        `0` and a passing gate. Nothing in this module can tell that apart
+ *        from a rules engine, so it no longer pretends to: such a run is
+ *        `declared-pure` with coverage `0`, the gate records the declaration,
+ *        and the number a reader sees is an assertion by the subject's author
+ *        rather than a measurement. The one thing that *is* checkable — a
+ *        `"pure"` subject that does record calls — is now a misdeclaration and
+ *        fails the gate.
+ *      - **Under `"calls-models"` the check is a floor of one.** A single
+ *        recorded three-token call satisfies it. That is not fixable, so it is
+ *        made visible instead: `modelCalls` and `costTenthCents` are on every
+ *        case result, and "high-tier underwriting determination, 1 call, 3
+ *        tokens" is a shape a reviewer can see without having to allege
+ *        anything.
  *   2. **This module has no network capability at all.** It contains nothing
  *      that can open a socket; the only thing that dials is the injected
  *      `ModelBackend`. A test cannot reach a live model with real credentials
@@ -192,6 +280,34 @@
  *
  * The honest claim is *unrepresentable through `evals`*, not *unrepresentable*,
  * and this file says so rather than letting the stronger claim stand.
+ *
+ * ## The report brands hold in one process, and only there
+ *
+ * `AccuracyReport` and `AgreementReport` are sealed with non-exported `unique
+ * symbol`s, so neither is assignable to the other and `gate` accepts only the
+ * first. That is a **compile-time, single-process** guarantee. It does not
+ * survive `JSON.stringify`, and the flow this gate exists for — run in
+ * continuous-integration job A, write JSON, gate in job B — could therefore only
+ * re-enter through a cast, at which point nothing was checked at all.
+ *
+ * So the boundary is carried by three things instead of one:
+ *
+ *   1. The brands, in process, unchanged.
+ *   2. The literal `schema` and `against` fields, which do survive
+ *      serialisation and are what `reopenAccuracyReport` reads.
+ *   3. `reopenAccuracyReport` itself: the validating re-entry. It refuses an
+ *      agreement report's JSON by schema, refuses any figure that is not a safe
+ *      integer, and **recomputes the four rates from the cases**, so a report
+ *      whose headline numbers do not follow from its own contents is refused
+ *      rather than gated. `gate` runs the same validation on whatever it is
+ *      handed, so a cast-in report is refused at runtime too.
+ *
+ * What that does **not** prove, stated rather than implied: that the run
+ * happened. `reopenAccuracyReport` establishes that an artefact is of the right
+ * kind and internally consistent. Establishing that it came from a real run
+ * means reading the trace out of the eval store by `runId` and recomputing
+ * `traceDigest` — which needs the store, and is what an auditor does rather than
+ * what a gate does.
  *
  * See `docs/CONTEXT.md` for the vocabulary, `docs/design/design-it-twice/
  * FINDINGS.md` for the hybrid this implements, and
@@ -225,6 +341,7 @@ export type {
   EvalNodeKind,
   EvalNodeStore,
   EvalPayload,
+  ExpiryResult,
   ExpectationOf,
   JudgeDescriptor,
   Limits,
@@ -256,10 +373,15 @@ export type {
   Subject,
   SubjectSpec,
   SubjectVersion,
+  Timers,
   TraceDigest,
   Verdict,
 } from "./lib/types.js";
 export { abstain, caseRef, determine, scorerId, seed, subjectVersion } from "./lib/types.js";
+
+/** Timer adapters. Two, which is what makes `Timers` a real seam. */
+export type { ManualTimers } from "./lib/timers.js";
+export { manualTimers, systemTimers } from "./lib/timers.js";
 
 export { defineSubject } from "./lib/subject.js";
 
@@ -270,7 +392,7 @@ export { createEvalRecorder } from "./lib/recorder.js";
 /** Store adapters. Two, which is what makes `EvalNodeStore` a real seam. */
 export { inMemoryEvalNodeStore } from "./lib/in-memory-store.js";
 export type { InMemoryStoreLimits } from "./lib/in-memory-store.js";
-export { sqlEvalNodeStore } from "./lib/sql-store.js";
+export { EVAL_STORE_SCHEMA_SQL, sqlEvalNodeStore } from "./lib/sql-store.js";
 export type { SqlEvalStoreLimits, SqlExecutor, SqlRow } from "./lib/sql-store.js";
 
 /** Case-source adapters. Two, and they are what the report type is derived from. */
@@ -305,7 +427,7 @@ export type {
   Disagreement,
   RunFacts,
 } from "./lib/report.js";
-export { INTERPRETATION } from "./lib/report.js";
+export { INTERPRETATION, reopenAccuracyReport } from "./lib/report.js";
 
 export type { ReportOf, RunSpec } from "./lib/run.js";
 export { DEFAULT_LIMITS, run } from "./lib/run.js";
@@ -333,16 +455,24 @@ export {
 
 export {
   BaselineRefused,
+  DuplicateCaseRef,
   EvalsError,
   EvalStoreUnavailable,
   LimitOutOfRange,
+  NodeSettledTwice,
   NoSuchRun,
   PanelMisdeclared,
   RecorderNotMinted,
+  ReportRefused,
   RunBudgetExhausted,
+  StoreNotMinted,
   SubjectAttemptedWrite,
   SuiteEmpty,
   SuiteUnversioned,
   SuiteVersionMismatch,
+  UnreadableEnvelope,
   UnserialisablePayload,
 } from "./lib/errors.js";
+
+/** The read half of the seven-year story: which envelopes this build decodes. */
+export { READABLE_ENVELOPES } from "./lib/upcast.js";

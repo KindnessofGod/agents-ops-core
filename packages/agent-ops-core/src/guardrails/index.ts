@@ -163,10 +163,35 @@
  *
  * Comparing an output against reference material is the same shape as an
  * `evals` `Scorer`, so it lives here, once, behind the `Groundedness` interface
- * — a pure function of `(claims, sources)` with an integer result, taking no
- * correlation identifier, no recorder and no tier. `evals` consumes it as a
- * scorer; `guardrails` wraps it as a detector. This module does not import
+ * — a pure function of `(claims, sources, budget)` with an integer result,
+ * taking no correlation identifier, no recorder and no tier. `evals` consumes it
+ * as a scorer; `guardrails` wraps it as a detector. This module does not import
  * `evals` and never will: the dependency runs `evals` → `guardrails`.
+ *
+ * ## Seam accounting, honestly
+ *
+ * C5: one adapter is a hypothetical seam, two is a real one. Counted straight,
+ * including where the count is zero:
+ *
+ *   - **`Detector` — a real seam.** Two shipped adapters with genuinely
+ *     different bodies: `deterministicDetector` (patterns, synchronous, no I/O)
+ *     and `modelDetector` (a classifier behind an injected port).
+ *   - **`Groundedness` — a real seam.** Two shipped adapters:
+ *     `overlapGroundedness` (deterministic token overlap) and
+ *     `judgeGroundedness` (a model judging each claim). `evals` consumes either
+ *     as a scorer; `guardrails` wraps either as a detector.
+ *   - **`Clock` and `Timer` — injected, not seamed.** `systemTimer` is the only
+ *     shipped timer and the test clock and timer live in `tests/` and are not
+ *     deliverables. Injection is a hermeticism requirement; counting a fake
+ *     clock as an adapter would let anyone call any injected dependency a seam.
+ *   - **`Classifier` — a port with zero adapters, and it stays at zero.** It is
+ *     the model-client injection point C3 forces: this package may not construct
+ *     or import a model client, so one arrives as a parameter. No second adapter
+ *     is named because none is intended — shipping one means a model-SDK
+ *     dependency nineteen applications inherit. Same accounting as `audit`'s
+ *     `SqlExecutor`.
+ *   - **`Audit` — not a seam of this module's, and the thing that most needs a
+ *     brand.** See "Where that guarantee stops" above.
  *
  * See `docs/CONTEXT.md` for the vocabulary and
  * `docs/design/PHASE-2-INTERFACE-REVIEW.md` §4 for the narrowing this

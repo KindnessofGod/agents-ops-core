@@ -8,6 +8,7 @@ import {
   scriptedModelBackend,
   seed as makeSeed,
   subjectVersion,
+  systemTimers,
 } from "../index.js";
 import type {
   Clock,
@@ -19,6 +20,7 @@ import type {
   ModelResponse,
   PriceTable,
   Redactor,
+  Timers,
 } from "../index.js";
 
 /**
@@ -97,10 +99,13 @@ export interface Harness {
   readonly clock: Clock & { advance(ms: number): void };
 }
 
-export const harness = (redact: Redactor = passthroughRedactor): Harness => {
+export const harness = (
+  redact: Redactor = passthroughRedactor,
+  timers: Timers = systemTimers(),
+): Harness => {
   const store = inMemoryEvalNodeStore();
   const clock = manualClock();
-  return { store, clock, recorder: createEvalRecorder({ store, clock, redact }) };
+  return { store, clock, recorder: createEvalRecorder({ store, clock, redact, timers }) };
 };
 
 export const echoBackend = (

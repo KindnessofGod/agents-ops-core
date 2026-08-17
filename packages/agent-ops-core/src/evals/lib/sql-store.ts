@@ -1,4 +1,4 @@
-import { EvalStoreUnavailable, LimitOutOfRange } from "./errors.js";
+import { EvalStoreUnavailable, LimitOutOfRange, UnreadableEnvelope } from "./errors.js";
 import { mintEvalNodeStore } from "./store-brand.js";
 import { readStoredNode } from "./upcast.js";
 import type {
@@ -391,6 +391,10 @@ export const sqlEvalNodeStore = (
         // know is `UnreadableEnvelope` rather than a plausible-looking node.
         return { header, nodes: nodeRows.rows.map((row) => readStoredNode(rowToNode(row))) };
       } catch (cause) {
+        // A row this build cannot decode is not a store outage, and wrapping it
+        // as one would lose the only detail a reader needs: which envelope, kind
+        // or outcome the row carried.
+        if (cause instanceof UnreadableEnvelope) throw cause;
         return fail("read", cause);
       }
     },

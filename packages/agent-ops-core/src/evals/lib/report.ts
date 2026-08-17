@@ -311,7 +311,7 @@ export const mintAccuracyReport = (
       expected: redactVerdict(redact, c.expected),
       detail: c.detail === null ? null : redactString(redact, "detail", c.detail),
     })),
-  }) as AccuracyReport;
+  }) as unknown as AccuracyReport;
 
 export const mintAgreementReport = (
   facts: RunFacts,
@@ -356,7 +356,7 @@ export const mintAgreementReport = (
       detail: c.detail === null ? null : redactString(redact, "detail", c.detail),
     })),
     interpretation: INTERPRETATION,
-  }) as AgreementReport;
+  }) as unknown as AgreementReport;
 
 /* ------------------------------------------------- crossing a process line */
 

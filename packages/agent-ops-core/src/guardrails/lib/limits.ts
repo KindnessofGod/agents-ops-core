@@ -1,17 +1,39 @@
 import type { Limits } from "./types.js";
 
 /**
- * Bounded resources. There is no unbounded anything in this module: no
- * unbounded fan-out across detectors, no unbounded wait on one, no unbounded
- * payload, no unbounded finding list, and **no retries at all**.
+ * Bounded resources: bounded fan-out across detectors, a bounded wait on one, a
+ * bounded payload, a bounded finding list, and **no retries at all**. Every
+ * field below is range-checked at construction — see `createGuardrails` — because
+ * `maxFindingsPerScreening: 0` used to turn a `block` into an `allow`.
  *
  * The absent bound is the interesting one. A detector that failed is not
  * retried, at any tier. Retrying a fail-closed screening spends the budget
  * twice to reach the same answer, and — worse — a hidden retry is a node that
  * has to be invented or lost. A caller who wants a second attempt calls
- * `screenInput` again with the first screening's node as `under`, and the
- * second attempt is a visible node with a recorded parent. Retries are a caller
+ * `screenInput` again with the first `Screening` as `under`, and the second
+ * attempt is a visible node with a recorded parent. Retries are a caller
  * decision, taken in the open.
+ *
+ * ## What these bounds do not reach, counted honestly
+ *
+ * "No unbounded anything" was too strong, and three things escaped it. Two are
+ * now bounded and the third cannot be, in this runtime:
+ *
+ *   - **A synchronous detector's work.** `detectorBudgetMicros` bounds the
+ *     *answer* — an overrun is measured against the injected clock and recorded
+ *     `unavailable/timed-out`, so the screening fails closed deterministically.
+ *     It does not bound the work: a synchronous body never yields, so nothing
+ *     can preempt a catastrophically backtracking regular expression in a
+ *     caller-supplied pattern pack. See `lib/detectors.ts`.
+ *   - **A judge's model calls.** `maxClaims` bounds the count and the budget is
+ *     now divided across them rather than discarded, so each call is asked for a
+ *     bound. A classifier that ignores its `budgetMicros` is bounded by nothing
+ *     here.
+ *   - **Replaying a case to resolve a parent.** `checkOutput` used to replay the
+ *     whole case on every call, growing for the life of the case on the hot path
+ *     before every effect. A `Screening` now carries its own settled node, so
+ *     that read happens only for a bare `NodeId` this process did not mint, and
+ *     once per case for the witness proof.
  */
 export const DEFAULT_LIMITS: Limits = Object.freeze({
   /**
