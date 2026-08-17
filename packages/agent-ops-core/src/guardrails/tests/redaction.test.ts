@@ -255,6 +255,11 @@ describe("guardrails — redaction before write", () => {
 
     const payloadNode = (await h.nodes()).find((n) => n.payload.kind === NODE.payload);
     expect(payloadNode?.payload["f.narrative"]).toBe("a much l");
-    expect(String(payloadNode?.payload["d.narrative"])).toHaveLength(32);
+    // 64 hex characters: SHA-256. This asserted 32 while the digest was four
+    // FNV-1a lanes, which a security review found could not carry the three
+    // guarantees resting on it — see `lib/canonical.ts`. The length is checked
+    // rather than the value so a future algorithm change fails loudly here
+    // instead of silently altering what a seven-year-old trace means.
+    expect(String(payloadNode?.payload["d.narrative"])).toHaveLength(64);
   });
 });

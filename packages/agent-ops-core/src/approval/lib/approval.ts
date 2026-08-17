@@ -11,6 +11,7 @@ import type {
   ReservedRuleId,
 } from "../../alerts/index.js";
 import { canonicalJson, digest } from "./canonical.js";
+import { narrowToRead } from "./clients.js";
 import {
   AdapterFailed,
   ApprovalError,
@@ -1271,11 +1272,37 @@ export const createApproval = (deps: ApprovalDeps): Approval => {
       runNode,
     );
     const decideStartedAt = clock.now();
-    const client = clients.readOnly({
+    const supplied = clients.readOnly({
       correlationId: ctx.correlationId,
       node: decideNode,
       pointId: spec.id,
     });
+    /**
+     * Re-form the client from its one permitted verb rather than passing on
+     * whatever the factory returned.
+     *
+     * `ClientFactory` is a seam, so the object arriving here is an
+     * application's, not ours. A security review compiled the bypass against
+     * this repository's own configuration with no `any`, no `as` and no
+     * `@ts-expect-error`: a decorating factory returns
+     * `Object.assign(base.readOnly(scope), { write: … })`, which satisfies
+     * `ReadOnlyClient` because excess-property checking does not apply to a
+     * non-fresh object; a `decide` then declares a structural *supertype* of
+     * `ReadOnlyClient` carrying an optional `write`, which contravariance
+     * accepts, and calls it. No licence, no kill-switch read, no idempotency
+     * claim, no `effect.attempting` node — the module's headline invariant
+     * defeated with zero casts.
+     *
+     * The runtime backstop documented on `inMemoryClientFactory` — "the
+     * read-only client has no `write` property at all" — was a property of
+     * *that adapter*, never of the seam. This makes it a property of the seam:
+     * the object `decide` receives is constructed here, so a factory has
+     * nothing to smuggle a verb through. Direct attacks (declaring
+     * `WriteCapableClient`, an intersection, an object-literal impostor) were
+     * already correctly rejected by the types; only the decorator route was
+     * open, and it is closed by construction rather than by inspection.
+     */
+    const client = narrowToRead(supplied);
     const determination: Determination<V, P> = await guard(
       writer,
       decideNode,

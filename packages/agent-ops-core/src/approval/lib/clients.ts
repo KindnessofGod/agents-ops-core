@@ -75,6 +75,33 @@ export interface Client<C extends Capability> extends Reads {
 export type ReadOnlyClient = Client<"read">;
 
 /**
+ * Re-form a read-only client from its one permitted verb.
+ *
+ * `ClientFactory` is a seam, so the object arriving from it belongs to an
+ * application rather than to us. A security review compiled a bypass against
+ * this repository's own configuration using no `any`, no `as` and no
+ * `@ts-expect-error`: a decorating factory returns
+ * `Object.assign(base.readOnly(scope), { write: … })`, which satisfies
+ * `ReadOnlyClient` because excess-property checking does not apply to a
+ * non-fresh object, and a `decide` declaring a structural *supertype* with an
+ * optional `write` is accepted by contravariance and can call it. That is the
+ * module's headline invariant defeated with zero casts.
+ *
+ * The runtime note above — "the runtime object has no such property" — was true
+ * of `inMemoryClientFactory` and never of the seam. This makes it true of the
+ * seam: `run` hands `decide` the result of this function, so there is no object
+ * an application controls for a verb to travel on.
+ *
+ * The cast is the whole point and it belongs here. `CAPABILITY` is phantom, so
+ * no object literal can carry it; minting one is the privilege of the module
+ * that declares the brand, exactly as `asTraceStore` and `asAudit` work in
+ * `audit`. A cast inside the brand's own module is the mechanism. A cast
+ * anywhere else is the bug.
+ */
+export const narrowToRead = (client: Reads): ReadOnlyClient =>
+  ({ read: client.read }) as unknown as ReadOnlyClient;
+
+/**
  * Only ever handed to a declared `EffectDeclaration.execute`, only after a
  * licence has been minted and the kill switch read. No `decide` at any tier
  * receives one — that is the deliberate inversion from `FINDINGS.md`, and it
