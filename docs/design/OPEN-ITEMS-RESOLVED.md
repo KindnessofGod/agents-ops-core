@@ -258,6 +258,70 @@ model underneath.
 
 ---
 
+## 6. Alerting: engineers find out before the customer telephones
+
+**Found by the user**, asking whether the right engineers are notified on
+failure long before a client or employee makes contact.
+
+**Honestly: not systematically, before this.** Alerts appeared in the error
+tables of individual modules — `AuthorityUnavailable` alerts,
+`IdempotencyIndeterminate` alerts — but as scattered obligations rather than a
+concept. There was no seam, no adapter, no severity model, and nothing at all
+for the failures that never throw.
+
+### Resolved
+
+**An `AlertSink` seam, separate from every escalation path.** Two real adapters:
+an on-call paging service, and a structured operational stream for the
+lower-severity conditions. Escalation and alerting never share a channel —
+routine escalation volume would mute the exceptional signal, which is the
+recurrence-cadence failure repeated one level up.
+
+**Alerting is driven by absence, not only by thrown errors.** The eight silent
+conditions are tabulated in `CONTEXT.md`. Every one of them returns success, or
+returns nothing at all, and none is reachable by catching exceptions. A
+reserved decision that completed unassisted is a legal breach that reports a
+good outcome; it must be detected by a check that runs whether or not anything
+went wrong.
+
+Two rules follow, and both are structural rather than operational:
+
+- **The alert path is injected, like everything else**, so it is testable and so
+  a test cannot page a real on-call engineer. An `AlertSink` that swallows
+  everything is a legitimate test adapter and an illegitimate production one —
+  so it is branded, and the production wiring is asserted at the composition
+  root rather than assumed.
+- **Failure to alert is itself alertable.** An `AlertSink` that throws must not
+  take the case down with it, and must not fail silently either. It degrades to
+  the next sink and records the degradation as a node.
+
+### The sweeper's dead-man's switch
+
+The sharpest consequence, and it protects the guarantee added in item 0.
+
+The sweeper fires reminders. If it dies, nobody is chased, nothing throws, and
+every waiting case rots in silence — the system doing exactly what the "never
+stop asking" rule forbids while reporting no problem whatsoever.
+
+- The sweeper **emits a heartbeat on every run, including empty ones**. "Nothing
+  was due" and "I did not run" must not share a representation, for precisely
+  the reason `not-attempted` and `unknown` do not.
+- **The watcher sits outside the sweeper**, and outside this library. A watchdog
+  that depends on the thing it watches fails silently at the moment it is
+  needed. This is the one alert `agent-ops-core` cannot deliver itself, and
+  `RUNBOOK.md` must say so in the plainest terms available, because it is the
+  single instruction most likely to be skipped at deployment and the most
+  expensive to have skipped.
+- **A missed heartbeat outranks every per-case alert.** One stalled case is one
+  customer. A stopped sweeper is every waiting case at once.
+
+**What would change our mind:** an application whose deployment already runs a
+scheduler with its own liveness alerting that it would rather use. That is an
+`AlertSink` adapter and an external watcher it already owns — the requirement is
+satisfied, not waived. What is never acceptable is no watcher at all.
+
+---
+
 ## Summary of what changed in the design
 
 | Item | Change |
@@ -268,3 +332,4 @@ model underneath.
 | 3 | Three idempotency states. `unknown` never auto-retries; it queues for a human. Ambiguity resolves toward not paying twice. |
 | 4 | `evals` nodes get their own store. `audit` keeps `INSERT`-only grants. A trace never spans both. |
 | 5 | Tier attaches per decision-and-effect. A case has a tier profile. Headline tier derived for reporting if ever required. |
+| 6 | `AlertSink` seam, never sharing a channel with escalation. Alerting driven by absence as well as by thrown errors — eight named silent conditions. Sweeper emits a heartbeat on every run including empty ones, watched from outside this library; a missed heartbeat outranks every per-case alert. |

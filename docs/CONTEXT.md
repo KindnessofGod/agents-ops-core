@@ -235,6 +235,70 @@ answerable indefinitely: it never self-resolves, it never disappears from the
 queue, and it never acquires a verdict by the passage of time. The library
 refuses to close it; only an authority can.
 
+**Alert**:
+*Plain English: telling an engineer the machinery is broken.*
+A notification that the system is not working correctly, addressed to an
+operator rather than to a business authority.
+_Avoid_: notification, warning, escalation, page, incident.
+
+**An alert is not an escalation and must never share its channel.** Escalation
+routes a *decision* to an authority because the business requires a human
+judgement; it is expected, routine, and happens continuously. An alert says the
+*machinery* is wrong; it is unexpected and rare. Mixed into one channel, the
+routine volume mutes the exceptional signal, which is the same failure the
+recurrence cadence rule exists to prevent, one level up. Different channel,
+different recipient, different urgency, always.
+
+**Silent failure**:
+A fault that produces no error. Nothing throws, nothing returns non-zero,
+no request fails, and every dashboard stays green.
+_Avoid_: soft failure, degraded, edge case.
+
+These are the failures that reach a customer before they reach an engineer, and
+they are exactly the dangerous quadrant of the outcome table. A case awaiting an
+authority is not an error. A payment whose outcome is unknown is not an error. A
+reserved decision that completed unassisted **returns success**. Catching
+exceptions does not find any of them.
+
+**Therefore: the absence of an expected event is itself an alertable
+condition.** The library alerts on things that did not happen, not only on
+things that failed. A system that alerts only on thrown errors is monitoring the
+failures it was going to survive anyway.
+
+The conditions that must alert, and every one of them is silent:
+
+| Condition | Why it is invisible |
+|---|---|
+| A reserved decision completed unassisted | Returns success. A legal breach reported as a good outcome. |
+| An effect is in `unknown` — attempted, outcome unrecorded | Possible double payment. Nothing failed; something is merely unwitnessed. |
+| Reminders have stopped firing for a waiting case | Nothing errored. The case simply stopped being chased. |
+| A case is buried — scheduled ladder spent, still unanswered | The organisation failed, not the software. No component is down. |
+| `AuthorityUnavailable` — nobody to escalate to | Looks like a queue with nothing in it. |
+| Under-recording detected — decisions with no recorded model call | The build stays green unless something counts what is missing. |
+| Trace unavailable at high tier | Fail-closed is correct *and* means work has stopped. Correct behaviour is still an incident. |
+| Abstention rate, or fail-closed screening rate, moves sharply | Every individual case behaved exactly as designed. |
+
+**Heartbeat**:
+A periodic proof that a component is still running, emitted by that component
+and watched by something outside it.
+_Avoid_: health check, ping, liveness probe, keepalive.
+
+**The sweeper is the single point of failure for the whole recurrence
+guarantee.** It is what fires reminders. If it stops, nobody is chased, nothing
+throws, and every waiting case rots silently — the system doing precisely what
+reserved decisions exist to prevent, while reporting no problem.
+
+So the sweeper emits a heartbeat on every run, including runs with nothing to
+do — "nothing was due" and "I did not run" must not share a representation, for
+the same reason `not-attempted` and `unknown` do not. **The watcher must sit
+outside the sweeper.** A watchdog that depends on the thing it watches fails
+silently at the exact moment it is needed, and this is the one alert that cannot
+be delivered by the library itself.
+
+**A missed heartbeat is the highest-severity alert in the system**, above any
+individual case failure. One stalled case is one customer; a stopped sweeper is
+every waiting case at once, and nobody finds out until somebody telephones.
+
 **Rubber-stamping**:
 An approval granted without the approver engaging with the brief. It is worse
 than no approval: it produces a record that a human approved, which discharges
