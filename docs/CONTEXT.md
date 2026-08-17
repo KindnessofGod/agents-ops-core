@@ -195,16 +195,45 @@ It has not completed. Any metric that counts a waiting case as finished — in
 either direction — is measuring the wrong thing, and the terminal states are
 closed such that "awaiting" is not among them.
 
+**The ladder never terminates into silence.** Its scheduled steps are followed
+by a **recurrence** that repeats until an authority answers. There is no "stop"
+value and no maximum attempt count — the type cannot express giving up. A
+decision that needed a human yesterday still needs one next month, and a system
+that stops asking has decided by exhaustion, which is the thing reserved
+decisions exist to prevent.
+
+**Recurrence**:
+The repeating tail of an escalation ladder: what is sent, to whom, and how
+often, once the scheduled steps are spent. Mandatory. Continues until answered.
+_Avoid_: retry, final notice, give up, max attempts.
+
+Two production constraints on it, and the second is the one usually missed:
+
+- **Cadence is bounded and non-degrading.** Reminders recur on a floor interval
+  and never accelerate. A recurrence that speeds up floods a channel, the
+  channel gets muted, and the case is then *less* likely to be answered than if
+  nothing had been sent. Persistence is the goal; frequency is not.
+- **Recurrence widens the audience, it does not raise the volume.** The
+  fifteenth reminder to a person who has ignored fourteen is not a plan. Each
+  cycle adds recipients — deputy, then line manager, then the accountable
+  executive — and holds the cadence steady. Reaching someone who *can* answer
+  beats reaching the same person more often.
+
+Every reminder sent is recorded as a node, so "we chased them" is evidence
+rather than an assertion.
+
 **Buried case**:
-A decision awaiting an authority that has exhausted its escalation ladder
-without being answered. It is an **incident**, not a state — the ladder has
-failed, and the failure is of the organisation, not of the case.
+A decision awaiting an authority whose scheduled ladder steps are spent and
+which is now in recurrence, still unanswered. It is an **incident**, not a
+state — the ladder has failed, and the failure is of the organisation, not of
+the case.
 _Avoid_: stale, abandoned, orphaned, timed out, expired.
 
-A buried case must remain answerable indefinitely: it never self-resolves, it
-never disappears from the queue, and it never acquires a verdict by the passage
-of time. What it acquires is escalating visibility, terminating in a named
-human being paged. The library refuses to close it; only an authority can.
+Buried does **not** mean the chasing stopped. Reminders continue on the
+recurrence for as long as the case is unanswered. A buried case remains
+answerable indefinitely: it never self-resolves, it never disappears from the
+queue, and it never acquires a verdict by the passage of time. The library
+refuses to close it; only an authority can.
 
 **Rubber-stamping**:
 An approval granted without the approver engaging with the brief. It is worse

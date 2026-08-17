@@ -33,16 +33,44 @@ Both sides enforced in the type:
 type DoNothing<R extends ReservedStatus> =
   R extends { reserved: true }
     // No expire branch. Nothing terminal without an authority answering.
-    ? { readonly ladder: NonEmpty<EscalationStep> }
-    : { readonly ladder: NonEmpty<EscalationStep>
+    ? { readonly ladder: EscalationLadder }
+    : { readonly ladder: EscalationLadder
         readonly expire?: { readonly after: Duration; readonly then: Settlement } }
+
+interface EscalationLadder {
+  readonly steps: NonEmpty<EscalationStep>
+  /** Mandatory. There is no "stop" value and no maximum attempt count. */
+  readonly recurrence: Recurrence
+}
 
 interface EscalationStep {
   readonly after: Duration
   readonly action: "notify" | "escalate" | "alert" | "page"
   readonly to: AuthorityRef
 }
+
+interface Recurrence {
+  /** Floor interval. Never accelerates — a flooded channel gets muted. */
+  readonly every: Duration
+  /** Each cycle adds recipients rather than raising volume to the same one. */
+  readonly widenTo: NonEmpty<AuthorityRef>
+}
 ```
+
+**The ladder cannot terminate into silence.** Keep asking, at a steady interval,
+until somebody answers — the type has no way to express giving up. A decision
+that needed a human yesterday still needs one next month; a system that stops
+asking has decided by exhaustion, which is exactly what reserved decisions
+exist to prevent.
+
+Two production constraints, the second usually missed. **Cadence is bounded and
+never accelerates** — a recurrence that speeds up floods the channel, the
+channel gets muted, and the case becomes *less* likely to be answered than if
+nothing had been sent. **Recurrence widens the audience rather than raising the
+volume**: the fifteenth reminder to someone who ignored fourteen is not a plan,
+so each cycle adds deputy, then line manager, then accountable executive, at a
+steady cadence. Every reminder sent is a recorded node, so "we chased them" is
+evidence rather than an assertion.
 
 A gated decision **cannot be declared without a non-empty ladder**. Declaring a
 human gate without saying what happens as it ages does not compile. Removing
