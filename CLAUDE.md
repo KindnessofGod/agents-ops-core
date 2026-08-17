@@ -123,7 +123,7 @@ from the plan. Where they diverge, the code is the truth — say where.
 **Track B — `docs/business/`, for a finance manager.**
 
 - `OVERVIEW.md`, `THE-PROBLEM.md`, `WHAT-IT-WILL-NOT-DO.md`,
-  `WORKED-EXAMPLE.md`, `IMPACT.md`, `FAQ.md`.
+  `WORKED-EXAMPLE.md`, `IMPACT.md`, `FAQ.md`, `GLOSSARY.md`.
 - No code. No unexplained acronym — not RAG, not LLM, not API, not MCP. Spell
   every term out on first use.
 - Short sentences. Written so the reader can explain the system to their own
@@ -138,11 +138,27 @@ flowchart appear in *both* tracks.
 ## Ubiquitous language
 
 `docs/CONTEXT.md` is binding, not decorative. Several of these terms overlap in
-ordinary speech and must not overlap here. In particular **containment and
-resolution are not the same thing** — a customer who abandons a conversation in
-frustration is contained but not resolved, and any metric that counts them as a
-success is measuring the wrong thing. Do not blur them in code, comments,
-metric names, or documentation.
+ordinary speech and must not overlap here. Three rules carry more weight than
+the rest:
+
+- **Unassisted containment and resolution are not the same thing.** A customer
+  who abandons a conversation in frustration is contained but not resolved, and
+  any metric that counts them as a success is measuring the wrong thing. The
+  term is always `unassisted_containment` — bare `containment` is a lint
+  failure, because the qualifier is what stops it being read as a quality
+  score. It carries no target in this library; it is recorded, never optimised.
+- **Reserved decisions are enforced structurally, never by configuration.** A
+  decision that must have a human by law or policy cannot be made automatic by
+  editing a setting, whatever the model's confidence. Correct unassisted
+  containment for a reserved decision is exactly zero.
+- **Resolution is unrecordable without a named evidence source and window** —
+  quiet, reviewed, or reversed. The library refuses to guess rather than let
+  each application invent one.
+
+`docs/business/GLOSSARY.md` is the plain-language companion, covering both our
+terms and the industry jargon around them. Keep it in step: a term added to
+`CONTEXT.md` that never reaches the glossary is a term only the authors
+understand.
 
 ## Working agreements
 

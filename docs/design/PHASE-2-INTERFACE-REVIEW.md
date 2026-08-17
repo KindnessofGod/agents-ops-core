@@ -137,6 +137,14 @@ whole class of mistake unrepresentable across nineteen applications.
 
 - Tier is assigned before the handler runs and is never derived from handler
   output. A tier computed from a verdict cannot gate the work that produced it.
+- **A reserved decision cannot complete unassisted.** There is no threshold, no
+  override and no configuration key that permits it, and no confidence value
+  that excuses it. Structurally: a reserved decision's handler is registered
+  against a type that has no automatic branch to return, so "the system decided
+  it" does not typecheck. This is a stronger guarantee than the tier ladder,
+  because reserved status is a legal obligation rather than a risk judgement —
+  and it is orthogonal to tier, so it cannot be re-tiered away by a team chasing
+  throughput.
 - An effect executes at most once per idempotency key. A repeat returns the
   *original* outcome — it does not re-execute and does not error.
 - Dual control's two authorities are distinct, and the second approval is
@@ -158,10 +166,19 @@ the gate can mint. The kill switch is checked at `execute`, not at `classify`.
 - `AuthorityUnavailable` — **the dangerous one.** No human to escalate to. This
   path silently becomes containment-without-resolution, which is the flattering
   failure `CONTEXT.md` warns about. It must be a distinct, alertable error and
-  never fold into a generic timeout.
+  never fold into a generic timeout. For a **reserved** decision it is stronger
+  still: with no authority available the case waits indefinitely or fails, and
+  must never fall through to a default. "Nobody was on shift" is not a
+  lawful basis for an automated decision.
 
-**Required configuration:** `TierPolicy` (per application), authority directory,
-idempotency store, kill-switch source, dual-control thresholds.
+**Required configuration:** `TierPolicy` (per application), **reserved-decision
+list** (per application), authority directory, idempotency store, kill-switch
+source, dual-control thresholds.
+
+The reserved list is required and defaults to empty. Empty means "this
+application has declared no legal obligations yet" — honest and visibly
+incomplete, rather than quietly wrong. An application heading for production
+with an empty reserved list should fail a pre-flight check, not a code review.
 
 **Performance characteristics — and one fact that reshapes the whole module:**
 `classify` runs on every decision and must be pure and sub-millisecond, with no
@@ -183,6 +200,11 @@ keep if I could keep only one.
 
 - **`TierPolicy`** — nineteen real adapters, one per application. This is the
   most obviously real seam in the project.
+- **`ReservedPolicy`** — nineteen real adapters. Kept deliberately separate
+  from `TierPolicy` rather than folded into it: merging them would let a
+  business quietly remove a legal obligation by adjusting a risk threshold,
+  which is precisely the failure the concept exists to prevent. Two seams, on
+  purpose, against the usual instinct to unify.
 - **`Authority`** — Adapter 1: human, via a task queue. Adapter 2: delegated
   automated policy at low tier (still recorded with a named delegation, per
   `CONTEXT.md`). **Real seam.**

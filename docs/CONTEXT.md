@@ -183,69 +183,150 @@ _Avoid_: circuit breaker, feature flag, disable, panic button.
 and the conflation hides real failures. They are separate fields, computed from
 separate data, available at separate times.
 
-**Containment**:
+**Unassisted containment**:
+*Plain English: the case finished without a person being asked to decide.*
 A case reached a terminal state without authority over it transferring to a
-human. It measures **human effort avoided**. It is a property of the path the
-system took, and it is fully observable from your own trace at the moment the
-case closes.
-_Avoid_: automation rate, deflection, self-service rate, success.
+human. It measures **human effort avoided** — it is a **cost** measure, not a
+quality measure. It is a property of the path the system took, and it is fully
+observable from your own trace at the moment the case closes.
+_Avoid_: automation rate, deflection, self-service rate, straight-through
+processing, success.
+
+The qualifier **unassisted** is not decoration and is not optional. Written
+bare, "containment" reads as though human involvement were failure, which is
+how the industry misuses it. Written as *unassisted containment*, it says what
+it actually records — nobody assisted — and leaves whether that was good
+entirely open. Use the full two-word term in code, column names, dashboards and
+both documentation tracks. `containment` alone is a lint failure.
 
 **Resolution**:
+*Plain English: the person whose problem it was actually got it sorted.*
 The party whose problem it was received the outcome they were entitled to. It
 measures **whether the system was any good**. It is a property of the outcome
 judged against a standard external to the run, and it is **not knowable when the
 case closes** — it requires evidence gathered afterwards.
-_Avoid_: success, accuracy, correctness, completion, closure, CSAT.
+_Avoid_: success, accuracy, correctness, completion, closure, customer
+satisfaction score.
+
+**Resolution evidence**:
+The external signal that lets resolution be recorded at all, plus the window it
+is observed over. Exactly one of three shapes, named explicitly per application:
+
+- **Quiet** — nothing came back within the window: no reopen, no complaint, no
+  appeal. Cheapest; usually already in your systems. **Weakest**: silence is not
+  agreement, and someone who gave up is silent. Never the sole source for a
+  reserved decision.
+- **Reviewed** — a human re-examined a sample of closed cases and judged them.
+  The only source that catches quiet wrongness, and the first one cut when
+  budgets tighten. Costs human time on cases nobody complained about.
+- **Reversed** — money moved back: a clawback, a reversal, a refund. Hardest
+  evidence, already recorded in finance. Only exists where money moves, so it
+  fits invoices, claims and expenses, and not ticket routing.
+
+An application may combine sources. It may not record resolution without naming
+at least one, and the trace records **which** source and window produced the
+value. A resolution figure whose provenance is unknown cannot be audited and is
+therefore not evidence of anything.
+
+**Reserved decision**:
+*Plain English: a decision a person must make, by law or by policy — the
+computer is not allowed to make it, no matter how sure it is.*
+A decision the system may prepare but must not make. Reserved status is
+determined by law, regulation, or standing policy, and is assigned before
+execution.
+_Avoid_: manual review, human-in-the-loop, mandatory escalation, high risk.
+
+Three consequences, all load-bearing:
+
+1. **Confidence is never a reason to skip it.** "The model was 99.8% sure" is
+   not an argument; the obligation does not depend on the system's opinion of
+   itself. This is what makes reserved different from every tier threshold.
+2. **Reserved status is orthogonal to risk tier.** Tier measures the
+   consequence of error; reserved is a legal or policy obligation. A £50
+   decision may be reserved and a £2M decision may not be. They must not be
+   merged into one ladder, or a business will "optimise" a legal obligation
+   away by re-tiering.
+3. **For a reserved decision the correct unassisted containment is 0%.** Not
+   low — nil. Any non-zero value is a breach, not an efficiency.
+
+Point 3 settles the argument about what containment is. A number whose target
+is *as high as possible* for some case types and *exactly zero* for others is
+plainly not a scoreboard. It is a reading, like a temperature.
+
+**Reserved status is enforced structurally, never by configuration.** There is
+no setting, threshold, or override that makes a reserved decision automatic.
+If it can be switched off by editing a config file, it is not reserved — it is
+a preference, and preferences get changed at 4pm on a Friday by someone chasing
+a throughput target.
 
 ### Why they get conflated, and why it flatters you
 
-Containment is cheap: it falls out of your own logs, immediately, for free.
-Resolution is expensive: it needs an entitlement standard, an external evidence
-source, and a waiting period. So teams measure containment, name it resolution,
-and report it.
+Unassisted containment is cheap: it falls out of your own logs, immediately, for
+free. Resolution is expensive: it needs an entitlement standard, an external
+evidence source, and a waiting period. So teams measure the cheap one, name it
+the expensive one, and report it.
 
 The failure is not merely that this is imprecise. It is that **the error runs in
 the flattering direction**. A customer who abandons a conversation in
-frustration is contained — nobody escalated, the case closed, the metric
+frustration is contained — nobody escalated, the case closed, the number
 improved. They are not resolved. The worse your system is at the moment of
-abandonment, the better your containment number looks.
+abandonment, the better the number looks.
 
 The mirror case is just as bad and gets discussed far less. A case escalated to
 a human who then fixes it correctly is **resolved but not contained** — a
-success the containment metric scores as a failure. A team optimising
+success the containment number scores as a failure. A team paid to raise
 containment is therefore being paid to suppress correct escalations. That is not
 a hypothetical incentive; it is the predictable result of shipping one number.
+
+There is also a third thing containment hides, and it is the one that makes the
+whole metric untrustworthy: **"no human was involved" silently includes "nobody
+decided at all."** A case that timed out, fell to a default, or was abandoned is
+counted identically to a case the system judged correctly. Both are unassisted.
+Only one involved judgment.
 
 The four states, all of which occur:
 
 | | **Resolved** | **Not resolved** |
 |---|---|---|
-| **Contained** | The goal. | **The dangerous quadrant.** Abandonment; wrong-but-unchallenged; a silent default after an abstention nobody saw. Looks like your best cases. |
-| **Not contained** | Escalation working exactly as designed. Costs a human. Counts as failure under containment. | The most expensive: a human was spent and it was still wrong. |
+| **Contained** | The intended path — *provided the decision was not reserved.* | **The dangerous quadrant.** Abandonment; wrong-but-unchallenged; a timeout or default nobody saw; a reserved decision that was never routed. Looks like your best cases. |
+| **Not contained** | Escalation working exactly as designed, and the only correct state for a reserved decision. Costs a human. Scored as failure by containment. | The most expensive: a human was spent and it was still wrong. |
 
 ### Rules this imposes on the code
 
-1. **Never a single `success` boolean.** Containment and resolution are two
-   fields with two provenances and two timestamps.
+1. **Never a single `success` boolean.** Unassisted containment and resolution
+   are two fields with two provenances and two timestamps.
 2. **Resolution must never be computed from data available at case close.** If
    it can be, it is containment wearing a different name. This is a review
    check, not a guideline.
 3. **A metric named `resolution_rate` derived from trace data alone is a bug**,
-   and should be treated as one.
-4. **Abstention is not containment's enemy or friend.** An abstention that
-   terminates on a default with no human is contained. It is very unlikely to be
-   resolved. This path deserves its own alert.
+   and should be treated as one. Resolution without a named evidence source and
+   window is not recordable.
+4. **`containment` alone is not a valid identifier** anywhere in the codebase.
+   The field, the column and the label are `unassisted_containment`.
+5. **Unassisted containment carries no target in the library.** It is recorded,
+   never optimised. Any per-application target lives in that application, next
+   to its reserved-decision list, where the two can be read together.
+6. **A reserved decision that completed unassisted is an incident**, not a
+   metric movement. It alerts; it does not appear in a weekly average.
+7. **"Nobody decided" is distinguishable from "the system decided."** Timeout,
+   default and abandonment are recorded as their own terminal states, never
+   collapsed into ordinary containment.
+8. **Abstention is neither containment's enemy nor its friend.** An abstention
+   that terminates on a default with no human is contained, and is very unlikely
+   to be resolved. This path gets its own alert.
 
-> **Challenge — I need this from you, per application.** Resolution is undefined
-> until you name, for each of the nineteen: the **entitlement standard** (what
-> the right answer is and who says so), the **evidence source** (reopen within
-> 30 days? auditor sample agreeing? no clawback in 90 days? no complaint?), and
-> the **observation window**.
+> **Settled.** The three evidence shapes — quiet, reviewed, reversed — are
+> defined above, and an application may combine them. The library will refuse to
+> record a resolution without a named source and window rather than let each
+> team invent one.
 >
-> Without those three, `resolution` is a word in a document and every
-> application will quietly degrade it back into containment, because containment
-> is the only thing they can actually compute. I would rather ship a library
-> that refuses to record a resolution than one that lets each team invent one.
+> **Still outstanding, per application, and not blocking the build:** the
+> **entitlement standard** (what the right answer is, and who says so), the
+> chosen **source and window**, and the **reserved-decision list**. Until an
+> application supplies these, its resolution field stays empty and its reserved
+> list is empty — which is honest, and visibly incomplete, rather than quietly
+> wrong. An empty reserved list is a deliberate default of "no legal obligations
+> declared yet", and applications going to production must fill it in.
 
 ---
 
@@ -295,8 +376,11 @@ erDiagram
     CASE ||--o{ DECISION : "contains"
     CASE ||--|| CORRELATION_ID : "identified by"
     CASE ||--|| TRACE : "recorded as"
-    CASE ||--|| CONTAINMENT : "observed at close"
+    CASE ||--|| UNASSISTED_CONTAINMENT : "observed at close"
     CASE ||--o| RESOLUTION : "observed later, externally"
+    RESOLUTION }o--|| RESOLUTION_EVIDENCE : "requires named source and window"
+    DECISION ||--o| RESERVED : "may be, by law or policy"
+    RESERVED ||--|| ESCALATION : "always requires"
 
     DECISION ||--|| VERDICT : "produces exactly one"
     DECISION ||--|| RISK_TIER : "classified by, before running"
@@ -315,9 +399,13 @@ erDiagram
     SHADOW_RUN }o--|| CASE : "replays without effect"
 ```
 
-Read the two outcome edges carefully: `CASE ||--|| CONTAINMENT` is mandatory and
-immediate; `CASE ||--o| RESOLUTION` is optional and later. That asymmetry is the
-whole point, and it is why they cannot share a column.
+Read the two outcome edges carefully: `CASE ||--|| UNASSISTED_CONTAINMENT` is
+mandatory and immediate; `CASE ||--o| RESOLUTION` is optional and later. That
+asymmetry is the whole point, and it is why they cannot share a column.
+
+Read the `RESERVED` edges too. A reserved decision always requires escalation,
+which means it can never be unassisted — the two facts are wired together in the
+model rather than left to a policy document nobody reads.
 
 ---
 
@@ -328,11 +416,27 @@ Recorded here rather than resolved, because they are yours to decide:
 1. **Does `verdict` survive as a separate term from `decision`?**
 2. **Does risk tier attach to a case, or to a decision-and-its-effect?** I
    recommend the latter; I acknowledge the former is simpler to explain.
-3. **What is the resolution evidence source and observation window for each of
-   the nineteen applications?** Until this is answered, resolution cannot be
-   recorded honestly.
-4. **Who are the named authorities**, and does an automated low-tier approval
+3. **Who are the named authorities**, and does an automated low-tier approval
    carry a delegation identity in the trace?
+4. **Per application, and not blocking the build:** the entitlement standard,
+   the chosen resolution evidence source and window, and the reserved-decision
+   list. Each application supplies its own; the library refuses to invent them.
+
+### Settled
+
+- **The term is `unassisted containment`**, keeping the industry word so
+  auditors recognise it and adding the qualifier so a newcomer can read it. The
+  bare form is a lint failure.
+- **Resolution evidence has three named shapes** — quiet, reviewed, reversed —
+  and resolution is unrecordable without one plus a window.
+- **Reserved decisions exist as a first-class concept**, orthogonal to risk
+  tier, enforced structurally rather than by configuration, with a correct
+  unassisted-containment value of exactly zero.
+
+That last one came from a question — *aren't there parts where it's important
+humans don't automate, functionally and legally?* — and it is the reason the
+containment framing could finally be settled: a number whose target is zero for
+some case types is not a scoreboard.
 
 These are tracked as ADRs once decided. Nothing in this file is settled by me
 alone — but nothing in the code may contradict it while it stands.
