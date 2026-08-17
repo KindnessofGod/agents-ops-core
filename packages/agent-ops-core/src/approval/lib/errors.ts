@@ -9,6 +9,38 @@
  * Nothing here throws for an **abstention** or an **escalation**. An abstention
  * is a verdict and a successful outcome of a working system; an escalation is a
  * change in who holds authority. Both are returned, never thrown.
+ *
+ * ## Where alerting lives now, and why it is not in this file
+ *
+ * This table used to carry scattered alerting obligations in prose —
+ * "`AuthorityUnavailable` ... alerts", "`IdempotencyIndeterminate` ... alerts" —
+ * with nothing that delivered them. `docs/design/OPEN-ITEMS-RESOLVED.md` item 6
+ * named that as the defect: *"Alerts appeared in the error tables of individual
+ * modules ... but as scattered obligations rather than a concept."* They are now
+ * raised through `ApprovalDeps.alerting`, at the site that detects the
+ * condition, and the node records what became of the raise.
+ *
+ * **The split is not arbitrary and it is worth understanding before adding an
+ * error here.** Everything in this file **throws**. A caller who catches it
+ * knows something went wrong, and an uncaught one turns a dashboard red. That is
+ * not the failure `alerts` exists for. The eight conditions in `docs/CONTEXT.md`
+ * are the ones that *return success*: a reserved decision completed unassisted,
+ * an effect whose outcome is merely unwitnessed, reminders that quietly stopped.
+ * None of them is reachable by catching anything, and none of them belongs in an
+ * error table — which is exactly why they were missing from every one.
+ *
+ * So: an error mode goes here. A silent condition goes through the seam. Two of
+ * the five conditions this module raises happen to *accompany* an error
+ * (`IdempotencyIndeterminate`, `AuthorityUnavailable`), and the alert is raised
+ * at the detection site rather than in the constructor, because an error's
+ * constructor cannot know whether anybody is going to catch it.
+ *
+ * The `alert: true` field still found on some node payloads in this module is
+ * neither of those things and is not a delivery. It is a query hint on a node
+ * that **already threw** — "an operator reading this trace should stop here" —
+ * and it says nothing about whether a human was told. Nodes describing one of
+ * the eight conditions carry `alerted: "delivered" | "suppressed" |
+ * "undelivered" | "not-configured" | "refused"` instead, which does.
  */
 
 export abstract class ApprovalError extends Error {
@@ -152,10 +184,20 @@ export class DualControlSelfApproval extends ApprovalError {
  * call was made and we cannot tell what happened.
  *
  * Fail-closed, **never auto-retried**, queued for a human with the full trace
- * attached, and it alerts. A duplicated payment is a clawback, a
- * customer-trust incident and a regulatory conversation; a delayed payment is a
- * phone call. Those costs are not symmetric and the default must not pretend
- * they are.
+ * attached. A duplicated payment is a clawback, a customer-trust incident and a
+ * regulatory conversation; a delayed payment is a phone call. Those costs are
+ * not symmetric and the default must not pretend they are.
+ *
+ * **The alert is raised where the condition is detected, not here.** Every site
+ * that puts a claim into `unknown` raises `effect-outcome-unknown` through
+ * `ApprovalDeps.alerting` before throwing this, and records the delivery on the
+ * node. An error's constructor cannot know whether anybody is going to catch it,
+ * and "it alerts" written in a doc comment was the scattered obligation
+ * `docs/design/OPEN-ITEMS-RESOLVED.md` item 6 was about.
+ *
+ * Note that `unknown` is the one state nothing in this library ever clears on
+ * its own, at any age. The alert is therefore not a notification about work in
+ * progress — it is the **only** thing that starts the work.
  */
 export class IdempotencyIndeterminate extends ApprovalError {
   override readonly name = "IdempotencyIndeterminate";
@@ -273,9 +315,16 @@ export class KillSwitchUnreadable extends ApprovalError {
  * No authority is available to answer.
  *
  * **Never fail-open.** Non-reserved: the case stays suspended and the ladder
- * keeps running. Reserved: indefinite hold, and it alerts. This is the path by
- * which a case becomes contained-without-resolution — the flattering failure —
- * so it is named, distinct, and never folded into a generic timeout.
+ * keeps running. Reserved: indefinite hold. This is the path by which a case
+ * becomes contained-without-resolution — the flattering failure — so it is
+ * named, distinct, and never folded into a generic timeout.
+ *
+ * **The alert is raised at the detection site, not here**, and this error is
+ * usually *constructed and not thrown*: the offer fails soft, so the name lands
+ * on a node while the case stays suspended and the sweep retries. That is
+ * precisely what makes it silent — `docs/CONTEXT.md`: *"looks like a queue with
+ * nothing in it"* — and why the raise cannot live in a constructor that nobody
+ * is waiting on. See `authority-unavailable` in `alerts`.
  */
 export class AuthorityUnavailable extends ApprovalError {
   override readonly name = "AuthorityUnavailable";
@@ -495,6 +544,72 @@ export class EffectAlreadyInFlight extends ApprovalError {
   override readonly incident = false;
   constructor(readonly key: string) {
     super(`idempotency key ${key} is claimed by another caller that has not settled it yet`);
+  }
+}
+
+/**
+ * The durable store could not serve a call.
+ *
+ * **Fail-closed, never degraded, and recorded before it is raised.** Three
+ * reasons, and they are not the same fact:
+ *
+ *   `store-failure`  The connection reset, the disk is full, the database is
+ *                    gone. Transient from the caller's side; retryable by the
+ *                    caller with backoff, because nothing was written.
+ *   `backpressure`   This adapter already holds `maxPendingWrites` writes in
+ *                    flight and shed this one rather than queueing it behind
+ *                    pool connections. Also retryable, and the retry is the
+ *                    point: shedding is how the backlog stays bounded instead
+ *                    of surfacing as latency until the process dies.
+ *   `contract`       The database refused the statement — a constraint, a data
+ *                    type, a missing column. A defect or a schema that has
+ *                    drifted from `APPROVAL_STORE_SCHEMA_SQL`, **never**
+ *                    retryable, and never reported as an outage: degrading a
+ *                    foreign-key violation into "the store was briefly away" is
+ *                    how a missing suspension becomes an ordinary Tuesday.
+ *
+ * It is deliberately raised by the adapter and **recorded by the module**: the
+ * store does not hold a recorder, and a failure nobody wrote down is the
+ * failure this library exists to make impossible. See `guard` in `approval.ts`.
+ */
+export class ApprovalStoreUnavailable extends ApprovalError {
+  override readonly name = "ApprovalStoreUnavailable";
+  override readonly incident = false;
+  /** Marks this as raised by an adapter, so `guard` records it rather than assuming it was. */
+  readonly adapterRaised = true;
+  constructor(
+    readonly reason: "store-failure" | "backpressure" | "contract",
+    readonly operation: string,
+    override readonly cause?: unknown,
+  ) {
+    super(`approval store could not serve ${operation} (${reason})`);
+  }
+}
+
+/**
+ * More entry-point invocations are in flight than `limits.maxInFlight` permits.
+ *
+ * **Fail-closed, shed before anything starts, not an incident.** Nothing was
+ * classified, screened, decided, recorded or paid, so the caller may retry with
+ * backoff and lose nothing but time.
+ *
+ * It is the one failure in this module with **no node**, and the reason is
+ * stated rather than hidden: recording it would mean opening a trace, which is
+ * the work being shed. The count belongs in the caller's own operational
+ * metrics, and a sustained non-zero value is a capacity fact rather than a case
+ * fact — there is no case to attach it to.
+ */
+export class ApprovalOverloaded extends ApprovalError {
+  override readonly name = "ApprovalOverloaded";
+  override readonly incident = false;
+  constructor(
+    readonly entryPoint: string,
+    readonly inFlight: number,
+    readonly ceiling: number,
+  ) {
+    super(
+      `${entryPoint} refused: ${inFlight} invocations already in flight against a ceiling of ${ceiling}`,
+    );
   }
 }
 

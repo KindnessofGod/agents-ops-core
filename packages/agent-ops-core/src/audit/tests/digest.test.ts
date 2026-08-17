@@ -5,6 +5,9 @@ import {
   SEAL_KIND,
   TRACE_DIGEST_VERSION,
   TraceTampered,
+  UnknownEnvelope,
+  digestGenesis,
+  extendDigest,
   inMemoryTraceStore,
   traceDigest,
   type RecordedNode,
@@ -90,6 +93,41 @@ describe("audit — trace digest", () => {
     // Handing the nodes over in the wrong order does not change the digest:
     // the chain is defined over the sequence the store assigned.
     expect(traceDigest(shuffled)).toBe(replayed.digest());
+  });
+
+  it("is a fold, so it can be extended one node at a time", async () => {
+    const { audit } = harness();
+    const trace = await audit.open(CASE_A);
+    await trace.record({ kind: "a", v: 1 }, { tier: "low" });
+    await trace.record({ kind: "b", v: 1 }, { tier: "low" });
+    await trace.record({ kind: "c", v: 1 }, { tier: "low" });
+    const nodes = (await audit.replay(CASE_A)).nodes;
+
+    // This equality is what lets `close` publish a whole-case digest derived
+    // from the seal alone — no re-read of the case it has just written — and
+    // what lets a 100,000-node walk digest incrementally. If it ever fails, the
+    // witnessed digest and the replayed digest are two different numbers.
+    let running = digestGenesis();
+    for (const node of nodes) running = extendDigest(running, node);
+    expect(String(running)).toBe(String(traceDigest(nodes)));
+
+    const head = nodes.slice(0, 2);
+    const last = nodes[2] as RecordedNode;
+    expect(String(extendDigest(traceDigest(head), last))).toBe(String(traceDigest(nodes)));
+  });
+
+  it("refuses to extend a digest whose construction it does not implement", async () => {
+    const { audit } = harness();
+    const trace = await audit.open(CASE_A);
+    await trace.record({ kind: "a", v: 1 }, { tier: "low" });
+    const node = (await audit.replay(CASE_A)).nodes[0] as RecordedNode;
+
+    // Not "tampered": "I do not ship that construction" and "somebody edited
+    // this row" are different sentences to say to an auditor.
+    expect(() =>
+      extendDigest("aoc.audit.trace.v9:sha256:00" as TraceDigest, node),
+    ).toThrow(UnknownEnvelope);
+    expect(() => extendDigest("nonsense" as TraceDigest, node)).toThrow(UnknownEnvelope);
   });
 
   it("verifies against a digest recorded elsewhere", async () => {

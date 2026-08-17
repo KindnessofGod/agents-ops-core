@@ -32,6 +32,7 @@ import {
   type Tier,
   type TierPolicy,
 } from "../../index.js";
+import type { AlertRaiser, ComponentId, Heartbeat } from "../../../alerts/index.js";
 
 /**
  * Adapters for the whole module, all in memory.
@@ -221,6 +222,18 @@ export interface HarnessOptions {
   readonly limits?: Partial<Limits>;
   readonly startAt?: number;
   readonly sweeperId?: string;
+  /**
+   * Where the five silent conditions go.
+   *
+   * A test may only ever pass an in-memory `Alerts` built over
+   * `recordingAlertSink`. That is not a convention it is trusted to keep: the
+   * `alerts` module constructs no transport and reads no environment, so there
+   * is no code path from this package to a pager for a test to reach even with
+   * live credentials present. Hermeticism is a fact about the call graph here.
+   */
+  readonly alerting?: AlertRaiser;
+  readonly heartbeat?: Heartbeat;
+  readonly sweeperComponent?: ComponentId;
 }
 
 const buildOn = (
@@ -255,6 +268,9 @@ const buildOn = (
     clock,
     limits: { ...DEFAULT_LIMITS, ...options.limits },
     sweeperId: options.sweeperId ?? "sweeper-a",
+    alerting: options.alerting,
+    heartbeat: options.heartbeat,
+    sweeperComponent: options.sweeperComponent,
   });
   return {
     approval,

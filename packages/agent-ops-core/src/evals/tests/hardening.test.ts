@@ -12,6 +12,7 @@ import {
   gate,
   goldenSuite,
   inMemoryEvalNodeStore,
+  inMemoryRunLedger,
   judgePanel,
   legacyReviewerExport,
   LimitOutOfRange,
@@ -21,6 +22,7 @@ import {
   reopenAccuracyReport,
   ReportRefused,
   run,
+  seed as makeSeed,
   scriptedModelBackend,
   sqlEvalNodeStore,
   StoreNotMinted,
@@ -132,6 +134,7 @@ describe("a forged store beneath a genuine recorder", () => {
         clock: manualClock(),
         redact: passthroughRedactor,
         timers: systemTimers(),
+        ledger: inMemoryRunLedger(),
       }),
     ).toThrow(StoreNotMinted);
   });
@@ -143,6 +146,7 @@ describe("a forged store beneath a genuine recorder", () => {
         clock: manualClock(),
         redact: passthroughRedactor,
         timers: systemTimers(),
+        ledger: inMemoryRunLedger(),
       }),
     ).not.toThrow();
   });
@@ -585,6 +589,7 @@ describe("an incident is never downgraded to an outcome", () => {
       clock: manualClock(),
       redact: passthroughRedactor,
       timers: systemTimers(),
+      ledger: inMemoryRunLedger(),
     });
     await expect(
       run({
@@ -740,16 +745,22 @@ describe("retention is bounded and atomic", () => {
       clock,
       redact: passthroughRedactor,
       timers: systemTimers(),
+      ledger: inMemoryRunLedger(),
     });
     for (let i = 0; i < 3; i += 1) {
       await run({
         label: `day-${i}`,
+        // A different **seed** per day, not just a different label. The label is
+        // deliberately not in the run key — "pre-merge" and "nightly" over the
+        // same cases are one question asked twice — so three runs that differed
+        // only by label would be one execution and two memo hits, and this test
+        // would have one run to expire rather than three.
+        seed: makeSeed(`seed-day-${i}`),
         cases: oneInvoice("duplicate"),
         subject: subjectSaying("duplicate"),
         scorers: [exactVerdict],
         models: echoBackend(),
         recorder,
-        seed: testSeed,
         limits: smallLimits,
         priceTable,
       });
@@ -989,6 +1000,7 @@ describe("the SQL adapter under concurrent writers", () => {
         clock: manualClock(),
         redact: passthroughRedactor,
         timers: systemTimers(),
+        ledger: inMemoryRunLedger(),
       }),
       seed: testSeed,
       limits: { ...smallLimits, concurrency: 8 },
@@ -1022,7 +1034,7 @@ describe("the SQL adapter is runnable as shipped", () => {
   it("ships the schema it requires, covering every table and column it writes", () => {
     // There was no migration creating agent_ops.eval_run or agent_ops.eval_node
     // anywhere in the repository, and the adapter described its schema in prose.
-    // Copy this into migrations/0003_eval_store.sql.
+    // Copy this into migrations/0004_eval_store.sql.
     for (const needle of [
       "agent_ops.eval_run",
       "agent_ops.eval_node",
@@ -1237,6 +1249,7 @@ describe("every node is settled on exactly one path", () => {
       clock: manualClock(),
       redact: passthroughRedactor,
       timers: systemTimers(),
+      ledger: inMemoryRunLedger(),
     });
     const opensAfterAbort = defineSubject({
       version: testSubjectVersion,

@@ -8,10 +8,12 @@ import type {
   Redactor,
   RiskTier,
   RunId,
+  RunKey,
   ScorerDescriptor,
   Seed,
   SourceDigest,
   SubjectVersion,
+  SubsetSelection,
   TraceDigest,
   Verdict,
 } from "./types.js";
@@ -43,9 +45,77 @@ import type {
 declare const ACCURACY: unique symbol;
 declare const AGREEMENT: unique symbol;
 
-export type Determinism =
-  | { readonly declared: "deterministic" }
-  | { readonly declared: "non-deterministic"; readonly reasons: readonly string[] };
+/**
+ * What the run's own scorers declared about themselves, **and what was actually
+ * checked**.
+ *
+ * The two halves are separate because they are different kinds of statement and
+ * only one of them is evidence. `declared` is an assertion by the scorer
+ * adapters' authors. `check` is a measurement this module performed.
+ *
+ * The declaration alone used to be the whole of it, which is how interface fact
+ * 5 — "a run is deterministic given (suite, subject, scorer, seed), or the
+ * report declares that it is not" — got satisfied without anything being
+ * verified. The half that varies in practice is the **subject**: a temperature
+ * setting, an unseeded shuffle, iteration over host-ordered keys, a cache warm
+ * on the second call. No scorer descriptor knows about any of those.
+ */
+export interface Determinism {
+  readonly declared: "deterministic" | "non-deterministic";
+  /** Why, when declared non-deterministic. Empty otherwise, never absent. */
+  readonly reasons: readonly string[];
+  readonly check: DeterminismCheck;
+}
+
+/**
+ * The determinism **check**, and what it does not cover.
+ *
+ * A seeded sample of this run's own cases is re-executed under the identical
+ * seed and the two verdicts are compared byte for byte in canonical form. That
+ * is cheap, it is the half that matters, and it is bounded by
+ * `Limits.determinismSampleCases`.
+ *
+ * `compared: "subject-verdict"` is on the artefact so nobody reads more into it
+ * than it says. **The scorers are not re-run.** A judge panel is
+ * non-deterministic by construction and says so in its descriptor; re-running it
+ * would measure the judge's variance, which is a different question, costs n
+ * times more, and is already surfaced as `contested`.
+ *
+ * A sample of 2 over 200 cases proves nothing about the other 198 and is not
+ * claimed to. What it catches is the common case, which is a subject that is
+ * non-deterministic *everywhere* — and that one is caught on the first sample.
+ */
+export type DeterminismCheck =
+  | { readonly kind: "not-checked"; readonly why: string }
+  | {
+      readonly kind: "checked";
+      readonly compared: "subject-verdict";
+      readonly sampled: readonly CaseRef[];
+      readonly stable: number;
+      /** Re-executed under the same seed and answered differently. */
+      readonly unstable: readonly CaseRef[];
+    };
+
+/**
+ * Whether this run executed, resumed, or ran blind because the ledger was down.
+ *
+ * On the artefact because a resumed run's cost, token counts and node graph
+ * describe **only the part that executed today**. A reader comparing two reports
+ * of the same suite and finding one at a tenth of the cost is looking at a
+ * resume, and the report should say so rather than leave them to work it out.
+ *
+ * `ledger-unavailable` is the visible half of the one fail-open policy in this
+ * module. A fail-open policy nobody can see is indistinguishable from a bug.
+ */
+export type Memoisation =
+  | { readonly kind: "fresh" }
+  | {
+      readonly kind: "resumed";
+      /** Carried forward from an earlier run of the same key, not observed today. */
+      readonly cases: readonly CaseRef[];
+      readonly fromRuns: readonly string[];
+    }
+  | { readonly kind: "ledger-unavailable"; readonly detail: string };
 
 /**
  * Whether the trace accounts for the thinking — and, when it does not, why not.
@@ -83,12 +153,14 @@ export interface RunFacts {
    * share a run key and can be recognised as repeats; the `runId` is unique per
    * execution.
    */
-  readonly runKey: string;
+  readonly runKey: RunKey;
   readonly subjectVersion: SubjectVersion;
   readonly subjectPurity: "calls-models" | "pure";
   readonly seed: Seed;
   readonly scorers: readonly ScorerDescriptor[];
   readonly determinism: Determinism;
+  /** Whether this run executed, resumed from memo, or ran without a ledger. */
+  readonly memoisation: Memoisation;
   readonly attribution: Attribution;
   readonly attributionCoverageBasisPoints: number;
   readonly unattributedCases: readonly CaseRef[];
@@ -127,12 +199,24 @@ export interface RunFacts {
   readonly capturedVia: "injected-client-only";
 }
 
+/**
+ * `could-not-evaluate` is the fifth value and the reason this schema is `/2`.
+ *
+ * It is **not** `unscored`. Unscored means the machinery worked and the case
+ * still could not be measured — a judge returned nonsense, a scorer threw, the
+ * subject crashed. Could-not-evaluate means the machinery did not get a turn:
+ * the provider answered 429, or 503, or the connection reset. One is a fact
+ * about the system under test; the other is a fact about ten minutes on a
+ * Tuesday, and folding them together made a rate-limit storm arrive as
+ * `unscored-rate` on the same red line a genuine regression uses.
+ */
 export type AccuracyCaseStatus =
   | "correct"
   | "incorrect"
   | "unscored"
   | "contested"
-  | "unattributed";
+  | "unattributed"
+  | "could-not-evaluate";
 
 export interface AccuracyCaseResult {
   readonly ref: CaseRef;
@@ -160,13 +244,21 @@ export interface AccuracyCaseResult {
 
 export interface AccuracyReport extends RunFacts {
   readonly [ACCURACY]: true;
-  readonly schema: "report.accuracy/1";
+  readonly schema: "report.accuracy/2";
   readonly against: "golden";
   readonly suiteDigest: SourceDigest;
+  /**
+   * Present and `null` when the run covered the whole suite; populated when it
+   * covered a subset. **A green gate over a subset states what it covered**, and
+   * this is where it says so.
+   */
+  readonly selection: SubsetSelection | null;
   readonly correctBasisPoints: number;
   readonly incorrectBasisPoints: number;
   readonly unscoredBasisPoints: number;
   readonly contestedBasisPoints: number;
+  /** Its own rate. A provider outage is not a quality signal. */
+  readonly couldNotEvaluateBasisPoints: number;
   readonly cases: readonly AccuracyCaseResult[];
 }
 
@@ -175,7 +267,8 @@ export type AgreementCaseStatus =
   | "disagreed"
   | "unscored"
   | "contested"
-  | "unattributed";
+  | "unattributed"
+  | "could-not-evaluate";
 
 export interface AgreementCaseResult {
   readonly ref: CaseRef;
@@ -207,9 +300,11 @@ export interface Disagreement {
 
 export interface AgreementReport extends RunFacts {
   readonly [AGREEMENT]: true;
-  readonly schema: "report.agreement/1";
+  readonly schema: "report.agreement/2";
   readonly against: "recorded-human-decisions";
   readonly cohortDigest: SourceDigest;
+  /** Present and `null` unless the cohort was itself a subset. */
+  readonly selection: SubsetSelection | null;
   /** Required and named. A figure with no stated provenance is not evidence. */
   readonly humanDecisionSource: string;
   readonly window: ObservationWindow;
@@ -230,6 +325,8 @@ export interface AgreementReport extends RunFacts {
   readonly disagreedBasisPoints: number;
   readonly unscoredBasisPoints: number;
   readonly contestedBasisPoints: number;
+  /** Its own rate. A provider outage is not a disagreement with a human. */
+  readonly couldNotEvaluateBasisPoints: number;
   /**
    * Enumerated, not summarised. Every one is a case for **adjudication**, never
    * a defect — the field is not called `failures` and it never will be.
@@ -290,20 +387,23 @@ const redactVerdict = (redact: Redactor, verdict: Verdict): Verdict => ({
 export const mintAccuracyReport = (
   facts: RunFacts,
   suiteDigest: SourceDigest,
+  selection: SubsetSelection | null,
   rates: {
     readonly correctBasisPoints: number;
     readonly incorrectBasisPoints: number;
     readonly unscoredBasisPoints: number;
     readonly contestedBasisPoints: number;
+    readonly couldNotEvaluateBasisPoints: number;
   },
   cases: readonly AccuracyCaseResult[],
   redact: Redactor,
 ): AccuracyReport =>
   ({
     ...facts,
-    schema: "report.accuracy/1",
+    schema: "report.accuracy/2",
     against: "golden",
     suiteDigest,
+    selection,
     ...rates,
     cases: cases.map((c) => ({
       ...c,
@@ -316,6 +416,7 @@ export const mintAccuracyReport = (
 export const mintAgreementReport = (
   facts: RunFacts,
   cohortDigest: SourceDigest,
+  selection: SubsetSelection | null,
   provenance: {
     readonly humanDecisionSource: string;
     readonly window: ObservationWindow;
@@ -326,6 +427,7 @@ export const mintAgreementReport = (
     readonly disagreedBasisPoints: number;
     readonly unscoredBasisPoints: number;
     readonly contestedBasisPoints: number;
+    readonly couldNotEvaluateBasisPoints: number;
   },
   disagreements: readonly Disagreement[],
   cases: readonly AgreementCaseResult[],
@@ -333,9 +435,10 @@ export const mintAgreementReport = (
 ): AgreementReport =>
   ({
     ...facts,
-    schema: "report.agreement/1",
+    schema: "report.agreement/2",
     against: "recorded-human-decisions",
     cohortDigest,
+    selection,
     humanDecisionSource: provenance.humanDecisionSource,
     window: provenance.window,
     withoutHumanDecision: provenance.withoutHumanDecision,
@@ -360,7 +463,7 @@ export const mintAgreementReport = (
 
 /* ------------------------------------------------- crossing a process line */
 
-const INTEGER_FIELDS = [
+const SHARED_INTEGER_FIELDS = [
   "attributionCoverageBasisPoints",
   "casesRun",
   "casesDeclared",
@@ -370,14 +473,123 @@ const INTEGER_FIELDS = [
   "startedAt",
   "finishedAt",
   "nodes",
-  "correctBasisPoints",
-  "incorrectBasisPoints",
   "unscoredBasisPoints",
   "contestedBasisPoints",
+  "couldNotEvaluateBasisPoints",
+] as const;
+
+const ACCURACY_INTEGER_FIELDS = [
+  ...SHARED_INTEGER_FIELDS,
+  "correctBasisPoints",
+  "incorrectBasisPoints",
+] as const;
+
+const AGREEMENT_INTEGER_FIELDS = [
+  ...SHARED_INTEGER_FIELDS,
+  "agreementBasisPoints",
+  "disagreedBasisPoints",
 ] as const;
 
 const rateOf = (numerator: number, denominator: number): number =>
   denominator === 0 ? 0 : Math.round((numerator * 10_000) / denominator);
+
+/**
+ * Every report schema this build can read. Bump by **adding**, never replacing.
+ *
+ * The module claimed a schema-evolution story for nodes and had none for
+ * reports, which is the wrong way round: the node graph expires at 90 days and
+ * the report is the seven-year artefact. A `report.accuracy/1` written before
+ * `couldNotEvaluateBasisPoints`, `selection` and the determinism *check* existed
+ * is still a valid report, and it is upcast on read — the bytes on disk are
+ * never touched, and the values the old build could not have known are filled
+ * with the honest answer rather than a flattering one.
+ */
+export const READABLE_REPORT_SCHEMAS: readonly string[] = [
+  "report.accuracy/1",
+  "report.accuracy/2",
+  "report.agreement/1",
+  "report.agreement/2",
+];
+
+/**
+ * Fill in the fields `/1` could not have carried, on read.
+ *
+ * Note the values. `couldNotEvaluateBasisPoints` becomes `0` — a `/1` run could
+ * not distinguish a provider outage from an unscored case, so its outage cases
+ * are already inside `unscoredBasisPoints` and moving them would be inventing
+ * data. `selection` becomes `null`: subsets did not exist, so the run covered
+ * whatever it covered and nothing claims otherwise. The determinism check
+ * becomes `not-checked`, **not** stable — an old report is silent about
+ * determinism, and silence is not a pass.
+ */
+const upcastReport = (record: Record<string, unknown>): Record<string, unknown> => {
+  const schema = record["schema"];
+  if (schema !== "report.accuracy/1" && schema !== "report.agreement/1") return record;
+  const declared = (record["determinism"] as { readonly declared?: unknown } | undefined)?.declared;
+  return {
+    ...record,
+    schema: schema === "report.accuracy/1" ? "report.accuracy/2" : "report.agreement/2",
+    couldNotEvaluateBasisPoints: 0,
+    selection: null,
+    memoisation: record["memoisation"] ?? { kind: "fresh" },
+    determinism: {
+      declared: declared === "non-deterministic" ? "non-deterministic" : "deterministic",
+      reasons:
+        (record["determinism"] as { readonly reasons?: readonly string[] } | undefined)?.reasons ??
+        [],
+      check: {
+        kind: "not-checked",
+        why: `written under ${String(schema)}, before determinism was verified rather than declared`,
+      },
+    },
+  };
+};
+
+const asRecord = (value: unknown, what: string): Record<string, unknown> => {
+  if (typeof value !== "object" || value === null) {
+    throw new ReportRefused(`expected an object for ${what}, got ${typeof value}`);
+  }
+  return value as Record<string, unknown>;
+};
+
+const checkIntegers = (
+  record: Record<string, unknown>,
+  fields: readonly string[],
+): void => {
+  for (const field of fields) {
+    const found = record[field];
+    if (typeof found !== "number" || !Number.isSafeInteger(found)) {
+      throw new ReportRefused(`${field} is not a safe integer`);
+    }
+  }
+};
+
+const casesOf = (record: Record<string, unknown>): readonly Record<string, unknown>[] => {
+  const cases = record["cases"];
+  if (!Array.isArray(cases) || cases.length === 0) {
+    throw new ReportRefused("cases is empty or missing; a report over no cases passes trivially");
+  }
+  return cases as readonly Record<string, unknown>[];
+};
+
+const checkRates = (
+  record: Record<string, unknown>,
+  cases: readonly Record<string, unknown>[],
+  expected: Readonly<Record<string, number>>,
+): void => {
+  for (const [field, want] of Object.entries(expected)) {
+    if (record[field] !== want) {
+      throw new ReportRefused(
+        `${field} is ${String(record[field])} but its own ${String(cases.length)} cases give ${String(want)}`,
+      );
+    }
+  }
+  if (record["casesRun"] !== cases.length) {
+    throw new ReportRefused(
+      `casesRun is ${String(record["casesRun"])} but the report carries ${String(cases.length)} cases`,
+    );
+  }
+};
 
 /**
  * Re-enter a report that crossed a process boundary, and refuse anything else.
@@ -408,50 +620,80 @@ const rateOf = (numerator: number, denominator: number): number =>
  * does, not what a gate does.
  */
 export const reopenAccuracyReport = (value: unknown): AccuracyReport => {
-  if (typeof value !== "object" || value === null) {
-    throw new ReportRefused(`expected an object, got ${typeof value}`);
-  }
-  const record = value as Record<string, unknown>;
-  if (record["schema"] !== "report.accuracy/1") {
+  const raw = asRecord(value, "an accuracy report");
+  if (raw["schema"] !== "report.accuracy/1" && raw["schema"] !== "report.accuracy/2") {
     throw new ReportRefused(
-      `schema is ${JSON.stringify(record["schema"])}, not "report.accuracy/1" — an agreement report is not an accuracy report, and a continuous-integration gate is not something you build on agreement data`,
+      `schema is ${JSON.stringify(raw["schema"])}, not an accuracy report schema this build reads (${READABLE_REPORT_SCHEMAS.filter((s) => s.startsWith("report.accuracy")).join(", ")}) — an agreement report is not an accuracy report, and a continuous-integration gate is not something you build on agreement data`,
     );
   }
+  const record = upcastReport(raw);
   if (record["against"] !== "golden") {
     throw new ReportRefused(`against is ${JSON.stringify(record["against"])}, not "golden"`);
   }
   if (record["capturedVia"] !== "injected-client-only") {
     throw new ReportRefused("capturedVia is missing; the artefact must state its own scope");
   }
-  for (const field of INTEGER_FIELDS) {
-    const found = record[field];
-    if (typeof found !== "number" || !Number.isSafeInteger(found)) {
-      throw new ReportRefused(`${field} is not a safe integer`);
-    }
-  }
-  const cases = record["cases"];
-  if (!Array.isArray(cases) || cases.length === 0) {
-    throw new ReportRefused("cases is empty or missing; a report over no cases passes trivially");
-  }
-  const statuses = (cases as readonly Record<string, unknown>[]).map((c) => c["status"]);
+  checkIntegers(record, ACCURACY_INTEGER_FIELDS);
+  const cases = casesOf(record);
+  const statuses = cases.map((c) => c["status"]);
   const count = (status: string): number => statuses.filter((s) => s === status).length;
-  const expected = {
+  checkRates(record, cases, {
     correctBasisPoints: rateOf(count("correct"), cases.length),
     incorrectBasisPoints: rateOf(count("incorrect"), cases.length),
+    // Unchanged in meaning across `/1` and `/2`: unmeasurable for reasons
+    // attributable to the system under test. A provider outage left this bucket
+    // when `could-not-evaluate` arrived; it did not change what the bucket means.
     unscoredBasisPoints: rateOf(count("unscored") + count("unattributed"), cases.length),
     contestedBasisPoints: rateOf(count("contested"), cases.length),
-  };
-  for (const [field, want] of Object.entries(expected)) {
-    if (record[field] !== want) {
-      throw new ReportRefused(
-        `${field} is ${String(record[field])} but its own ${String(cases.length)} cases give ${String(want)}`,
-      );
-    }
-  }
-  if (record["casesRun"] !== cases.length) {
+    couldNotEvaluateBasisPoints: rateOf(count("could-not-evaluate"), cases.length),
+  });
+  return record as unknown as AccuracyReport;
+};
+
+/**
+ * The same honest re-entry for an agreement report.
+ *
+ * It exists because the ledger stores reports as JSON — a completed shadow run
+ * of the same key must come back through a validating door, not a cast — and
+ * because a caller doing agreement analysis across a process line was previously
+ * offered nothing at all and would have written the cast themselves.
+ *
+ * **There is deliberately no `gate` that accepts what this returns.** The
+ * disjointness is the point: agreement's baseline is human behaviour including
+ * human error, so 97% agreement is 97% agreement, and no amount of re-entry
+ * turns it into a build verdict.
+ */
+export const reopenAgreementReport = (value: unknown): AgreementReport => {
+  const raw = asRecord(value, "an agreement report");
+  if (raw["schema"] !== "report.agreement/1" && raw["schema"] !== "report.agreement/2") {
     throw new ReportRefused(
-      `casesRun is ${String(record["casesRun"])} but the report carries ${String(cases.length)} cases`,
+      `schema is ${JSON.stringify(raw["schema"])}, not an agreement report schema this build reads`,
     );
   }
-  return value as AccuracyReport;
+  const record = upcastReport(raw);
+  if (record["against"] !== "recorded-human-decisions") {
+    throw new ReportRefused(
+      `against is ${JSON.stringify(record["against"])}, not "recorded-human-decisions"`,
+    );
+  }
+  if (record["capturedVia"] !== "injected-client-only") {
+    throw new ReportRefused("capturedVia is missing; the artefact must state its own scope");
+  }
+  if (typeof record["humanDecisionSource"] !== "string" || record["humanDecisionSource"] === "") {
+    throw new ReportRefused(
+      "humanDecisionSource is missing; an agreement figure with no named source is not evidence of anything",
+    );
+  }
+  checkIntegers(record, AGREEMENT_INTEGER_FIELDS);
+  const cases = casesOf(record);
+  const statuses = cases.map((c) => c["status"]);
+  const count = (status: string): number => statuses.filter((s) => s === status).length;
+  checkRates(record, cases, {
+    agreementBasisPoints: rateOf(count("agreed"), cases.length),
+    disagreedBasisPoints: rateOf(count("disagreed"), cases.length),
+    unscoredBasisPoints: rateOf(count("unscored") + count("unattributed"), cases.length),
+    contestedBasisPoints: rateOf(count("contested"), cases.length),
+    couldNotEvaluateBasisPoints: rateOf(count("could-not-evaluate"), cases.length),
+  });
+  return record as unknown as AgreementReport;
 };

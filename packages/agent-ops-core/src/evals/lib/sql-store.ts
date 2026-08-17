@@ -73,7 +73,7 @@ import type {
  * `agent_ops.eval_node` anywhere in the repository — so the second adapter of
  * this seam was unrunnable as shipped and nobody could tell from reading it.
  *
- * It belongs in `migrations/` as `0003_eval_store.sql`, applied by the same
+ * It belongs in `migrations/` as `0004_eval_store.sql`, applied by the same
  * migration role that applies the audit tables. Shipping it here as well means
  * the adapter and the schema it assumes cannot drift apart silently: a test in
  * this module asserts that every table and column this file writes appears in
@@ -102,7 +102,7 @@ const NODE = "agent_ops.eval_node";
 
 /**
  * The schema this adapter requires, and the grants that make it different from
- * `audit`'s. Copy into `migrations/0003_eval_store.sql`.
+ * `audit`'s. Copy into `migrations/0004_eval_store.sql`.
  *
  * Read the grants against `0002_audit_trace.sql` side by side. That file gives
  * its writer `SELECT, INSERT` and nothing else, and adds triggers that raise on
@@ -116,7 +116,7 @@ const NODE = "agent_ops.eval_node";
  * The consequence, stated because it is a real weakening: **eval node graphs are
  * not seven-year evidence.** The reports are; the graph behind them expires.
  */
-export const EVAL_STORE_SCHEMA_SQL = `-- 0003_eval_store.sql
+export const EVAL_STORE_SCHEMA_SQL = `-- 0004_eval_store.sql
 -- The eval node store. A SEPARATE physical store from the audit trace, per
 -- docs/design/OPEN-ITEMS-RESOLVED.md item 4: its own role, its own grants, its
 -- own 90-day retention. A trace never spans both.
@@ -200,7 +200,7 @@ END
 $$;
 
 INSERT INTO agent_ops.schema_migrations (version)
-VALUES ('0003_eval_store')
+VALUES ('0004_eval_store')
 ON CONFLICT (version) DO NOTHING;
 
 COMMIT;

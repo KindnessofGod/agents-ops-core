@@ -2,9 +2,11 @@ import { canonicalPayloadForm, digestOf, EVAL_ENVELOPE_VERSION } from "./canonic
 import {
   EvalStoreUnavailable,
   NodeSettledTwice,
+  ProviderUnavailable,
   RecorderNotMinted,
   SubjectAttemptedWrite,
 } from "./errors.js";
+import { assertMintedLedger } from "./ledger-brand.js";
 import { assertMintedStore } from "./store-brand.js";
 import type { ModelBackend, ModelRequest, ModelResponse, ReadOnlyClient } from "./clients.js";
 import type {
@@ -22,6 +24,7 @@ import type {
   RecorderDeps,
   Redactor,
   RunId,
+  RunLedger,
   StoredEvalRun,
   StoredRunHeader,
   Timers,
@@ -148,6 +151,16 @@ export interface RecorderInternals {
   readonly redact: Redactor;
   readonly clock: Clock;
   readonly timers: Timers;
+  /**
+   * Idempotency and resume. Wired at the composition root next to the store,
+   * never handed in per run — see the note on `RecorderDeps.ledger`.
+   */
+  readonly ledger: RunLedger;
+  /**
+   * Where a run raises `under-recording-detected`. Optional; see
+   * `RecorderDeps.alerting` for why it is wired here and not per run.
+   */
+  readonly alerting: import("../../alerts/index.js").AlertRaiser | undefined;
 }
 
 const internals = new WeakMap<EvalRecorder, RecorderInternals>();
@@ -186,6 +199,27 @@ const priceOf = (
 const backoffMillis = (attempt: number, jitter01: number): number =>
   Math.max(1, Math.floor(Math.min(20 * 2 ** attempt, 2_000) * jitter01));
 
+/**
+ * How long to wait before the next attempt.
+ *
+ * A provider that says `Retry-After` is telling you when it will serve you
+ * again, and ignoring it is how a bounded retry turns into a bounded retry that
+ * fails three times in ninety milliseconds and reports a regression. So the
+ * provider's number wins — **capped**, because a header is input and an
+ * uncapped wait taken from input is not a bound. Thirty seconds is the cap; a
+ * provider asking for longer than that has told us to stop for now, and the case
+ * becomes `could-not-evaluate` rather than blocking a worker for a minute.
+ *
+ * Everything else keeps the seeded jitter, so the backoff sequence stays
+ * reproducible from the run seed and a test asserts it instead of waiting.
+ */
+const RETRY_AFTER_CAP_MILLIS = 30_000;
+
+const waitMillis = (cause: unknown, attempt: number, jitter01: number): number =>
+  cause instanceof ProviderUnavailable && cause.retryAfterMillis !== null
+    ? Math.max(1, Math.min(cause.retryAfterMillis, RETRY_AFTER_CAP_MILLIS))
+    : backoffMillis(attempt, jitter01);
+
 const errorName = (cause: unknown): string => (cause instanceof Error ? cause.name : typeof cause);
 
 const errorMessage = (cause: unknown): string =>
@@ -202,6 +236,11 @@ export const createEvalRecorder = (deps: RecorderDeps): EvalRecorder => {
   // the other half of the recorder's: a genuine recorder over a forged store
   // produced a green report with nothing written anywhere.
   const store = assertMintedStore(deps.store);
+  // Same reason, one layer along. A forged store makes a run report success
+  // while writing nothing; a forged **ledger** makes `run` return a green report
+  // without executing anything at all, which is cheaper still and leaves no
+  // diff. Both are checked here, before a run can open.
+  const ledger = assertMintedLedger(deps.ledger);
   const recorder = {} as EvalRecorder;
   let runCounter = 0;
 
@@ -372,17 +411,25 @@ export const createEvalRecorder = (deps: RecorderDeps): EvalRecorder => {
               lastError = cause;
               if (attempt === input.retries) break;
               // Each retry is its own recorded fact with a parent, not a log line.
+              const wait = waitMillis(cause, attempt, nextJitter());
               const retryNode = await makeNode(callNode, {
                 kind: "retry",
                 name: request.model,
                 v: 1,
-                payload: { attempt, "error.name": errorName(cause) },
+                payload: {
+                  attempt,
+                  "error.name": errorName(cause),
+                  // So a rate-limit storm is legible in the trace as a storm
+                  // rather than as a series of unexplained model failures.
+                  providerUnavailable: cause instanceof ProviderUnavailable,
+                  waitMillis: wait,
+                },
                 signal: options.signal,
               });
               await retryNode.settle({ outcome: "ok", closing: {} });
               // Bounded, jittered, and driven by the **injected** timers, so a
               // test asserts the sequence instead of waiting for it.
-              await deps.timers.sleep(backoffMillis(attempt, nextJitter()), options.signal);
+              await deps.timers.sleep(wait, options.signal);
               continue;
             }
             // The success path is deliberately outside the `try`: a settle that
@@ -544,6 +591,8 @@ export const createEvalRecorder = (deps: RecorderDeps): EvalRecorder => {
     redact: deps.redact,
     clock: deps.clock,
     timers: deps.timers,
+    ledger,
+    alerting: deps.alerting,
   });
   return recorder;
 };

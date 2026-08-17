@@ -1,5 +1,6 @@
 import type { CorrelationId, NodeId, RiskTier } from "../../audit/index.js";
 import type { Clock } from "../../audit/index.js";
+import type { DeclaredCoverage, DetectorCoverage } from "./coverage.js";
 import type { SETTLED_NODE } from "./mint.js";
 import type { Timer } from "./timer.js";
 
@@ -270,6 +271,28 @@ export interface ScreeningSubject {
    * racing cannot cancel work the module does not control.
    */
   readonly budgetMicros: number;
+  /**
+   * Whether the budget above is already spent. Checked by a well-behaved
+   * detector between units of work; honoured by both shipped adapters.
+   *
+   * **Not a clock, and the distinction is what keeps purity intact.** It cannot
+   * say what time it is, how long is left, or how long anything took: it is a
+   * one-bit, monotone oracle closed over the engine's injected clock. There is
+   * nothing here to have an effect with, nothing to seed a nonce from, and
+   * nothing that varies between two calls in the same instant.
+   *
+   * It exists because a budget a detector cannot observe is a budget only the
+   * engine can enforce, and the engine can only enforce it *after the fact* —
+   * see `Detector.screen` for the half of that which stays true regardless.
+   */
+  readonly deadline: Deadline;
+}
+
+/**
+ * The one-bit budget oracle handed to a detector. See `ScreeningSubject.deadline`.
+ */
+export interface Deadline {
+  expired(): boolean;
 }
 
 export type DetectorUnavailableReason =
@@ -313,12 +336,29 @@ export type DetectorReport =
       readonly costTenthCents: number;
       readonly modelCalls: number;
       readonly spend?: DetectorSpend;
+      readonly examinedFields?: readonly string[];
     }
   | {
       readonly outcome: "searched-and-found-none";
       readonly costTenthCents: number;
       readonly modelCalls: number;
       readonly spend?: DetectorSpend;
+      /**
+       * Which fields this detector actually looked at. Omitted means **all of
+       * them** — every field it was shown.
+       *
+       * It is here because `fields?: readonly string[]` on the shipped adapters
+       * was invisible wiring: a personal-data detector configured for
+       * `["subject"]` while the free-text `narrative` went unexamined produced a
+       * screening reading `searchedAndFoundNone` over text nobody searched. The
+       * engine folds this into `Screening.coverage`, so the trace records how
+       * much of the payload was looked at rather than implying all of it.
+       *
+       * Names must be fields the detector was shown; anything else is a
+       * `DetectorReportInvalid`, because a detector claiming to have searched a
+       * field that does not exist is claiming a search nobody ran.
+       */
+      readonly examinedFields?: readonly string[];
     }
   | {
       readonly outcome: "unavailable";
@@ -371,7 +411,38 @@ export interface Detector {
    * derived from the identifier.
    */
   readonly searches: string;
-  screen(subject: ScreeningSubject): Promise<DetectorReport> | DetectorReport;
+  /**
+   * What this detector claims to cover, and — the half that matters — what it
+   * claims not to. Optional, because a bespoke caller detector may have nothing
+   * to say; a detector that completes a search having declared nothing is
+   * counted in `Screening.coverage.declared.undeclared` rather than assumed
+   * either way. See `lib/coverage.ts`.
+   */
+  readonly declares?: DetectorCoverage;
+  /**
+   * **Asynchronous, and that is a requirement rather than a convenience.**
+   *
+   * It used to be `Promise<DetectorReport> | DetectorReport`. A synchronous body
+   * never yields, so the engine's race against `detectorBudgetMicros` was not
+   * scheduled until after the detector had already finished, and a detector that
+   * looped could not be preempted by any in-process timer of any design.
+   *
+   * Requiring a promise is the precondition for the race being scheduled at all.
+   * **It is not, by itself, a bound**, and this interface will not pretend
+   * otherwise: an `async` function whose body is central-processing-unit-bound
+   * until it returns blocks the event loop exactly as a synchronous one did.
+   * What actually bounds the shipped deterministic adapter is two other things —
+   * `Pattern` cannot be constructed from a regular expression capable of
+   * exponential backtracking, and the scan checks `subject.deadline` between
+   * every pattern and every field. See `lib/safe-pattern.ts`, which also states
+   * the polynomial residue that remains and gives its bound.
+   *
+   * For an application-supplied detector the honest claim is narrower still: a
+   * detector that awaits something can be raced, a detector that yields to its
+   * `deadline` stops on time, and a detector that does neither is bounded by
+   * nothing this module can offer.
+   */
+  screen(subject: ScreeningSubject): Promise<DetectorReport>;
 }
 
 /**
@@ -617,6 +688,85 @@ export interface ScreeningCost {
   readonly unmeasuredDetectors: number;
 }
 
+/** Which classes of detector completed a search over this payload. */
+export type CoverageDepth =
+  | "none"
+  | "deterministic"
+  | "model"
+  | "deterministic-and-model";
+
+/**
+ * How much of the payload was actually looked at, and how much of it went into
+ * the trace unexamined.
+ *
+ * ## The question this answers, and the one it refuses to
+ *
+ * Redaction masks **detected sites**. Text no detector flagged is recorded
+ * verbatim, bounded only by `maxRecordedFieldChars` — which means a screening
+ * that found nothing and a screening that had nothing to find produce the same
+ * `Screening.payload` and the same `recommend: "allow"`. A caller could not tell
+ * *"we looked, and masked three items"* from *"we found nothing and wrote all
+ * 4,812 characters of a free-text narrative into a seven-year archive"*. Those
+ * are different risks and they now have different numbers.
+ *
+ * **It is coverage, not confidence, and the name is deliberate.**
+ * `docs/CONTEXT.md` binds *confidence* to a verdict — the system's estimate of
+ * how likely its own conclusion is to be wrong — and this module produces no
+ * verdict. More to the point, nothing here can estimate the probability that a
+ * name, an address or a diagnosis went unrecognised: that depends on text nobody
+ * has read. A single number claiming to be "redaction confidence" would be the
+ * most dangerous field in the trace, because it would be believed. So what is
+ * reported is what is actually observable — how much text was examined, by what
+ * class of detector, how much was masked, how much was written down anyway —
+ * and the inference is left to the reader, who has the payload.
+ *
+ * Every figure is an integer, and `rule` names the arithmetic so a 2033 reader
+ * can reproduce it without this file.
+ */
+export interface ScreeningCoverage {
+  /** Names the arithmetic below, so a change to it is a new name, not a drift. */
+  readonly rule: string;
+  /** Code units of caller text a completing detector examined. */
+  readonly examinedCodeUnits: number;
+  /** Code units of caller text in the payload, examined or not. */
+  readonly totalCodeUnits: number;
+  /** `examinedCodeUnits` over `totalCodeUnits`, in basis points, floored. */
+  readonly examinedBasisPoints: number;
+  /**
+   * Fields **no** completing detector examined. Names only — a field name is a
+   * caller's key, never its content.
+   */
+  readonly unexaminedFields: readonly string[];
+  readonly maskedSites: number;
+  /** Code units of the original text replaced by `MASK`. */
+  readonly maskedCodeUnits: number;
+  /**
+   * Code units of caller text this screening wrote into the trace verbatim,
+   * after masking and after truncation to `maxRecordedFieldChars`.
+   *
+   * The headline risk number. Zero masked sites and a large figure here is the
+   * "we found nothing and wrote it all down" case, and it is now a number rather
+   * than an inference somebody has to make.
+   *
+   * Counted by subtracting each `MASK` marker from the recorded text, so a
+   * payload whose own words include the literal string `[redacted]` is
+   * undercounted by ten code units per occurrence. That is the one inaccuracy in
+   * this figure and it errs downward, which is the wrong direction — it is named
+   * rather than corrected because correcting it needs a marker that cannot occur
+   * in caller text, and a marker that is not byte-stable across seven years is a
+   * worse trade than an occasional ten.
+   */
+  readonly verbatimCodeUnitsRecorded: number;
+  readonly depth: CoverageDepth;
+  /** Detectors that completed a search, by class. */
+  readonly deterministicDetectors: number;
+  readonly modelDetectors: number;
+  /** Detectors that could not search at all. Their coverage is nil, not partial. */
+  readonly unavailableDetectors: number;
+  /** What the completing detectors declared they cover — and do not. */
+  readonly declared: DeclaredCoverage;
+}
+
 declare const SCREENING: unique symbol;
 
 /**
@@ -653,6 +803,16 @@ export interface Screening {
   readonly recommended: RecommendedDisposition;
   readonly cost: ScreeningCost;
   /**
+   * How much was looked at, by what, and how much went into the trace anyway.
+   *
+   * This is what makes the residual risk below **visible** rather than merely
+   * documented: `maskedSites: 0` beside `verbatimCodeUnitsRecorded: 4812` is a
+   * different sentence from `maskedSites: 3`, and until this field existed they
+   * produced identical screenings. See `ScreeningCoverage` — and note it is
+   * coverage, not confidence.
+   */
+  readonly coverage: ScreeningCoverage;
+  /**
    * Redacted at every **detected** site: no site any detector reported reaches
    * a store, here or anywhere, and there is no un-writing.
    *
@@ -660,10 +820,11 @@ export interface Screening {
    * Text no detector flagged is recorded verbatim, bounded by
    * `maxRecordedFieldChars`, so a free-text narrative carrying a name, an
    * address or a diagnosis in a shape no pattern matched lands in the trace in
-   * full. Two things shrink that residue and neither is this module asserting it
-   * away: a model-class detector on the same field, and `audit`'s
-   * deny-by-default `redactAllExcept` on the trace itself, wired with
-   * `GUARDRAILS_TRACE_FIELDS`.
+   * full. Three things shrink that residue and none of them is this module
+   * asserting it away: a model-class detector on the same field, `audit`'s
+   * deny-by-default `redactAllExcept` on the trace itself wired with
+   * `GUARDRAILS_TRACE_FIELDS`, and — since neither is free — reading `coverage`
+   * and deciding which fields are worth either.
    */
   readonly payload: ScreenedPayload;
 }
@@ -758,6 +919,29 @@ export interface GuardrailsDeps {
   /** Required. No default. Tier selects the set. */
   readonly detectorSets: DetectorSets;
   readonly limits: Limits;
+  /**
+   * The eighth silent condition: **the fail-closed screening rate moving
+   * sharply**.
+   *
+   * `docs/CONTEXT.md`: *"every individual case behaved exactly as designed."*
+   * There is no case to look at. A classifier that starts timing out at noon
+   * produces two hundred screenings that each fail closed correctly, recommend
+   * `abstain` correctly and write a correct node — and together mean this
+   * deployment has stopped making decisions with nobody told. It is the one
+   * condition here that is a property of a window rather than of a payload.
+   *
+   * **Wired as one object or not at all.** A window with nowhere to raise is a
+   * counter nobody reads, and a sink with no window terms cannot judge a
+   * movement. Half-wiring the two would produce something that *looks*
+   * monitored, which is worse than being visibly unmonitored — so the two cannot
+   * be separated in the type.
+   *
+   * Optional, and its absence is not disguised. Nothing degrades: screening
+   * behaves identically, and no rate is watched. See `lib/rate-watch.ts` for
+   * what "fail-closed" means exactly, why the window is keyed by phase and tier,
+   * and why the first two windows of a process's life raise nothing.
+   */
+  readonly rateAlerting?: import("./rate-watch.js").RateAlerting | undefined;
 }
 
 /**

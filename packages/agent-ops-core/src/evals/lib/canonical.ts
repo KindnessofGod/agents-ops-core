@@ -127,3 +127,31 @@ export const digestOf = (parts: readonly string[]): string => {
  */
 export const basisPoints = (numerator: number, denominator: number): number =>
   denominator === 0 ? 0 : Math.round((numerator * 10_000) / denominator);
+
+/**
+ * A seeded rank for one identifier: FNV-1a, 32 bits, over `"<seed>:<value>"`.
+ *
+ * Two places need to choose a reproducible sample of cases — the pre-merge
+ * subset and the determinism check — and both must be recomputable by somebody
+ * in 2033 who holds the seed and the reference list. So the rule is stated
+ * completely rather than delegated: **offset basis 2166136261, prime 16777619,
+ * unsigned 32-bit throughout, both bytes of every UTF-16 code unit hashed low
+ * first.** That is short enough to reimplement with a calculator, which is the
+ * property `digestOf`'s sha256 does not have.
+ *
+ * It is not a digest and is not used as one. It orders a list; it makes no claim
+ * about collision resistance and nothing depends on one. Both callers also
+ * **record the identifiers they chose**, so a selection stays checkable even if
+ * this rule is ever changed — the answer was written down rather than left to be
+ * recomputed.
+ */
+export const seededRank = (seed: string, value: string): number => {
+  const input = `${seed}:${value}`;
+  let hash = 2_166_136_261 >>> 0;
+  for (let index = 0; index < input.length; index += 1) {
+    const unit = input.charCodeAt(index);
+    hash = Math.imul(hash ^ (unit & 0xff), 16_777_619) >>> 0;
+    hash = Math.imul(hash ^ ((unit >>> 8) & 0xff), 16_777_619) >>> 0;
+  }
+  return hash >>> 0;
+};

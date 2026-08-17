@@ -34,7 +34,10 @@ import {
  *     turned a `block` into an `allow`;
  *   - a **synchronous** detector ignored `detectorBudgetMicros` entirely,
  *     because a synchronous body never yields and `Promise.race` is therefore
- *     never scheduled;
+ *     never scheduled. The test below is what could be done from the engine's
+ *     side alone — refuse the answer deterministically — and it still holds for
+ *     any detector whose body does not yield. What was done about the *work* is
+ *     in `safe-pattern.test.ts` and `deadline.test.ts`;
  *   - `judgeGroundedness` discarded the budget and handed every one of up to
  *     `maxClaims` sequential model calls a hardcoded `budgetMicros: 0`.
  */

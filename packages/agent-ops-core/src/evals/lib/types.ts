@@ -13,6 +13,19 @@ export type ScorerDigest = string & { readonly __brand: "ScorerDigest" };
 export type Seed = string & { readonly __brand: "Seed" };
 export type TraceDigest = string & { readonly __brand: "EvalTraceDigest" };
 
+/**
+ * The content address of *what would be run*: source digest, subject version,
+ * scorer digests, seed, price-table version and the limits.
+ *
+ * It is not the run's identity — `RunId` is, and it is unique per execution.
+ * `RunKey` is the identity of the **question**, which is what makes two
+ * executions recognisable as repeats of one another. Everything that could
+ * change the answer is in it; nothing that cannot is. The label is not in it, so
+ * `"nightly"` and `"pre-merge"` over the same suite are one question asked
+ * twice, not two.
+ */
+export type RunKey = string & { readonly __brand: "EvalRunKey" };
+
 export const caseRef = (value: string): CaseRef => value as CaseRef;
 export const subjectVersion = (value: string): SubjectVersion => value as SubjectVersion;
 export const scorerId = (value: string): ScorerId => value as ScorerId;
@@ -149,6 +162,61 @@ export interface CaseSource<K extends SourceKind> {
    * that a figure whose provenance is unknown is not evidence of anything.
    */
   readonly provenance: K extends "recorded" ? RecordedProvenance : null;
+  /**
+   * Present when this source is a **subset** of a larger one, `null` when it is
+   * the whole thing.
+   *
+   * A subset is a `CaseSource` in its own right with its own content address —
+   * not a flag on a run — which is what makes the pre-merge run's key different
+   * from the nightly run's key without anybody having to remember. It also
+   * makes the coverage claim travel: `run` stamps this onto a `source` node and
+   * onto the report, and `gate` reads it so a green pre-merge build **states
+   * what it actually covered** instead of implying it covered everything.
+   */
+  readonly selection: SubsetSelection | null;
+}
+
+/**
+ * What a subset selected, what it deliberately did not, and how it decided.
+ *
+ * Every field here exists so the selection can be reproduced and argued with.
+ * The seeded sample is a function of `(seed, ref)` alone, so the same seed over
+ * the same suite selects the same cases on every host and in every year — and
+ * the sample is recorded by reference anyway, so the selection is checkable even
+ * if the sampling rule is later changed.
+ *
+ * **High-tier and quarantined cases are pinned.** They are selected before the
+ * budget is consulted and are never dropped to fit it: the point of a cheap
+ * pre-merge run is to be cheap about the cases where being wrong is cheap. If
+ * the pinned cases alone exceed `maxCases` the subset runs over budget and says
+ * so in `overBudget`, because dropping the high-tier cases to hit a time target
+ * is exactly the trade nobody would defend out loud.
+ */
+export interface SubsetSelection {
+  /** "pre-merge". Recorded, never interpreted. */
+  readonly label: string;
+  /** The content address of the source this was selected from. */
+  readonly fromDigest: SourceDigest;
+  readonly fromSize: number;
+  /** The selection seed. Not the run seed — a subset is chosen before a run. */
+  readonly seed: Seed;
+  readonly maxCases: number;
+  /** Pinned: every case whose decision is high tier. */
+  readonly pinnedHighTier: readonly CaseRef[];
+  /** Pinned: every case the caller declared quarantined (recently flaky). */
+  readonly pinnedQuarantined: readonly CaseRef[];
+  /** The seeded remainder, sized to what is left of the budget. */
+  readonly sampled: readonly CaseRef[];
+  /**
+   * The cases in the parent source this subset did **not** select.
+   *
+   * Enumerated, not counted. `gate` needs to tell "the author deleted this
+   * golden case" from "the pre-merge subset did not run it", and a count cannot
+   * answer that. Absence of a case is not evidence about the case.
+   */
+  readonly notSelected: readonly CaseRef[];
+  /** True when the pinned cases alone exceeded `maxCases`. Nothing was dropped. */
+  readonly overBudget: boolean;
 }
 
 export interface RecordedProvenance {
@@ -196,6 +264,30 @@ export type EvalNodeKind =
   | "retry"
   | "aggregate"
   | "gate"
+  /**
+   * What this run carried forward from a previous execution of the same run
+   * key rather than executing: how many cases, from which runs, and why.
+   * Present only on a resumed run, so "these 180 results were not observed
+   * today" is a recorded fact rather than something a reader has to infer from
+   * a suspiciously low cost figure.
+   */
+  | "resume"
+  /**
+   * The determinism **check**: a seeded sample of this run's cases re-executed
+   * under the same seed and compared. Interface fact 5 used to be satisfied by
+   * a declaration; this is the node that makes it a measurement.
+   */
+  | "determinism"
+  /**
+   * Under-recording: decisions this run observed with no model call beneath
+   * them, on a subject that did not declare itself pure.
+   *
+   * Written only when there is something to write, and it carries what became
+   * of the alert. The gate blocks on the same fact, but a blocked gate tells a
+   * developer watching a change land; this node and its alert tell an operator
+   * on the night a nightly run finds it.
+   */
+  | "under-recording"
   /** Whatever the subject or a scorer opened for itself via `child`. */
   | "span";
 
@@ -229,6 +321,9 @@ export const NODE_KINDS: readonly EvalNodeKind[] = [
   "retry",
   "aggregate",
   "gate",
+  "resume",
+  "determinism",
+  "under-recording",
   "span",
 ];
 
@@ -588,6 +683,23 @@ export interface Limits {
   readonly retries: number;
   /** 1..10_000_000. Cost ceiling in tenth-cents. */
   readonly costCeilingTenthCents: number;
+  /**
+   * 0..32. How many of this run's cases are **re-executed under the same seed
+   * and compared**, to turn interface fact 5 from a declaration into a check.
+   *
+   * The report used to state that a run was deterministic, or name its
+   * non-determinism, entirely on the strength of what the scorer adapters
+   * declared about themselves. Nothing verified the subject, which is the half
+   * that actually varies: a temperature setting, an unseeded shuffle, a
+   * `Map` iteration over host-ordered keys, a cache warm on the second call.
+   *
+   * It costs, which is why it is a number rather than a boolean and why the
+   * number is small. `DEFAULT_LIMITS` samples 2 of 200 — around 1% of the run's
+   * spend to know whether the other 99% means anything. `0` switches the check
+   * off, and the report then says `not-checked` and why, rather than falling
+   * back to the claim.
+   */
+  readonly determinismSampleCases: number;
 }
 
 /**
@@ -637,7 +749,199 @@ export interface RecorderDeps {
   readonly redact: Redactor;
   /** Required. Wall clocks and backoff are driven from here, never ambiently. */
   readonly timers: Timers;
+  /**
+   * Required, and it arrives **here** rather than on `RunSpec` on purpose.
+   *
+   * The ledger is durable state belonging to the composition root, exactly like
+   * the store: it is wired once, next to the database, by the same code that
+   * wires the witness. Putting it on `RunSpec` would make idempotency something
+   * each of nineteen callers decides per invocation, and the first one to leave
+   * it out pays for a 200-case run twice without noticing.
+   *
+   * `inMemoryRunLedger()` is a legitimate value here and forgets at process
+   * exit, which is the right answer for a test and the wrong one for continuous
+   * integration. There is no `undefined`.
+   */
+  readonly ledger: RunLedger;
+  /**
+   * Where `under-recording-detected` is raised — the sixth of
+   * `docs/CONTEXT.md`'s eight silent conditions, and the one this module is the
+   * only place able to see: *"decisions with no recorded model call. The build
+   * stays green unless something counts what is missing."*
+   *
+   * This module already counts it. `UnattributedDecision` blocks the gate and
+   * turns the build red, which is the right consequence for a change somebody is
+   * watching land. It is the wrong consequence for a **nightly** run, where a
+   * red build is a line in a report nobody opens until Monday, and the subject
+   * has been doing its thinking somewhere unrecorded since Thursday. The gate
+   * tells a developer; this tells an operator.
+   *
+   * Wired **here** rather than on `RunSpec` for the same reason `ledger` is:
+   * alerting is composition-root state, next to the store and the database. A
+   * per-invocation parameter is one nineteen callers each decide, and the first
+   * to leave it out is silent in exactly the way this exists to prevent.
+   *
+   * Optional, because nineteen applications cannot be recompiled at once. Its
+   * absence is not silent: it is written onto the run's own `under-recording`
+   * node as `alerted: "not-configured"`.
+   */
+  readonly alerting?: import("../../alerts/index.js").AlertRaiser | undefined;
 }
+
+/* ------------------------------------------------------------------ ledger */
+
+/**
+ * The run ledger — idempotency and resume, and the reason a 200-case run that
+ * dies at case 180 does not pay for 180 cases again.
+ *
+ * Two things are memoised and they are memoised at different granularities,
+ * because they answer different questions:
+ *
+ *   **A completed run**, keyed by `RunKey`. Re-running a key that already
+ *   finished returns the original report and executes nothing at all. This is
+ *   the C2 idempotency requirement stated for effects — "a repeat returns the
+ *   original outcome rather than re-executing or erroring" — applied to the one
+ *   thing in this module that costs real money.
+ *
+ *   **A completed case**, keyed by `(RunKey, CaseRef)`. An interrupted run
+ *   resumes from these: the cases that finished are carried forward as recorded
+ *   facts and only the remainder executes.
+ *
+ * ## The trap, and where it is closed
+ *
+ * A run that exceeded its budget produces a `partial` report. Memoising that as
+ * a completed run would make a biased sample permanent *and* free — every later
+ * run of the key would return it without executing, and it would look exactly
+ * like a finished run because it is the same type. So the write side is not a
+ * check: `CompletedRunRecord` is branded and `mintCompletedRun` is its only
+ * producer, and that function refuses a partial report. A caller cannot
+ * construct the argument.
+ *
+ * Per-case memos are a different matter and *are* written by a partial run: the
+ * cases that genuinely finished did genuinely finish, and carrying them forward
+ * is the whole point. What is never memoised is a case that ended because the
+ * clock ran out or the run was aborted underneath it — those are facts about the
+ * budget, not about the case.
+ *
+ * ## Fail policy, which is the opposite of `EvalNodeStore`'s
+ *
+ * `EvalStoreUnavailable` is fail-closed at every tier: an unrecorded eval run is
+ * a number nobody can check. `LedgerUnavailable` is **fail-open**: an unmemoised
+ * eval run is a bill, not a false number. The run re-executes and the
+ * degradation is stamped on the report as `memoisation`. A corrupt answer is a
+ * different thing and is fail-closed — see `LedgerCorrupt`.
+ *
+ * ## Branded, for the same reason the store is
+ *
+ * `findCompleted` is a path that returns a report **without executing
+ * anything**. A hand-rolled ledger is therefore the cheapest possible way to
+ * make a build green, cheaper than deleting a golden case and far quieter. Only
+ * `inMemoryRunLedger` and `sqlRunLedger` mint one; an application brings its own
+ * database through `sqlRunLedger`'s injected `SqlExecutor`.
+ */
+export interface RunLedgerMethods {
+  findCompleted(runKey: RunKey): Promise<StoredCompletedRun | undefined>;
+  /** Idempotent under concurrent writers: the first record for a key stands. */
+  recordCompleted(record: CompletedRunRecord): Promise<void>;
+  /** Every case memo for this key, in reference order. */
+  findCases(runKey: RunKey): Promise<readonly StoredCaseMemo[]>;
+  /** Idempotent under concurrent writers: the first memo for a case stands. */
+  recordCase(memo: CaseMemo): Promise<void>;
+  /**
+   * Retention, bounded, and required for the same reason the node store's is:
+   * "delete everything older than 90 days" against a table this size is a
+   * statement that holds a lock for minutes. The caller loops on `runKeys > 0`.
+   */
+  expireBefore(cutoff: number, batchLimit: number): Promise<LedgerExpiryResult>;
+}
+
+export interface LedgerExpiryResult {
+  readonly runKeys: number;
+  readonly cases: number;
+}
+
+declare const RUN_LEDGER: unique symbol;
+
+/** Branded. Minted only by this module's two shipped adapters. */
+export interface RunLedger extends RunLedgerMethods {
+  readonly [RUN_LEDGER]: true;
+}
+
+declare const COMPLETED_RUN: unique symbol;
+
+/**
+ * What `recordCompleted` accepts. **Branded, and minted only by
+ * `mintCompletedRun`**, which refuses a partial run, an unattributed run and a
+ * run that could not evaluate cases.
+ *
+ * The brand is the mechanism, not the refusal. A check can be skipped by a
+ * caller who builds the object themselves; a type that cannot be named cannot be
+ * built.
+ */
+export interface CompletedRunRecord {
+  readonly [COMPLETED_RUN]: true;
+  readonly runKey: RunKey;
+  readonly runId: RunId;
+  readonly completedAt: number;
+  readonly schema: string;
+  readonly sourceKind: SourceKind;
+  /**
+   * The report, as JSON.
+   *
+   * Serialised rather than held as an object because the whole point is to
+   * survive a process line — continuous-integration job A runs, job B a week
+   * later asks the same question. It re-enters through `reopenAccuracyReport` or
+   * `reopenAgreementReport`, which recompute the rates from the cases, so a row
+   * edited in the database is refused rather than returned.
+   */
+  readonly reportJson: string;
+}
+
+/** The read shape. Plain data: an adapter decodes rows into it. */
+export interface StoredCompletedRun {
+  readonly runKey: RunKey;
+  readonly runId: RunId;
+  readonly completedAt: number;
+  readonly schema: string;
+  readonly sourceKind: SourceKind;
+  readonly reportJson: string;
+}
+
+/**
+ * The statuses a case can be memoised under.
+ *
+ * `could-not-evaluate` is deliberately **not** here. A provider that was
+ * throttling is a fact about ten minutes on a Tuesday, not about the case, and
+ * freezing it into the ledger would make a rate-limit storm permanent for that
+ * run key. Neither is a timeout: a case that ran out of clock says nothing
+ * reproducible about itself.
+ */
+export type MemoisedStatus =
+  | "matched"
+  | "mismatched"
+  | "unscored"
+  | "contested"
+  | "unattributed";
+
+export interface CaseMemo {
+  readonly runKey: RunKey;
+  readonly ref: CaseRef;
+  /** Checked on resume. A memo against a different case is fail-closed. */
+  readonly caseDigest: CaseDigest;
+  readonly fromRunId: RunId;
+  readonly fromNode: EvalNodeId;
+  readonly recordedAt: number;
+  readonly status: MemoisedStatus;
+  readonly scoreBasisPoints: number;
+  /** The observed verdict as JSON, or the four-character string `null`. */
+  readonly observedJson: string;
+  readonly detail: string | null;
+  readonly modelCalls: number;
+  readonly costTenthCents: number;
+}
+
+/** The read shape. Structurally identical; a different name so the seam is legible. */
+export type StoredCaseMemo = CaseMemo;
 
 export interface RunDeps {
   readonly models: ModelBackend;

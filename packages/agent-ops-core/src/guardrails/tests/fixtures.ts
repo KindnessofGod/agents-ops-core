@@ -13,15 +13,18 @@ import {
   createGuardrails,
   deterministicDetector,
   localeOf,
+  safePattern,
   type Classifier,
   type ClassifierRequest,
   type Detector,
+  type DetectorReport,
   type DetectorSet,
   type DetectorSets,
   type Guardrails,
   type Limits,
   type Locale,
   type NonEmpty,
+  type ScreeningSubject,
   type Timer,
   type TimerHandle,
 } from "../index.js";
@@ -143,17 +146,31 @@ export const scriptedClassifier = (
   },
 });
 
-/** A detector that always behaves the way the test asks it to. */
+/**
+ * A detector that always behaves the way the test asks it to.
+ *
+ * The body may be written synchronously even though `Detector.screen` must
+ * return a promise, because the interesting cases are precisely the ones a test
+ * wants to write synchronously — a detector that burns the clock and returns, or
+ * one that returns a malformed report. Wrapping here keeps those tests readable
+ * **and** keeps the production interface honest: a real detector cannot decline
+ * to be asynchronous, and this fixture is the only place that difference is
+ * papered over. See `Detector.screen` for why the requirement is a precondition
+ * rather than a bound.
+ */
 export const scriptedDetector = (
   id: string,
-  screen: Detector["screen"],
-  overrides: Partial<Pick<Detector, "costClass" | "locales" | "searches">> = {},
+  screen: (subject: ScreeningSubject) => DetectorReport | Promise<DetectorReport>,
+  overrides: Partial<Pick<Detector, "costClass" | "locales" | "searches" | "declares">> = {},
 ): Detector => ({
   id: id as Detector["id"],
   costClass: overrides.costClass ?? "deterministic",
   locales: overrides.locales ?? ([EN_GB] as unknown as NonEmpty<Locale>),
   searches: overrides.searches ?? `whatever ${id} looks for`,
-  screen,
+  ...(overrides.declares === undefined ? {} : { declares: overrides.declares }),
+  async screen(subject) {
+    return await screen(subject);
+  },
 });
 
 /** Finds nothing, and says what it looked for. The baseline of every test. */
@@ -173,11 +190,12 @@ export const ninDetector = (severity: "redact" | "advisory" = "redact"): Detecto
     category: "personal-data",
     severity,
     patterns: [
-      {
+      safePattern({
         rule: "uk.national-insurance-number",
         match: /\b[A-CEGHJ-PR-TW-Z]{2}\s?\d{2}\s?\d{2}\s?\d{2}\s?[A-D]\b/g,
         confidenceBasisPoints: 9_500,
-      },
+        covers: "personal-data.national-identifier",
+      }),
     ],
   });
 
@@ -209,6 +227,12 @@ export const harness = (options: {
   readonly limits?: Partial<Limits>;
   readonly store?: TraceStore;
   readonly clock?: ManualClock;
+  /**
+   * The fail-closed rate watch. Wired as one object with its raiser or not at
+   * all — see `GuardrailsDeps.rateAlerting`. Nothing here can reach a pager:
+   * `alerts` constructs no transport and reads no environment.
+   */
+  readonly rateAlerting?: import("../index.js").RateAlerting;
 }): Harness => {
   const store = options.store ?? inMemoryTraceStore();
   const clock = options.clock ?? manualClock();
@@ -228,6 +252,7 @@ export const harness = (options: {
     locale: options.locale ?? EN_GB,
     detectorSets: options.detectorSets,
     limits: { ...DEFAULT_LIMITS, ...options.limits },
+    rateAlerting: options.rateAlerting,
   });
   return {
     guardrails,

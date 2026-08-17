@@ -30,6 +30,16 @@
  *                     It is also the only degradable error mode in the module.
  *   Redacted first.   Redaction runs before write. No store adapter ever sees an
  *                     unredacted payload, because there is no un-writing.
+ *   Alerting.         `trace-unavailable-at-high-tier` — the seventh silent
+ *                     condition — is raised through the injected `alerting`
+ *                     when a high-tier write is refused. Fail-closed is correct
+ *                     here and is not in question; it is still an incident,
+ *                     because correct behaviour that stops a £2M disbursement is
+ *                     an outage with a clean conscience, and the only outward
+ *                     sign is an error a retry loop will reasonably catch. The
+ *                     record travels on `TraceUnavailable.alerting`, because the
+ *                     one place this library normally records an alert — a node
+ *                     on the case's trace — is the thing that just failed.
  *   Injected clock.   No `Date.now()` inside this module, ever. That is what
  *                     makes ageing testable without waiting.
  *   Terminal close.   Recording after `close` is an error, not a no-op, and the
@@ -87,12 +97,63 @@
  *      store that forms the node correctly and discards it is indistinguishable
  *      from one that writes it, until you replay. **Replay is the proof of a
  *      write.**
- *   3. **Tamper detection has a ceiling.** An edited row is caught by
- *      `TraceTampered`; a removed row, a row inserted after the seal, a
- *      duplicated sequence and a rewritten scope statement are caught by
- *      `TraceIncoherent`. An adversary who rewrites the whole case and
- *      recomputes the seal is caught by none of them. That needs the digest to
- *      have been witnessed somewhere this module cannot write.
+ *   3. **Tamper detection has a ceiling, and the witness is where it now
+ *      stops.** An edited row is caught by `TraceTampered`; a removed row, a row
+ *      inserted after the seal, a duplicated sequence and a rewritten scope
+ *      statement are caught by `TraceIncoherent`. An adversary who rewrites the
+ *      whole case and recomputes the seal is caught by none of them, because
+ *      every one of those checks is computed from the rows and that adversary
+ *      controls the rows.
+ *
+ *      So the whole-case digest is published at `close` to an injected
+ *      `Witness`, and `verifyAgainstWitness` checks a replayed case against what
+ *      was published rather than only against itself. The ceiling moves; it does
+ *      not disappear. `lib/witness.ts` sets out exactly what that defeats — a
+ *      consistent rewrite, a case restored from an edited backup, retro-dating —
+ *      and exactly what it does not: an adversary holding both sets of
+ *      credentials, a compromise of the host both tables sit on, tampering that
+ *      happened before the seal, and anything at all in the in-memory adapter,
+ *      which shares a process with the thing it witnesses. Crossing a real trust
+ *      boundary needs a witness under separate custody. That is a third adapter
+ *      behind the same interface, it is named there, and it is not shipped —
+ *      because shipping it means choosing a custodian for nineteen applications.
+ *
+ * ## Reading a case that will not fit
+ *
+ * `replay` materialises the whole case, and for the tens of nodes a case
+ * normally holds that is the right answer and stays the default. It is the wrong
+ * answer at the ceiling: `maxNodesPerCase` is 100,000. So `TraceStore` also
+ * carries `readPage` — bounded, ordered, cursored on the store-assigned sequence
+ * — and `Audit.walk` streams a case a page at a time, holding one page and a
+ * fixed-size verifier however long the case is.
+ *
+ * Both read paths make **the same checks, on the same code**: every invariant is
+ * expressed once, incrementally, in `lib/stream.ts`, and `replay` and `walk`
+ * both drive it. This module's own history is the argument — two paths claiming
+ * one guarantee and holding different ones is the defect it has spent its
+ * releases removing.
+ *
+ * A walk that stops early gets no verdict, deliberately. A partial walk cannot
+ * verify a seal it never reached, and a verdict that quietly meant "nothing was
+ * wrong with the part I looked at" is exactly the reassuring silence this module
+ * exists to refuse.
+ *
+ * ## Seven-year expiry, and why it is not a function here
+ *
+ * Nothing in this library deletes a trace, and the trace tables grant no role it
+ * creates the ability to. That is the guarantee, so retention cannot be a
+ * library call: a `expire(correlationId)` verb needs a DELETE grant on the
+ * writer role, and nineteen applications would then hold, all day and every day,
+ * the one permission the whole design exists to withhold.
+ *
+ * The library therefore prepares a removal it cannot perform. `RetentionRegister`
+ * lists sealed cases past retention; `Archivist.clearForRemoval` re-reads the
+ * live case in full, recomputes its digest, and clears it only if the archive
+ * copy **and** the external witness both agree — checked on the day of the
+ * removal, not the day of the export. Every verb on both is a read, and
+ * `lib/invariants.ts` fails the build if one that removes is ever added. The
+ * removal itself is a documented procedure run by a separately-authorised role
+ * against a runbook a person signs. See `lib/retention.ts`.
  *
  * ## What is not here
  *
@@ -124,12 +185,31 @@
  *     `systemClock` is the only one; the test clock lives in `tests/` and is not
  *     a deliverable. This seam is justified by C2's "clock injected, no
  *     `Date.now()` inside a module", not by C5, and it would fail C5 on its own.
- *   - **`SqlExecutor` — not a seam at all.** It is the driver-injection point C3
- *     forces: this package may not import `pg`, so the pool arrives as a
- *     parameter. There is one shape, no behaviour variation is wanted, and no
- *     second adapter is named because none is intended. Shipping one would mean
- *     taking a driver dependency nineteen applications inherit, which CLAUDE.md
- *     requires an ADR for and C3 forbids anyway.
+ *   - **`Witness` — a real seam, and the thinnest honest one here.** Two shipped
+ *     adapters, `inMemoryWitness` and `postgresWitness`, with genuinely
+ *     different bodies and genuinely different worth: the second raises the bar
+ *     to two roles and two grants, the first raises it not at all and says so.
+ *     The adapter that would make this seam earn its keep completely — a
+ *     custodian outside this organisation — is named and not shipped, so the
+ *     count is two real ones and one refusal rather than three.
+ *   - **`RetentionRegister` — a real seam, narrowly.** Two adapters: the
+ *     in-memory trace store implements it directly, and
+ *     `postgresRetentionRegister` reads the seal rows on a SELECT-only
+ *     connection. The in-memory one is a deliverable — it is what lets an
+ *     application test its own expiry procedure without a database — and not a
+ *     mock.
+ *   - **`SqlExecutor` — not a seam at all, and now checkable anyway.** It is the
+ *     driver-injection point C3 forces: this package may not import `pg`, so the
+ *     pool arrives as a parameter. There is one shape, no behaviour variation is
+ *     wanted, and no second adapter is named because none is intended. Shipping
+ *     one would mean taking a driver dependency nineteen applications inherit,
+ *     which CLAUDE.md requires an ADR for and C3 forbids anyway. What it has
+ *     instead of a second adapter is `sqlExecutorContract` — an executable suite
+ *     with no test-framework dependency, runnable in CI against an in-memory
+ *     implementation and against a live pool from an operational script. It is
+ *     the answer to the honest note at the foot of `tests/postgres-store.test.ts`:
+ *     the schema's guarantees still need a real database, but the fifteen lines
+ *     every composition root writes no longer need to be taken on trust.
  *   - **`DIGEST_ALGORITHM` — fixed, not a seam**, and versioned instead.
  *
  * See `docs/CONTEXT.md` for the vocabulary and
@@ -147,6 +227,7 @@ export type {
   CaseTrace,
   CorrelationId,
   Degraded,
+  ExpiredCase,
   FailPolicy,
   NodeId,
   NodePayload,
@@ -159,15 +240,27 @@ export type {
   RedactionId,
   Redactor,
   ReplayedCase,
+  RetentionPage,
+  RetentionQuery,
+  RetentionRegister,
   RiskTier,
   StoredCase,
   StoredNode,
   TraceDigest,
+  TracePage,
+  TracePageRequest,
   TraceProvenance,
   TraceStore,
   TraceUnavailableReason,
+  TraceVerdict,
   UnassistedContainment,
   UnavailabilityPolicy,
+  WalkLimits,
+  Witness,
+  WitnessId,
+  WitnessReceipt,
+  WitnessRecord,
+  WitnessVerdict,
 } from "./lib/types.js";
 
 export { createAudit } from "./lib/audit.js";
@@ -179,11 +272,50 @@ export type {
   InMemoryTraceStore,
 } from "./lib/in-memory-store.js";
 export { postgresTraceStore } from "./lib/postgres-store.js";
+export type { PostgresStoreLimits } from "./lib/postgres-store.js";
+
+/**
+ * The driver-injection point. Still not a seam — see the accounting above — but
+ * now accompanied by a contract suite, so the fifteen lines every composition
+ * root writes are checkable rather than merely described.
+ */
+export type { SqlExecutor, SqlRow } from "./lib/sql.js";
+export {
+  runSqlExecutorContract,
+  sqlExecutorContract,
+  SqlContractViolation,
+} from "./lib/contract.js";
 export type {
-  PostgresStoreLimits,
-  SqlExecutor,
-  SqlRow,
-} from "./lib/postgres-store.js";
+  SqlContractCase,
+  SqlContractOutcome,
+  SqlContractStatements,
+  SqlContractSubject,
+} from "./lib/contract.js";
+
+/**
+ * Witness adapters. Two, which makes `Witness` a real seam; the third — under
+ * separate custody, and the only one that crosses a trust boundary — is named
+ * in `lib/witness.ts` and deliberately not shipped.
+ */
+export { inMemoryWitness, postgresWitness } from "./lib/witness.js";
+export type {
+  InMemoryWitness,
+  InMemoryWitnessLimits,
+  PostgresWitnessDeps,
+} from "./lib/witness.js";
+
+/**
+ * Retention. Everything the seven-year expiry procedure needs, and deliberately
+ * nothing that performs it: every verb here is a read, and `lib/invariants.ts`
+ * fails the build if a removing verb is ever added.
+ */
+export { createArchivist, postgresRetentionRegister, SEVEN_YEARS_MS } from "./lib/retention.js";
+export type {
+  Archivist,
+  ArchivistDeps,
+  ClearanceReason,
+  RemovalClearance,
+} from "./lib/retention.js";
 
 /** Redactor adapters. Two, with different bodies and different positions on keys. */
 export {
@@ -207,8 +339,10 @@ export {
   canonicalNodeForm,
   canonicalPayloadForm,
   decodeNode,
+  digestGenesis,
   digestVersionOf,
   envelopeOf,
+  extendDigest,
   traceDigest,
 } from "./lib/canonical.js";
 
@@ -228,6 +362,7 @@ export {
   AuditError,
   NoSuchCase,
   CaseAlreadyClosed,
+  CaseNotClosed,
   ParentNotOfThisCase,
   PayloadTooLarge,
   ProvenanceConflict,
@@ -240,6 +375,12 @@ export {
   UnknownEnvelope,
   UnserialisablePayload,
   RedactionUnsound,
+  WitnessConflict,
+  WitnessContractViolated,
+  WitnessUnavailable,
 } from "./lib/errors.js";
 
-export type { TraceIncoherenceReason } from "./lib/errors.js";
+export type {
+  TraceIncoherenceReason,
+  WitnessUnavailableReason,
+} from "./lib/errors.js";

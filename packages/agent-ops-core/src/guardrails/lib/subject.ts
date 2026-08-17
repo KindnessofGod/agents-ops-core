@@ -103,7 +103,18 @@ export const frozenSources = (sources: Sources): Sources =>
 export const maskFindings = (
   original: { readonly [f: string]: string },
   findings: readonly Finding[],
-): { readonly fields: { readonly [f: string]: string }; readonly maskedSites: number } => {
+): {
+  readonly fields: { readonly [f: string]: string };
+  readonly maskedSites: number;
+  /**
+   * Code units of the original text that `MASK` replaced. Reported beside the
+   * site count because they answer different questions: three sites is three
+   * things found, and 41 code units is how much of the payload stopped being
+   * readable. `Screening.coverage` needs the second to say how much text went
+   * into the trace unmasked.
+   */
+  readonly maskedCodeUnits: number;
+} => {
   const byField = new Map<string, FindingSite[]>();
   for (const finding of findings) {
     if (finding.category !== "personal-data" && finding.severity !== "redact") continue;
@@ -114,6 +125,7 @@ export const maskFindings = (
 
   const fields: Record<string, string> = Object.create(null) as Record<string, string>;
   let maskedSites = 0;
+  let maskedCodeUnits = 0;
   for (const field of Object.keys(original)) {
     const text = original[field] as string;
     const sites = byField.get(field);
@@ -126,11 +138,12 @@ export const maskFindings = (
     let out = text;
     for (let i = merged.length - 1; i >= 0; i -= 1) {
       const site = merged[i] as { start: number; end: number };
+      maskedCodeUnits += site.end - site.start;
       out = out.slice(0, site.start) + MASK + out.slice(site.end);
     }
     fields[field] = out;
   }
-  return { fields: Object.freeze(fields), maskedSites };
+  return { fields: Object.freeze(fields), maskedSites, maskedCodeUnits };
 };
 
 const mergeSites = (

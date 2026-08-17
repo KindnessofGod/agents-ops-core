@@ -1,5 +1,5 @@
 import { digestOf } from "./canonical.js";
-import { EvalsError, PanelMisdeclared } from "./errors.js";
+import { EvalsError, PanelMisdeclared, ProviderUnavailable } from "./errors.js";
 import type { ModelBackend, ModelId, ModelRequest, ModelResponse, PromptVersion } from "./clients.js";
 import type { ScoreOutcome, Scorer, ScorerDigest, ScorerId, ScoringContext } from "./types.js";
 
@@ -124,10 +124,16 @@ export const judgePanel = (input: JudgePanelInput): Scorer => {
           // — an unrecorded eval run presented as a measured one, which is the
           // exact failure this module exists to prevent.
           if (cause instanceof EvalsError && cause.incident) throw cause;
-          // A judge that could not be reached, after the runner's bounded
-          // retries, makes the case `unscored`. `unscored` is never `passed`:
-          // it counts against the gate, because a case nobody could measure is
-          // not a case that went well.
+          // **A provider that would not serve the judge is not a judge that
+          // disagreed.** It propagates, so the runner can make the case
+          // `could-not-evaluate` rather than `unscored` — otherwise a throttled
+          // judge panel arrives at the gate as `unscored-rate`, which is a
+          // statement about the subject, and the subject did nothing.
+          if (cause instanceof ProviderUnavailable) throw cause;
+          // A judge that could not be reached for any *other* reason, after the
+          // runner's bounded retries, makes the case `unscored`. `unscored` is
+          // never `passed`: it counts against the gate, because a case nobody
+          // could measure is not a case that went well.
           return { kind: "unscored", reason: "judge-unavailable" };
         }
         if (sample === undefined) return { kind: "unscored", reason: "judge-unparseable" };

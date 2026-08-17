@@ -120,6 +120,20 @@ const recordingExecutor = (): Recorder => {
       case "read-nodes":
         return { rows: [...forCase] };
 
+      case "read-page": {
+        // `sequence > $2 ORDER BY sequence LIMIT $3`, faithfully enough to hold
+        // the adapter to invariant 7. The adapter asks for `limit + 1` rows and
+        // derives `more` from the extra one.
+        const after = Number(params[1]);
+        const limit = Number(params[2]);
+        return {
+          rows: forCase
+            .filter((row) => Number(row["sequence"]) > after)
+            .sort((a, b) => Number(a["sequence"]) - Number(b["sequence"]))
+            .slice(0, limit),
+        };
+      }
+
       default:
         throw new Error(`unexpected statement: ${text}`);
     }
@@ -286,6 +300,40 @@ describe("audit — Postgres adapter, bounded reads and evolving bytes", () => {
       trace.record({ kind: "c", v: 1 }, { tier: "low" }),
     ).rejects.toThrow(TraceUnavailable);
     expect((await audit.replay(CASE_A)).nodes).toHaveLength(2);
+  });
+
+  it("streams a case through pages and agrees with its own whole-case replay", async () => {
+    // Invariant 7 held by the second adapter, not only by the first. Both
+    // adapters owe the same page contract, and a streaming reader that agreed
+    // with one and not the other would make a case's evidence depend on which
+    // store it was read from.
+    const { audit, statements } = pgHarness();
+    const trace = await audit.open(CASE_A);
+    for (let i = 0; i < 9; i += 1) {
+      await trace.record({ kind: "decision.decided", v: 1, step: i }, { tier: "low" });
+    }
+    await trace.close({ unassistedContainment: true });
+
+    const seen: number[] = [];
+    const walk = audit.walk(CASE_A, { pageSize: 4 });
+    let verdict;
+    for (;;) {
+      const step = await walk.next();
+      if (step.done) {
+        verdict = step.value;
+        break;
+      }
+      seen.push(step.value.sequence);
+    }
+
+    expect(seen).toEqual([0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    expect(verdict.closed).toBe(true);
+    expect(String(verdict.digest)).toBe(String((await audit.replay(CASE_A)).digest()));
+
+    const pages = statements.filter((s) => tagOf(s) === "read-page");
+    expect(pages.length).toBeGreaterThan(1);
+    // Bounded at the statement, not merely in the caller.
+    for (const page of pages) expect(page).toContain("LIMIT $3");
   });
 
   it("round-trips telemetry through rows without a column for it", async () => {

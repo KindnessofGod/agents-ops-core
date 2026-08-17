@@ -12,20 +12,24 @@
  * outside the module. That absence is the auditability mechanism, not an
  * omission.
  *
- * Four verbs, and the fourth is the honest one:
+ * Five verbs, and the last two are the honest ones:
  *
- *   run      Declare-and-go. Returns `Settled` or `Suspended`. Never blocks on
- *            a human; there is no promise here that resolves when a person
- *            answers, because `await approve()` is the wrong shape for a wait
- *            measured in days.
- *   answer   Called by the application's approval surface, in another process,
- *            on another release, possibly a week later.
- *   sweep    Drives time. Ladder steps, recurrence reminders and expiry do not
- *            happen because a timer fired inside this module — nothing here
- *            owns a timer. Bounded, leased, idempotent, re-entrant, and it
- *            records its own nodes.
- *   inDoubt  The reconciliation queue: effects whose outcome is unrecorded.
- *            They are never auto-retried. A human resolves them.
+ *   run       Declare-and-go. Returns `Settled` or `Suspended`. Never blocks on
+ *             a human; there is no promise here that resolves when a person
+ *             answers, because `await approve()` is the wrong shape for a wait
+ *             measured in days.
+ *   answer    Called by the application's approval surface, in another process,
+ *             on another release, possibly a week later.
+ *   sweep     Drives time. Ladder steps, recurrence reminders, expiry and the
+ *             release of a kill-switch hold do not happen because a timer fired
+ *             inside this module — nothing here owns a timer. Bounded, leased,
+ *             idempotent, re-entrant, and it records its own nodes.
+ *   inDoubt   The reconciliation queue for **effects**: those whose outcome is
+ *             unrecorded. They are never auto-retried. A human resolves them.
+ *   reconcile The reconciliation queue for the **link**: suspensions whose trace
+ *             node is missing, and trace nodes whose suspension is missing. Two
+ *             stores that cannot share a transaction can still be compared, and
+ *             this is the comparison. See `Durability` below.
  *
  * Invariants a caller must know:
  *
@@ -50,12 +54,38 @@
  *                  authority closes it.
  *   Durability.    A suspension is plain data. Nothing needed to resume lives in
  *                  a closure, so a runtime may be rebuilt between the question
- *                  and the answer. **Scope, stated rather than implied:** the
- *                  only shipped `ApprovalStore` is in-memory, so every
- *                  durability test here demonstrates survival across a runtime
- *                  restart over the same store — a real property of the shape —
- *                  and not survival across process death. `postgresApprovalStore`
- *                  is named and not built. See `ApprovalStore`.
+ *                  and the answer. **Two store adapters ship**, and the scope of
+ *                  each is stated rather than implied: `inMemoryApprovalStore`
+ *                  demonstrates survival across a runtime restart over the same
+ *                  object, and `postgresApprovalStore` demonstrates survival
+ *                  across **process death** — `tests/postgres-store.test.ts`
+ *                  serialises the whole database to bytes, throws away every
+ *                  object including the store and the executor, rebuilds from
+ *                  those bytes alone and answers the case.
+ *   Linkage.       A suspension and its trace node **do not share a
+ *                  transaction**, and cannot: `audit`'s interface exposes none,
+ *                  and a transaction spanning `decide` would hold a pooled
+ *                  connection open across a model call. So the link is written
+ *                  on **both** sides — the record carries `suspendNode`, the
+ *                  node carries the suspension id — and a crash between the two
+ *                  writes loses a row rather than the link. `reconcile` is the
+ *                  bounded query that finds the disagreement and says how to
+ *                  close it. This is a real weakening, reported rather than
+ *                  dressed up: the window is detectable and recoverable, not
+ *                  absent.
+ *   Holds.         A kill-switch hold is **not terminal**. The switch is engaged
+ *                  during an incident and disengaged after it, so a held case
+ *                  keeps a due time, the sweep keeps visiting it, and when the
+ *                  switch is found off the case returns to the first seat with
+ *                  the ladder restarted and the sealed answers cleared. The
+ *                  effect is never taken on release: an approval given before an
+ *                  incident was given against pre-incident evidence.
+ *   Licence.       `licenceValidFor` is enforced **twice** — once in `answer`
+ *                  before the settlement commits, and once at the instant of
+ *                  execution, against the clock, before a claim is taken. It was
+ *                  previously computed, recorded and never compared on the
+ *                  second side, and a field that is recorded and never read is
+ *                  worse than no field, because it reads as a control.
  *   Authorisation. An answer is authorised against the durable set of
  *                  authorities the directory actually offered that seat's brief
  *                  to, never against the identity the calling surface asserts.
@@ -79,6 +109,21 @@
  *                  Money in minor units, latency in microseconds, confidence in
  *                  basis points.
  *   Clock.         Injected. No `Date.now()` in this module, ever.
+ *   Alerting.      Five of `docs/CONTEXT.md`'s eight **silent** conditions are
+ *                  visible only from inside this module — a reserved decision
+ *                  completed unassisted, an effect in `unknown`, reminders that
+ *                  stopped, a buried case, and `AuthorityUnavailable`. Every one
+ *                  of them returns success or returns nothing at all, so none is
+ *                  reachable by catching an exception. They are raised through
+ *                  the injected `alerting` and what became of each raise is on
+ *                  the node: `alerted: "delivered"` and
+ *                  `alerted: "not-configured"` are different rows in the archive
+ *                  seven years from now. A test cannot page anybody, because
+ *                  nothing here constructs a transport.
+ *   Heartbeat.     `sweep` beats on **every** run, including empty ones — and
+ *                  **the watcher is external.** See `DEFAULT_SWEEPER_COMPONENT`
+ *                  below. This is the one alert the library cannot deliver
+ *                  itself, and the deployment step most likely to be skipped.
  *
  * Two notes on what is deliberately *not* here.
  *
@@ -100,10 +145,14 @@
  * are **not** counted: they are not exported, and by the same standard that
  * makes `inMemoryApprovalStore` a deliverable they are mocks.
  *
- *   `ApprovalStore`       ONE adapter — in-memory. **Hypothetical by this
- *                         project's own rule.** `postgresApprovalStore` is
- *                         named and not built; it needs a migration that does
- *                         not exist. Reported, not dressed up.
+ *   `ApprovalStore`       Two, both shipped and both exported:
+ *                         `inMemoryApprovalStore` and `postgresApprovalStore`.
+ *                         The seam was hypothetical by this project's own rule
+ *                         while the second was named and unbuilt; it is built,
+ *                         and it ships the schema it needs as
+ *                         `APPROVAL_STORE_SCHEMA_SQL` rather than describing it
+ *                         in prose, so the adapter and its migration cannot
+ *                         drift apart silently.
  *   `ClientFactory`       Two. `inMemoryClientFactory` ships here; the second
  *                         is each application's own factory over its evidence
  *                         store and effect channel.
@@ -128,7 +177,7 @@
  *
  * See `docs/CONTEXT.md` for the vocabulary, `docs/design/design-it-twice/
  * FINDINGS.md` for the hybrid this implements, and
- * `docs/design/OPEN-ITEMS-RESOLVED.md` for the six settled decisions.
+ * `docs/design/OPEN-ITEMS-RESOLVED.md` for the seven settled decisions.
  */
 
 export type {
@@ -197,9 +246,12 @@ export type {
   KillSwitchState,
   Licence,
   Limits,
+  LinkDivergence,
+  LinkDivergenceKind,
   NonEmpty,
   NotReserved,
   PolicyFacts,
+  ReconciliationReport,
   RedactedPayload,
   Recurrence,
   Reminder,
@@ -226,12 +278,60 @@ export type {
 
 export { defineDecisionPoint } from "./lib/define.js";
 export { createApproval } from "./lib/approval.js";
-export { inMemoryApprovalStore } from "./lib/in-memory-store.js";
 export { DEFAULT_LIMITS } from "./lib/limits.js";
+
+/**
+ * ⚠ **THE SWEEPER'S DEAD-MAN'S SWITCH, AND THE WATCHER FOR IT IS NOT IN THIS
+ * LIBRARY.**
+ *
+ * `sweep` emits a heartbeat on **every** run, including runs that found nothing
+ * to do, under `DEFAULT_SWEEPER_COMPONENT` unless `ApprovalDeps.sweeperComponent`
+ * names another. *"Nothing was due"* and *"I did not run"* do not share a
+ * representation: the first is a recorded beat, the second is the **absence** of
+ * one — and an absence is not observable from inside the process that failed to
+ * produce it.
+ *
+ * So this module ships the emit side and nothing else. **Something outside this
+ * process must poll `alerts.livenessQuery` and raise `heartbeat-missed` when the
+ * sweeper stops.** A watchdog that depends on the thing it watches fails
+ * silently at the exact moment it is needed; if the host dies, an in-process
+ * check dies with it, nothing throws, no dashboard turns red, and every waiting
+ * case rots until somebody telephones.
+ *
+ * A missed heartbeat is the highest-severity condition in the system and
+ * `alerts` proves that ordering in its type rather than asserting it: one
+ * stalled case is one customer, a stopped sweeper is every waiting case at once.
+ *
+ * `EXTERNAL_WATCHDOG_REQUIREMENT` is re-exported here rather than restated,
+ * because a sentence this important that exists in two places will eventually
+ * exist in two versions. `docs/RUNBOOK.md` must carry it verbatim.
+ */
+export { DEFAULT_SWEEPER_COMPONENT } from "./lib/approval.js";
+export { EXTERNAL_WATCHDOG_REQUIREMENT } from "../alerts/index.js";
+
+/**
+ * Store adapters. **Two**, which is what makes `ApprovalStore` a real seam.
+ *
+ * `inMemoryApprovalStore` is a shipped deliverable, not a mock — it is what
+ * makes hermetic tests structural rather than conventional. `postgresApprovalStore`
+ * is the one that carries a suspension across process death, and it takes an
+ * injected `SqlExecutor`: no driver is imported here, no connection string is
+ * read, and no socket is opened, so no code path in this package can reach a
+ * database whatever credentials are in the environment.
+ */
+export { inMemoryApprovalStore } from "./lib/in-memory-store.js";
+export { APPROVAL_STORE_SCHEMA_SQL, postgresApprovalStore } from "./lib/postgres-store.js";
+export type {
+  PostgresApprovalStoreLimits,
+  SqlExecutor,
+  SqlRow,
+} from "./lib/postgres-store.js";
 
 export {
   AdapterFailed,
   ApprovalError,
+  ApprovalOverloaded,
+  ApprovalStoreUnavailable,
   AuthorityNotOffered,
   AuthorityUnavailable,
   DualControlSelfApproval,

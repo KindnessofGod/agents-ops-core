@@ -564,6 +564,18 @@ export type KillSwitchReader = () => Promise<KillSwitchState>;
  * payment happens with the race already resolved. It is not terminal — a case
  * can sit in it if the process dies mid-call, and it is then an entry in the
  * reconciliation queue rather than a case anybody is still chasing.
+ *
+ * `held` is **not terminal either**, and that is the correction this release
+ * makes. The kill switch stops effects without stopping decisions, and it is
+ * engaged during an incident and disengaged after it. A hold that settled the
+ * case for good would mean every case answered during an incident silently
+ * needing a human to notice it and do something — the dangerous quadrant
+ * reached by a path nobody designed. So a held suspension keeps a `nextDueAt`,
+ * the sweep keeps visiting it, and when the switch is found disengaged the case
+ * returns to `awaiting` at the first seat with the ladder restarted and the
+ * sealed answers cleared. The effect is never taken automatically on release:
+ * an approval given before an incident was given against pre-incident evidence,
+ * and a fresh approval is the only thing that licenses money to move.
  */
 export type SuspensionState =
   | "awaiting"
@@ -718,23 +730,51 @@ export interface IdempotencyClaim {
 /**
  * The durable seam.
  *
- * **One adapter ships: the in-memory one.** By this project's own rule that
- * makes this seam hypothetical, and it is reported as such rather than dressed
- * up. The named second adapter is `postgresApprovalStore`, alongside `audit`'s
- * `postgresTraceStore` and sharing one `SqlExecutor` so that a suspension and
- * its trace node commit together; it is **not built**, and it needs a migration
- * that does not exist yet.
+ * **Two adapters ship**: `inMemoryApprovalStore` and `postgresApprovalStore`.
+ * The second is the one that carries a suspension across process death, and it
+ * takes an injected `SqlExecutor` — the same shape `audit`'s `postgresTraceStore`
+ * takes, so one pool wired once at the composition root serves both. Neither
+ * adapter imports a driver, reads a connection string or opens a socket, which
+ * is what keeps hermeticity structural rather than conventional.
  *
- * The consequence for the module's headline durability invariant is stated in
- * `index.ts` rather than left for a reader to discover: every durability test
- * in this module demonstrates survival across a *runtime* restart over the same
- * store object, which is a real property of the design — nothing needed to
- * resume lives in a closure — and is **not** a demonstration of survival across
- * process death, because an in-process `Map` does not survive it.
+ * What the two adapters must agree on, stated here because it is the
+ * interesting part of the seam rather than the storage:
+ *
+ *   - `saveSuspension` is **insert-if-absent**. A second save for an id that
+ *     already exists is a no-op, never an overwrite: overwriting would reset
+ *     `revision` and turn a lost compare-and-set into a silent clobber.
+ *   - `swapSuspension` is a compare-and-set on `revision`, and it must be one
+ *     atomic operation. A read followed by a write is not this interface.
+ *   - `acquireLease` is a compare-and-set on the lease and **does not touch
+ *     `revision`**, so a sweeper holding a lease can still be raced out of its
+ *     write by an `answer` that arrived in the same second.
+ *   - `dueSuspensions` returns `awaiting` records that are due or expired **and
+ *     `held` records that are due**, because a kill-switch hold is resumable —
+ *     see `SuspensionState`.
+ *   - The three idempotency states never collapse into two, and `unknown` is
+ *     never reclaimed for execution at any age.
  */
 export interface ApprovalStore {
+  /**
+   * Insert-if-absent. Returns normally whether or not the row was written; the
+   * caller has already read `loadSuspension` and a concurrent `run` for the
+   * same case, point and payload is a duplicate, not a conflict.
+   */
   readonly saveSuspension: (record: SuspensionRecord) => Promise<void>;
   readonly loadSuspension: (id: SuspensionId) => Promise<SuspensionRecord | undefined>;
+  /**
+   * Every suspension recorded against one case. Bounded.
+   *
+   * Exists for `reconcile`, which compares the durable suspensions of a case
+   * against the suspension nodes in its trace. Without a read keyed by case,
+   * "a suspension whose trace node is missing" is undetectable — the only way
+   * in is the suspension id, and the missing side is the side that would have
+   * carried it.
+   */
+  readonly suspensionsOf: (
+    correlationId: CorrelationId,
+    limit: number,
+  ) => Promise<readonly SuspensionRecord[]>;
   /**
    * Conditional update. Returns `false` when `expectedRevision` no longer
    * holds, which is how two writers to one case are made correct without a lock
@@ -745,7 +785,15 @@ export interface ApprovalStore {
     expectedRevision: number,
     next: SuspensionRecord,
   ) => Promise<boolean>;
-  /** Bounded. Never "everything due". */
+  /**
+   * Bounded. Never "everything due".
+   *
+   * Returns `awaiting` records whose `nextDueAt` has passed or whose expiry has
+   * passed, **and `held` records whose `nextDueAt` has passed**. A kill-switch
+   * hold is not a terminal state: the switch is engaged during an incident and
+   * disengaged after it, and a case that stopped being visited when the switch
+   * went on would be a case nobody ever comes back to.
+   */
   readonly dueSuspensions: (now: Instant, limit: number) => Promise<readonly SuspensionRecord[]>;
   /** Compare-and-set on the lease. Two sweepers must be safe; they will be. */
   readonly acquireLease: (
@@ -814,6 +862,24 @@ export interface Limits {
   /** Bounded read of the reconciliation queue. */
   readonly inDoubtBatch: number;
   /**
+   * Maximum cases one `reconcile` may compare, and the ceiling on suspensions
+   * read per case. Reconciliation reads a whole trace per case, so an unbounded
+   * pass over a backlog is a memory incident dressed as a health check.
+   */
+  readonly reconcileBatch: number;
+  /**
+   * Ceiling on entry-point invocations in flight against this instance.
+   *
+   * Every `run`, `answer`, `sweep` and `reconcile` holds trace writes, store
+   * round trips and adapter calls open for its duration. Without a ceiling the
+   * queue is the connection pool's, most drivers' pool queues are unbounded,
+   * and nothing sheds: the backlog surfaces as latency until the process dies
+   * with the work still in it. Over the ceiling, invocations are refused with
+   * `ApprovalOverloaded` before anything is started, so a shed call has taken no
+   * decision, written no node and moved no money.
+   */
+  readonly maxInFlight: number;
+  /**
    * How many cases' parent indexes are held in memory at once.
    *
    * A case resumed in another process holds identifiers, not nodes, so the
@@ -861,6 +927,61 @@ export interface ApprovalDeps {
   readonly limits: Limits;
   /** Identifies this process in a lease. Two sweepers must be distinguishable. */
   readonly sweeperId: string;
+  /**
+   * Where the five silent conditions this module can see are raised.
+   *
+   * `docs/CONTEXT.md` tabulates eight failures that produce no error, and this
+   * module is the only place five of them are visible: a reserved decision that
+   * completed unassisted, an effect whose outcome is unrecorded, reminders that
+   * stopped firing, a buried case, and `AuthorityUnavailable`. Every one of them
+   * **returns success or returns nothing at all**, so none is reachable by
+   * catching an exception and none of them was reaching an operator before this
+   * parameter existed.
+   *
+   * **Injected, so a test cannot page anybody.** There is no code path from this
+   * package to a network; a chain of sinks arrives as a parameter or the
+   * conditions are recorded and not raised.
+   *
+   * **Optional, and the absence is written down.** Nineteen applications cannot
+   * be recompiled at once, and a required parameter would have been satisfied
+   * everywhere with a sink that swallows — which is worse than absence, because
+   * it looks wired. Where this is absent the detection still happens, still
+   * writes its node, and the node says `alerted: "not-configured"`. See
+   * `alerts.assertProductionAlerting`, which is what a composition root calls to
+   * refuse a chain that pages nobody.
+   */
+  readonly alerting?: import("../../alerts/index.js").AlertRaiser | undefined;
+  /**
+   * ⚠ **The sweeper's dead-man's switch, and the watcher for it is external.**
+   *
+   * The sweeper is the single point of failure for the whole recurrence
+   * guarantee: it is what fires reminders. If it stops, nobody is chased,
+   * nothing throws, no dashboard turns red, and every waiting case rots in
+   * silence — the system doing precisely what reserved decisions exist to
+   * prevent while reporting no problem whatsoever.
+   *
+   * So `sweep` beats **on every run, including runs with nothing to do**, and
+   * `HeartbeatRun` has no way to spell "I did not run" — that is the *absence*
+   * of a beat, which only something outside this process can see.
+   *
+   * **This library cannot deliver that one alert.** A watchdog that depends on
+   * the thing it watches fails silently at the exact moment it is needed. Wire
+   * `alerts.livenessQuery` into a watcher that runs in a different process, and
+   * see `alerts.EXTERNAL_WATCHDOG_REQUIREMENT`, which `docs/RUNBOOK.md` must
+   * carry verbatim. It is the single instruction most likely to be skipped at
+   * deployment and the most expensive to have skipped.
+   */
+  readonly heartbeat?: import("../../alerts/index.js").Heartbeat | undefined;
+  /**
+   * Which component the beat is filed under. Defaults to
+   * `DEFAULT_SWEEPER_COMPONENT`.
+   *
+   * Name it per deployment where more than one sweeper runs against one store:
+   * two processes beating under one name are indistinguishable from one process
+   * beating twice as often, and the survivor of a partial outage would keep the
+   * name alive while half the fleet is dead.
+   */
+  readonly sweeperComponent?: import("../../alerts/index.js").ComponentId | undefined;
 }
 
 /* --------------------------------------------------------------------- results */
@@ -964,6 +1085,12 @@ export interface SweepReport {
   readonly expired: number;
   /** Briefs delivered by this sweep that had never been delivered before. */
   readonly presented: number;
+  /**
+   * Kill-switch holds that were **persisted back to `awaiting`** because the
+   * switch was found disengaged. Counted only when the compare-and-set held, so
+   * this figure never reports a release that did not durably happen.
+   */
+  readonly holdsReleased: number;
   /** Suspensions another sweeper held a live lease on. Not an error. */
   readonly skippedLeased: number;
   /**
@@ -982,6 +1109,97 @@ export interface SweepReport {
    * stated here rather than papered over.
    */
   readonly nodes: readonly NodeId[];
+  /**
+   * What became of this run's heartbeat — the sweeper's proof that it is still
+   * alive, emitted on **every** run including this one if it found nothing.
+   *
+   * It is on the report rather than swallowed because a beat that failed is not
+   * a small thing: a component that is running but cannot record that it is
+   * running will be declared dead by an external watcher, and the operator woken
+   * at 3am will find a healthy sweeper and learn to distrust the alert. Naming
+   * it here is what lets a caller tell the two apart.
+   *
+   *   `did-work`         Beat recorded; this sweep touched at least one case.
+   *   `nothing-was-due`  Beat recorded; there was nothing to do. **Not the same
+   *                      fact as not running**, and that is the whole reason the
+   *                      heartbeat exists.
+   *   `not-configured`   No `heartbeat` was wired. Nothing is watching this
+   *                      sweeper, and the deployment is one process death away
+   *                      from every waiting case rotting in silence.
+   *   `failed`           The store refused the beat. The sweep still completed;
+   *                      the liveness record did not move.
+   */
+  readonly heartbeat: "did-work" | "nothing-was-due" | "not-configured" | "failed";
+}
+
+/* -------------------------------------------------------- reconciling the link */
+
+/**
+ * The two ways a suspension and its trace node can disagree.
+ *
+ * **They can disagree because they do not share a transaction, and they cannot
+ * be made to.** A suspension is written through `ApprovalStore`; its nodes are
+ * written through `audit`, whose interface exposes no transaction and never
+ * will — and even if it did, the transaction would have to span `decide`, which
+ * means holding a pooled database connection open across a model call. So the
+ * link is written **twice, on both sides**: the durable record carries
+ * `suspendNode` and `runNode`, and the `approval.suspend.begin` node carries the
+ * suspension identifier. Neither write can invent the other, and a crash
+ * between them therefore loses a *row*, never the link itself — which is what
+ * makes the disagreement findable instead of silent.
+ */
+export type LinkDivergenceKind =
+  /**
+   * The trace records an intent to suspend and no durable suspension exists.
+   * The dangerous one: `run` returned a `SuspensionId` nobody can answer,
+   * `sweep` will never see it, and nothing errored.
+   */
+  | "trace-without-suspension"
+  /**
+   * A durable suspension names a node the trace does not contain. The case is
+   * still answerable — but every later node loses its parent, so the ageing of
+   * a case that waited eleven days stops being provable from its own trace.
+   */
+  | "suspension-without-trace";
+
+export interface LinkDivergence {
+  readonly kind: LinkDivergenceKind;
+  readonly correlationId: CorrelationId;
+  readonly suspension: SuspensionId;
+  /** The node named by whichever side has one, or `null` when neither does. */
+  readonly node: NodeId | null;
+  readonly pointId: string;
+  /**
+   * What closes it.
+   *
+   * `re-run` — the application calls `run` again for this case and point.
+   * `run` is idempotent per (case, point, effect payload), so a re-run either
+   * rejoins the existing suspension or recreates the one that was lost, and it
+   * cannot ask a second person the same question.
+   *
+   * `repaired` — this pass fixed it. Only ever the `suspension-without-trace`
+   * direction: the divergence node this pass wrote becomes the record's parent,
+   * so the case's later nodes are parented again. Nothing in the trace is
+   * rewritten; a node is added, which is the only edit an append-only archive
+   * permits.
+   */
+  readonly recovery: "re-run" | "repaired";
+}
+
+export interface ReconciliationReport {
+  /** Cases compared. Bounded by `limits.reconcileBatch`. */
+  readonly examined: number;
+  /** Suspensions compared across both sides. */
+  readonly compared: number;
+  readonly divergences: readonly LinkDivergence[];
+  /**
+   * Cases whose trace could not be read at all, so no comparison was possible.
+   *
+   * Reported rather than counted as clean: "we looked and everything agreed"
+   * and "we could not look" are different facts, and a reconciliation that
+   * collapses them is a green dashboard for an unread archive.
+   */
+  readonly unreadable: readonly CorrelationId[];
 }
 
 export interface Approval {
@@ -997,4 +1215,16 @@ export interface Approval {
   ): Promise<Settled<unknown> | Suspended>;
   sweep(request: { readonly limit: number }): Promise<SweepReport>;
   inDoubt(): Promise<readonly IdempotencyClaim[]>;
+  /**
+   * The reconciliation queue for the **link**, as `inDoubt` is the
+   * reconciliation queue for **effects**.
+   *
+   * Takes the cases to compare rather than discovering them: neither seam can
+   * enumerate cases — `audit` has no "list every trace" and it should not, and
+   * a store scan would be an unbounded read of a seven-year archive. The
+   * application holds its own open cases and passes them in, bounded.
+   */
+  reconcile(request: {
+    readonly cases: readonly CorrelationId[];
+  }): Promise<ReconciliationReport>;
 }

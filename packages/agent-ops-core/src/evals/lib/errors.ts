@@ -361,3 +361,175 @@ export class NoSuchRun extends EvalsError {
     super(`no such eval run: ${runId}`);
   }
 }
+
+/**
+ * The provider could not be reached, or refused the call for capacity reasons —
+ * a 429, a 503, a quota exhaustion, a connection reset.
+ *
+ * **Fail-open per case, and this is the only fail-open policy in the module.**
+ * The case becomes `could-not-evaluate`: a status of its own, counted in its own
+ * rate, and never folded into `unscored`. A gate blocked on it exits `2`, not
+ * `1`.
+ *
+ * The reason is that a rate-limit storm is not a quality signal and must not be
+ * readable as one. Before this existed, a provider throttling an eval run
+ * produced unscored cases, `unscored-rate` blocked the gate, and the build
+ * reported the same failure it reports when a change makes the system worse.
+ * Two very different causes, one indistinguishable red build — so the first one
+ * teaches people to ignore the second. **A 429 storm is not a regression.**
+ *
+ * It is still bounded: could-not-evaluate cases count against
+ * `Limits.maxCaseFailures`, so a storm stops the run rather than hammering the
+ * provider for the remaining 199 cases. The run then ends `partial`, which also
+ * cannot pass a gate.
+ *
+ * This is the one error a `ModelBackend` adapter is expected to **throw**. The
+ * nineteen applications' provider clients raise it when they see a 429 or a 503;
+ * anything else they throw is an ordinary model failure and makes the case a
+ * genuine `unscored`.
+ */
+export class ProviderUnavailable extends EvalsError {
+  override readonly name = "ProviderUnavailable";
+  override readonly incident = false;
+  constructor(
+    readonly model: string,
+    readonly detail: string,
+    /** Honoured as a backoff floor, capped. `null` when the provider said nothing. */
+    readonly retryAfterMillis: number | null = null,
+  ) {
+    super(`provider unavailable for ${model}: ${detail}`);
+  }
+}
+
+/**
+ * A run ledger arrived that this module did not mint.
+ *
+ * Fail-closed, **incident**, and the sibling of `StoreNotMinted` for the same
+ * reason: a forged ledger makes `run` return a report that no run produced.
+ * `findCompleted` returning a hand-built record is a way to make a build green
+ * without executing anything at all — strictly cheaper than deleting a golden
+ * case, and invisible.
+ */
+export class LedgerNotMinted extends EvalsError {
+  override readonly name = "LedgerNotMinted";
+  override readonly incident = true;
+  constructor() {
+    super(
+      "this run ledger was not minted by inMemoryRunLedger or sqlRunLedger; a forged ledger returns a report no run produced",
+    );
+  }
+}
+
+/**
+ * The ledger could not be read or written.
+ *
+ * **Fail-open, and this is deliberately the opposite of `EvalStoreUnavailable`,
+ * which sits four classes above and is fail-closed at every tier.** The
+ * difference is what each one costs when it is wrong.
+ *
+ * A node store that cannot accept a write produces an eval run nobody can check:
+ * the number exists and the evidence does not. A ledger that cannot be read
+ * produces a run that executes when it did not have to. The first is a false
+ * number; the second is a bill. So the run continues, re-executing everything,
+ * and the degradation is **stamped on the report** as
+ * `memoisation: { kind: "ledger-unavailable" }` rather than swallowed — a
+ * fail-open policy that is invisible is indistinguishable from a bug.
+ *
+ * The one ledger condition that is *not* fail-open is `LedgerCorrupt`, below.
+ */
+export class LedgerUnavailable extends EvalsError {
+  override readonly name = "LedgerUnavailable";
+  override readonly incident = false;
+  constructor(
+    readonly operation: string,
+    override readonly cause: unknown,
+  ) {
+    super(
+      `run ledger unavailable during ${operation}${typeof cause === "string" ? `: ${cause}` : ""}`,
+    );
+  }
+}
+
+/**
+ * The ledger answered, and what it said cannot be true.
+ *
+ * **Fail-closed, incident.** A completed-run record whose report is partial, or
+ * whose report does not survive `reopenAccuracyReport`, means the memo and the
+ * artefact disagree — and the memo is the thing `run` would have returned
+ * *instead of executing*. Returning it would publish a number no run produced.
+ *
+ * This is the specific failure the design review flagged: a run that exceeded
+ * its budget produces a `partial` report, and memoising that as if it were
+ * complete makes every later run of the same key return a biased sample as a
+ * finished one. The write path makes it unrepresentable — `mintCompletedRun`
+ * refuses a partial report and is the only producer of the record type — and
+ * this is the read-side backstop for a row written by an older build or edited
+ * in the database.
+ */
+export class LedgerCorrupt extends EvalsError {
+  override readonly name = "LedgerCorrupt";
+  override readonly incident = true;
+  constructor(
+    readonly runKey: string,
+    readonly why: string,
+  ) {
+    super(`the ledger's record for run key ${runKey} cannot be used: ${why}`);
+  }
+}
+
+/**
+ * A report was offered for memoisation and refused.
+ *
+ * Fail-closed at the mint, before the ledger sees it. A partial run, an
+ * unattributed run, or a run that could not evaluate some of its cases has not
+ * established what it claims to have established; memoising it means every
+ * later run of the same key returns it **without executing**, so the
+ * flattering-but-wrong answer becomes permanent and free.
+ */
+export class RunNotMemoisable extends EvalsError {
+  override readonly name = "RunNotMemoisable";
+  override readonly incident = false;
+  constructor(readonly why: string) {
+    super(`refusing to memoise this run as complete: ${why}`);
+  }
+}
+
+/**
+ * A memoised case does not match the case it would be carried forward onto.
+ *
+ * Fail-closed, **incident**. The run key content-addresses the source digest, so
+ * a case whose content changed changes the key and cannot reach its old memo.
+ * Arriving here means the ledger and the source disagree under one key — a
+ * hand-rolled `CaseSource`, a ledger shared between two suites, or a row edited
+ * by hand. Carrying the memo forward would report a result for a case that was
+ * never run in that form.
+ */
+export class MemoisedCaseMismatch extends EvalsError {
+  override readonly name = "MemoisedCaseMismatch";
+  override readonly incident = true;
+  constructor(
+    readonly ref: string,
+    readonly expected: string,
+    readonly found: string,
+  ) {
+    super(
+      `memoised case ${ref} was recorded against digest ${found} but this source carries ${expected}`,
+    );
+  }
+}
+
+/**
+ * A subset was declared that cannot be selected.
+ *
+ * Fail-closed at construction, before any spend. A subset with a budget below
+ * one case, a quarantine naming a case the suite does not contain, or a seed
+ * that is empty are all ways to get a pre-merge gate that silently covers
+ * nothing — the zero-case suite wearing its third hat.
+ */
+export class SubsetUnselectable extends EvalsError {
+  override readonly name = "SubsetUnselectable";
+  override readonly incident = false;
+  constructor(readonly why: string) {
+    super(`refusing to select this subset: ${why}`);
+  }
+}

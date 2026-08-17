@@ -12,12 +12,23 @@
  *   gate    The continuous-integration regression gate. Accepts **only** an
  *           `AccuracyReport`. Passing an `AgreementReport` is a compile error.
  *
- * `accept`, `goldenSuite`, `defineSubject`, `exactVerdict` and `judgePanel` are
- * constructors of argument types: they evaluate nothing, open no node and reach
+ * `accept`, `goldenSuite`, `defineSubject`, `exactVerdict`, `judgePanel`,
+ * `preMergeSubset`, `runKeyOf`, `exitCodeFor`, `mintCompletedRun` and
+ * `reopenAccuracyReport` / `reopenAgreementReport` are constructors of argument
+ * types and readers of artefacts: they evaluate nothing, open no node and reach
  * no store. A third *executing* entry point is a signal to **split the module**,
  * not to extend it — and the accounting is stated plainly because that
  * distinction is exactly the one somebody will use next year to add
  * `generateSuite()` as "just a constructor".
+ *
+ * Two of them are worth reading against that rule rather than assumed to pass
+ * it. `runKeyOf` is pure and is the reason idempotency did **not** need a fourth
+ * verb: a caller asks the ledger `findCompleted(runKeyOf(spec))` to find out
+ * whether a run will cost anything, and `run` itself does the same thing
+ * internally. `exitCodeFor` is a decision about what a failure *means*, and
+ * decisions about meaning belong where they can be tested — a `bin` wrapper over
+ * it is four lines, and none of the nineteen applications should be
+ * re-deriving in shell whether a rate-limit storm is a regression.
  *
  * **`recordedCases` is not in that list, and the earlier version of this comment
  * put it there.** It is `async`; it calls `humanDecisions.decisionFor` once per
@@ -81,6 +92,53 @@
  *                  with coverage `0`, **not** `complete` with coverage `10000`:
  *                  the check is a declaration, not a measurement, and the
  *                  report says which. See the honesty note at the foot.
+ *   Idempotent.    `run` is content-addressed by `runKeyOf(spec)` — source
+ *                  digest, subject version and purity, scorer digests, seed,
+ *                  price-table version, every limit. **Re-running a completed
+ *                  key returns the original report and executes nothing**: the
+ *                  original `runId`, `startedAt` and `traceDigest`, not a fresh
+ *                  run that happens to agree. An interrupted run **resumes** —
+ *                  200 cases dying at 180 pays for 20, and the 180 arrive as
+ *                  `case` nodes stamped with the run and node they came from, so
+ *                  the trace says they were not observed today. A **partial run
+ *                  is never memoised as complete**: `mintCompletedRun` is the
+ *                  only producer of the ledger's write type and refuses one, so
+ *                  a budget-exceeded run cannot become a permanent, free,
+ *                  biased pass. There is no `force: true`; to re-execute,
+ *                  change something the key is made of.
+ *   Determinism.   **Checked, not declared.** A seeded sample of the run's own
+ *                  cases is re-executed under the identical seed and the
+ *                  verdicts compared byte for byte, bounded by
+ *                  `Limits.determinismSampleCases` (2 by default, 0 switches it
+ *                  off and the report then says `not-checked` and why). The
+ *                  report carries `declared` *and* `check`, and the check states
+ *                  `compared: "subject-verdict"` — the scorers are not re-run,
+ *                  because a judge panel is non-deterministic by construction
+ *                  and says so. A subject that answers differently on
+ *                  re-execution blocks the gate: every other number here — the
+ *                  baseline, the comparison, the replay — assumes it would not.
+ *   Coverage.      A pre-merge **subset** is a `CaseSource` with its own content
+ *                  address, not a flag: high-tier and quarantined cases are
+ *                  pinned and are never dropped to fit the budget, the seeded
+ *                  remainder is recorded by reference, and `notSelected` is
+ *                  enumerated so `gate` can tell "the pre-merge run skipped it"
+ *                  from "somebody deleted it". A green gate states what it
+ *                  covered, on the pass line. A subset never advances a
+ *                  baseline.
+ *   Availability.  A provider that will not serve is **not a regression**.
+ *                  `ProviderUnavailable` — a 429, a 503, a reset, raised by the
+ *                  `ModelBackend` adapter — makes a case `could-not-evaluate`:
+ *                  its own status, its own rate, its own gate reason, its own
+ *                  exit code. It is still bounded, counting against
+ *                  `maxCaseFailures` so a storm stops the run rather than
+ *                  hammering the provider for the other 199 cases.
+ *   Exit codes.    `exitCodeFor` is a library function, so the decision is
+ *                  testable without a process: `0` pass, `1` evidence failure,
+ *                  `2` could-not-evaluate, `3` integrity failure. Could-not-
+ *                  evaluate never returns `0`, and an unrecognised throw is `3`
+ *                  rather than `1`. The block-reason classification is a
+ *                  `switch` with no `default`, so adding a gate reason without
+ *                  classifying it does not compile.
  *   Judges.        Non-deterministic and they say so. Model and prompt version
  *                  recorded per sample; aggregated over an odd n ≥ 3; a panel
  *                  that splits beyond its declared band is `contested`, carrying
@@ -103,6 +161,16 @@
  *                  the subject's own promise. Nothing here kills it. The run
  *                  terminates, the node is settled `timeout`, the report is
  *                  `partial`, and the abandoned work runs on.
+ *   Alerting.      `under-recording-detected` — the sixth silent condition — is
+ *                  raised through `RecorderDeps.alerting` at the end of a run
+ *                  that found decisions with no model call beneath them. The
+ *                  gate already blocks on the same fact, and that is right for a
+ *                  change a developer is watching land; it is wrong for a
+ *                  nightly run, where a red build is a line in a report nobody
+ *                  opens until Monday while the subject has been thinking
+ *                  somewhere unrecorded since Thursday. One alert per run, not
+ *                  one per case, carrying the run identifier — an eval run has
+ *                  no case, and saying so is better than inventing one.
  *   Integers.      Every number in a payload is a safe integer — cost in
  *                  tenth-cents, latency in micros, scores in basis points. No
  *                  IEEE-754 anywhere, because byte-stable serialisation is what
@@ -214,6 +282,15 @@
  *                          The second is not hypothetical — every one of the
  *                          nineteen has a first shadow run, and at that point
  *                          the reviewers' decisions were never in `audit`.
+ *   `RunLedger`            `inMemoryRunLedger` / `sqlRunLedger`. Idempotency and
+ *                          resume. Branded for a sharper reason than the store
+ *                          is: `findCompleted` returns a report **without
+ *                          executing anything**, so a hand-rolled ledger is the
+ *                          cheapest possible way to make a build green and,
+ *                          unlike a deleted golden case, it leaves no diff. The
+ *                          in-memory one forgets at process exit — right for a
+ *                          test, wrong for continuous integration, and a
+ *                          property of the adapter rather than of the seam.
  *
  * `ModelBackend` is a seam with one shipped adapter (`scriptedModelBackend`) and
  * nineteen unshipped ones — the applications' own provider clients. Counted as
@@ -331,9 +408,11 @@ export { modelId, promptVersion } from "./lib/clients.js";
 export type {
   AppendEvalNode,
   CaseDigest,
+  CaseMemo,
   CaseRef,
   CaseSource,
   Clock,
+  CompletedRunRecord,
   DecisionContext,
   EvalCase,
   EvalNode,
@@ -344,7 +423,9 @@ export type {
   ExpiryResult,
   ExpectationOf,
   JudgeDescriptor,
+  LedgerExpiryResult,
   Limits,
+  MemoisedStatus,
   NodeContext,
   NodeHandle,
   NodeOutcome,
@@ -358,6 +439,9 @@ export type {
   Redactor,
   RiskTier,
   RunId,
+  RunKey,
+  RunLedger,
+  RunLedgerMethods,
   ScoreOutcome,
   Scorer,
   ScorerDescriptor,
@@ -368,11 +452,14 @@ export type {
   SettleEvalNode,
   SourceDigest,
   SourceKind,
+  StoredCaseMemo,
+  StoredCompletedRun,
   StoredEvalRun,
   StoredRunHeader,
   Subject,
   SubjectSpec,
   SubjectVersion,
+  SubsetSelection,
   Timers,
   TraceDigest,
   Verdict,
@@ -415,6 +502,20 @@ export {
 export type { JudgePanelInput } from "./lib/scorers.js";
 export { exactVerdict, judgePanel, scriptedModelBackend } from "./lib/scorers.js";
 
+/** Ledger adapters. Two, which is what makes `RunLedger` a real seam. */
+export type { InMemoryLedgerLimits } from "./lib/ledger.js";
+export {
+  EVAL_LEDGER_SCHEMA_SQL,
+  inMemoryRunLedger,
+  mintCompletedRun,
+  reopenMemoisedReport,
+  sqlRunLedger,
+} from "./lib/ledger.js";
+
+/** Pre-merge subset selection: seeded, budget-sized, high tier and quarantine pinned. */
+export type { SubsetInput } from "./lib/subset.js";
+export { preMergeSubset } from "./lib/subset.js";
+
 export type {
   AccuracyCaseResult,
   AccuracyCaseStatus,
@@ -424,24 +525,39 @@ export type {
   AgreementReport,
   Attribution,
   Determinism,
+  DeterminismCheck,
   Disagreement,
+  Memoisation,
   RunFacts,
 } from "./lib/report.js";
-export { INTERPRETATION, reopenAccuracyReport } from "./lib/report.js";
+export {
+  INTERPRETATION,
+  READABLE_REPORT_SCHEMAS,
+  reopenAccuracyReport,
+  reopenAgreementReport,
+} from "./lib/report.js";
 
 export type { ReportOf, RunSpec } from "./lib/run.js";
-export { DEFAULT_LIMITS, run } from "./lib/run.js";
+export { DEFAULT_LIMITS, run, runKeyOf } from "./lib/run.js";
 
 export type {
   Baseline,
   BaselineCase,
   GateBlockReason,
   GateCounts,
+  GateCoverage,
   GateFloors,
   GateInput,
   GateOutcome,
 } from "./lib/gate.js";
 export { accept, DEFAULT_FLOORS, gate } from "./lib/gate.js";
+
+/**
+ * The command-line adapter's verdict, as a function — so the decision is
+ * testable without spawning a process. A `bin` wrapper over it is four lines.
+ */
+export type { EvalExitCode, ExitDecision, ExitInput, ExitKind } from "./lib/exit.js";
+export { exitCodeFor } from "./lib/exit.js";
 
 /** Byte-stable serialisation, exposed so an auditor can recompute it. */
 export {
@@ -458,15 +574,22 @@ export {
   DuplicateCaseRef,
   EvalsError,
   EvalStoreUnavailable,
+  LedgerCorrupt,
+  LedgerNotMinted,
+  LedgerUnavailable,
   LimitOutOfRange,
+  MemoisedCaseMismatch,
   NodeSettledTwice,
   NoSuchRun,
   PanelMisdeclared,
+  ProviderUnavailable,
   RecorderNotMinted,
   ReportRefused,
   RunBudgetExhausted,
+  RunNotMemoisable,
   StoreNotMinted,
   SubjectAttemptedWrite,
+  SubsetUnselectable,
   SuiteEmpty,
   SuiteUnversioned,
   SuiteVersionMismatch,

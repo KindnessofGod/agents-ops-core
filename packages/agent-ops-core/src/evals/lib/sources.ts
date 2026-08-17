@@ -114,7 +114,9 @@ export const goldenSuite = (input: GoldenSuiteInput): CaseSource<"golden"> => {
   if (input.expectDigest !== undefined && input.expectDigest !== digest) {
     throw new SuiteVersionMismatch(input.expectDigest, digest);
   }
-  return { kind: "golden", digest, size: cases.length, cases, provenance: null };
+  // `selection: null` — this is the whole suite. `preMergeSubset` produces the
+  // other shape, with its own digest, so the two can never be confused.
+  return { kind: "golden", digest, size: cases.length, cases, provenance: null, selection: null };
 };
 
 /* ------------------------------------------------------------- recorded cases */
@@ -306,5 +308,9 @@ export const recordedCases = async (
       withoutHumanDecision,
       considered: taken.length,
     },
+    // A cohort is already a bounded slice of production, bounded by `maxCases`
+    // and by the window, and both are on `provenance`. Subsetting it again would
+    // be a second denominator nobody could read.
+    selection: null,
   };
 };

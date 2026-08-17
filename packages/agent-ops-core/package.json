@@ -29,6 +29,10 @@
     "./guardrails": {
       "types": "./dist/guardrails/index.d.ts",
       "default": "./dist/guardrails/index.js"
+    },
+    "./alerts": {
+      "types": "./dist/alerts/index.d.ts",
+      "default": "./dist/alerts/index.js"
     }
   },
   "files": [

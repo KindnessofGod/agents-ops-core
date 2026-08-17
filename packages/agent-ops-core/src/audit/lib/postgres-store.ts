@@ -17,6 +17,7 @@ import {
   isSealNode,
   sealPayload,
 } from "./seal.js";
+import type { SqlExecutor, SqlRow } from "./sql.js";
 import type {
   AppendInput,
   CorrelationId,
@@ -27,6 +28,8 @@ import type {
   RedactionId,
   RiskTier,
   StoredCase,
+  TracePage,
+  TracePageRequest,
   TraceProvenance,
   TraceStore,
   UnassistedContainment,
@@ -112,25 +115,6 @@ import { asTraceStore } from "./types.js";
  * Replay's seal check is what catches it.
  */
 
-export interface SqlRow {
-  readonly [column: string]: unknown;
-}
-
-/**
- * The driver-injection point, and **not a seam** — see the seam accounting in
- * `index.ts`. It exists because C3 forbids this package from importing a
- * driver, not because two implementations of database access are wanted. There
- * is exactly one shape: wire your existing pool to it.
- */
-export interface SqlExecutor {
-  query(
-    text: string,
-    params: readonly unknown[],
-  ): Promise<{ readonly rows: readonly SqlRow[] }>;
-  /** Runs `fn` on one connection inside a transaction, rolling back on throw. */
-  transaction<T>(fn: (tx: SqlExecutor) => Promise<T>): Promise<T>;
-}
-
 export interface PostgresStoreLimits {
   /** Ceiling on nodes in one case. A runaway retry loop is a bug, not a trace. */
   readonly maxNodesPerCase: number;
@@ -197,6 +181,21 @@ FROM ${NODE}
 WHERE correlation_id = $1
 ORDER BY sequence
 LIMIT $2`,
+
+  /**
+   * One page. `sequence > $2` is an index range scan on the primary key, so the
+   * cost of the nth page does not grow with n — which `OFFSET` would, and which
+   * is why the cursor is a sequence rather than an offset. `LIMIT $3` is fetched
+   * as `limit + 1` by the caller so `more` is a fact rather than an inference
+   * from a full page.
+   */
+  readPage: `-- audit:read-page
+SELECT sequence, node_id, at_ms, tier, parent_sequence,
+       payload_schema_version, redaction, kind, payload_canonical, node_canonical, is_seal
+FROM ${NODE}
+WHERE correlation_id = $1 AND sequence > $2
+ORDER BY sequence
+LIMIT $3`,
 } as const;
 
 /** `bigint` arrives as a string from most drivers. Both shapes are accepted. */
@@ -580,6 +579,50 @@ export const postgresTraceStore = (
           const provenance = await readProvenance(tx, correlationId);
           if (provenance === undefined) return undefined;
           return { provenance, nodes: await readNodes(tx, correlationId) };
+        });
+      } catch (error) {
+        return asStoreError(error, correlationId);
+      }
+    },
+
+    /**
+     * One bounded window.
+     *
+     * Each page is its own transaction rather than one long-lived snapshot
+     * across the whole walk, and that is a deliberate trade with a real cost on
+     * each side. A repeatable-read snapshot held over 100 pages would pin a
+     * connection and hold back vacuum for the length of an operator's walk; a
+     * page-per-transaction walk can, in principle, see nodes appended to an
+     * *open* case between pages. The second is harmless here and the first is
+     * not, because the case being walked at the node ceiling is overwhelmingly a
+     * closed one — nothing can be appended to a sealed case at all — and a walk
+     * that observes a live case growing observes exactly what happened.
+     *
+     * The provenance read is inside the same transaction as the node read, so a
+     * page's scope statement and its nodes are from one instant.
+     */
+    async readPage(request: TracePageRequest): Promise<TracePage | undefined> {
+      const { correlationId } = request;
+      const limit = Math.max(request.limit, 0);
+      try {
+        return await sql.transaction(async (tx) => {
+          const provenance = await readProvenance(tx, correlationId);
+          if (provenance === undefined) return undefined;
+
+          // `limit + 1` rows, so "is there more" is answered by the database
+          // rather than guessed from a full page.
+          const { rows } = await tx.query(SQL.readPage, [
+            correlationId,
+            request.afterSequence ?? -1,
+            limit + 1,
+          ]);
+          const more = rows.length > limit;
+          const page = more ? rows.slice(0, limit) : rows;
+          return {
+            provenance,
+            nodes: page.map((row) => rowToNode(row, correlationId)),
+            more,
+          };
         });
       } catch (error) {
         return asStoreError(error, correlationId);

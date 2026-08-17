@@ -293,6 +293,54 @@ export class LimitsInvalid extends GuardrailsError {
 }
 
 /**
+ * A regular expression was offered as a `Pattern` that this module will not run.
+ *
+ * Fail-closed, **at construction**, and it is an incident rather than a call-site
+ * defect because of where the failure lands: a catastrophically backtracking
+ * pattern is not a wrong answer, it is the event loop of every decision in the
+ * process stopping. `guardrails` runs on the hot path twice per decision, so a
+ * pattern that stalls is nineteen applications' latency incident, and the
+ * cheapest loud place to refuse it is boot.
+ *
+ * Refused shapes and why, in `lib/safe-pattern.ts`. The analyser is
+ * conservative — it refuses what is known to blow up and cannot prove anything
+ * linear — and there is deliberately no override: a refused pattern decomposes
+ * into ones that are accepted, and an escape hatch is the configuration key that
+ * gets turned at 4pm on a Friday by somebody whose pattern would not compile.
+ */
+export class PatternUnsafe extends GuardrailsError {
+  override readonly name = "PatternUnsafe";
+  override readonly incident = true;
+  constructor(
+    readonly rule: string,
+    readonly detail: string,
+  ) {
+    super(`pattern ${rule} cannot be run on the hot path: it ${detail}`);
+  }
+}
+
+/**
+ * A detector's coverage declaration contradicts itself, or claims a scope
+ * without saying what qualifies it.
+ *
+ * Fail-closed, at construction, **incident**. A category declared both covered
+ * and uncovered is two incompatible claims in one object, and a reader who
+ * trusts either is reading a coin flip — over exactly the question ("does this
+ * pack see street addresses?") that a coverage declaration exists to answer.
+ * The failure it prevents is silent: a caller reads `covers` and stops looking.
+ */
+export class CoverageIncoherent extends GuardrailsError {
+  override readonly name = "CoverageIncoherent";
+  override readonly incident = true;
+  constructor(
+    readonly detector: string,
+    readonly detail: string,
+  ) {
+    super(`detector ${detector} declares incoherent coverage: it ${detail}`);
+  }
+}
+
+/**
  * `checkOutput` was handed an output screening as its `after`.
  *
  * Fail-closed, **incident**. `Screening` is unforgeable, so *something* was

@@ -1,15 +1,22 @@
+import type { Archivist } from "./retention.js";
 import type {
   AppendInput,
   CorrelationId,
   Degraded,
   RecordedNode,
   RecordResult,
+  RetentionRegister,
   RiskTier,
   StoredCase,
+  TracePage,
+  TracePageRequest,
   TraceStore,
   TraceProvenance,
   UnassistedContainment,
   UnavailabilityPolicy,
+  Witness,
+  WitnessRecord,
+  WitnessReceipt,
 } from "./types.js";
 
 /**
@@ -75,6 +82,7 @@ interface StructuralStoreImpostor {
     outcome: UnassistedContainment,
   ): Promise<RecordedNode>;
   read(correlationId: CorrelationId): Promise<StoredCase | undefined>;
+  readPage(request: TracePageRequest): Promise<TracePage | undefined>;
 }
 
 export type ImpostorStoreDoesNotTypecheck = Assert<
@@ -100,4 +108,70 @@ export type OutcomeCarriesTheQualifier = Assert<
   UnassistedContainment extends { readonly unassistedContainment: boolean }
     ? true
     : false
+>;
+
+/**
+ * Names that would mean removal. Listed once and applied to three interfaces,
+ * so the rule is checkable rather than a habit.
+ */
+type RemovingVerb =
+  | "delete"
+  | "remove"
+  | "purge"
+  | "expire"
+  | "drop"
+  | "truncate"
+  | "erase"
+  | "destroy";
+
+type HasNoRemovingVerb<T> = Extract<keyof T, RemovingVerb> extends never ? true : false;
+
+/**
+ * **The append-only guarantee, as a build failure rather than as a habit.**
+ *
+ * The trace tables grant no role this library creates the ability to delete, and
+ * the reason those grants can stay that way is that no interface here has a verb
+ * that would want one. Adding `expire(correlationId)` to `TraceStore` would look
+ * like a small convenience and would require a DELETE grant on the role nineteen
+ * applications hold all day. This fails the build first.
+ */
+export type StoreCannotRemove = Assert<HasNoRemovingVerb<TraceStore>>;
+
+/**
+ * The same rule where it is most tempting to break it. The retention interfaces
+ * exist *because* something eventually has to be removed; the point of them is
+ * that the something is a separately-authorised procedure and not this library.
+ * See `lib/retention.ts`.
+ */
+export type RegisterCannotRemove = Assert<HasNoRemovingVerb<RetentionRegister>>;
+export type ArchivistCannotRemove = Assert<HasNoRemovingVerb<Archivist>>;
+
+/**
+ * The witness seam cannot be impersonated either, and for a sharper reason than
+ * the store's: a structural impostor here would not fail loudly, it would report
+ * every case as agreeing with a witness that never existed.
+ */
+interface StructuralWitnessImpostor {
+  readonly id: string;
+  publish(record: WitnessRecord): Promise<WitnessReceipt>;
+  lookUp(correlationId: CorrelationId): Promise<WitnessRecord | undefined>;
+}
+
+export type ImpostorWitnessDoesNotTypecheck = Assert<
+  StructuralWitnessImpostor extends Witness ? false : true
+>;
+
+/** …and a real witness still satisfies the shape it is branded with. */
+export type BrandedWitnessIsStillAWitness = Assert<
+  Witness extends StructuralWitnessImpostor ? true : false
+>;
+
+/**
+ * A witness record carries a digest, a count and a time — and no payload. The
+ * assertion is here because a witness may be under someone else's custody, and
+ * the field that leaks personal data to a third party is the field somebody adds
+ * later "just for debugging".
+ */
+export type WitnessCarriesNoPayload = Assert<
+  "payload" extends keyof WitnessRecord ? false : true
 >;

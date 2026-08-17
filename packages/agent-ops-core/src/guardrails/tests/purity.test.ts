@@ -29,11 +29,13 @@ import { MASK, NODE, type NonEmpty, type Source, type SourceId } from "../index.
 describe("guardrails — detectors are pure with respect to the payload", () => {
   it("hands the detector nothing it could cause an effect with", async () => {
     let seen: readonly string[] = [];
+    let deadlineKeys: readonly string[] = [];
     const h = harness({
       detectorSets: sameAtEveryTier(
         setOf("observer", [
           scriptedDetector("observer", (subject) => {
             seen = Object.keys(subject);
+            deadlineKeys = Object.keys(subject.deadline);
             return { outcome: "searched-and-found-none", costTenthCents: 0, modelCalls: 0 };
           }),
         ]),
@@ -46,7 +48,20 @@ describe("guardrails — detectors are pure with respect to the payload", () => 
       payload: { narrative: "ordinary" },
     });
 
-    expect([...seen].sort()).toEqual(["budgetMicros", "fields", "locale", "phase", "sources"]);
+    expect([...seen].sort()).toEqual([
+      "budgetMicros",
+      "deadline",
+      "fields",
+      "locale",
+      "phase",
+      "sources",
+    ]);
+    // `deadline` is the one capability added since, and it is a one-bit oracle
+    // rather than a clock: it cannot say what time it is, how long is left, or
+    // how long anything took. A detector that could read the clock could seed a
+    // nonce, vary its answer between two runs of the same case, and quietly
+    // stop being replayable.
+    expect(deadlineKeys).toEqual(["expired"]);
   });
 
   it("freezes the view, so mutation throws rather than being silently dropped", async () => {

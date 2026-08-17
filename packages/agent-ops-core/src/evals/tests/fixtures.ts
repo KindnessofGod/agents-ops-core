@@ -3,6 +3,7 @@ import {
   determine,
   goldenSuite,
   inMemoryEvalNodeStore,
+  inMemoryRunLedger,
   modelId,
   promptVersion,
   scriptedModelBackend,
@@ -20,6 +21,7 @@ import type {
   ModelResponse,
   PriceTable,
   Redactor,
+  RunLedger,
   Timers,
 } from "../index.js";
 
@@ -81,6 +83,14 @@ export const TEST_MODEL = modelId("test-model");
 export const TEST_JUDGE = modelId("test-judge");
 export const PROMPT_V1 = promptVersion("extract@1");
 
+/**
+ * `determinismSampleCases: 0` here on purpose.
+ *
+ * Most tests in this module assert what a run *recorded* — node counts, trace
+ * digests, cost figures — and a determinism re-execution adds spans and model
+ * calls to every one of them. The check has its own tests, where it is switched
+ * on deliberately, which is also how a caller should reach for it.
+ */
 export const smallLimits: Limits = {
   concurrency: 4,
   perCaseMillis: 5_000,
@@ -88,6 +98,7 @@ export const smallLimits: Limits = {
   maxCaseFailures: 10,
   retries: 0,
   costCeilingTenthCents: 1_000_000,
+  determinismSampleCases: 0,
 };
 
 export const testSeed = makeSeed("seed-0");
@@ -95,17 +106,38 @@ export const testSubjectVersion = subjectVersion("invoice-approval@test");
 
 export interface Harness {
   readonly store: EvalNodeStore;
+  readonly ledger: RunLedger;
   readonly recorder: EvalRecorder;
   readonly clock: Clock & { advance(ms: number): void };
 }
 
+/**
+ * A fresh store and a fresh ledger per harness, so a test that does not care
+ * about idempotency gets none: every `harness()` is a new world, and a run
+ * cannot accidentally return a memo left behind by the test above it.
+ *
+ * Passing a ledger in is how the resume tests share one across two harnesses,
+ * which is exactly the shape a crashed continuous-integration job has.
+ */
 export const harness = (
   redact: Redactor = passthroughRedactor,
   timers: Timers = systemTimers(),
+  ledger: RunLedger = inMemoryRunLedger(),
+  /**
+   * Where `under-recording-detected` goes. Only ever an in-memory `Alerts`, and
+   * not by convention: `alerts` constructs no transport and reads no
+   * environment, so this test suite has no path to a pager at all.
+   */
+  alerting?: import("../../alerts/index.js").AlertRaiser,
 ): Harness => {
   const store = inMemoryEvalNodeStore();
   const clock = manualClock();
-  return { store, clock, recorder: createEvalRecorder({ store, clock, redact, timers }) };
+  return {
+    store,
+    clock,
+    ledger,
+    recorder: createEvalRecorder({ store, clock, redact, timers, ledger, alerting }),
+  };
 };
 
 export const echoBackend = (

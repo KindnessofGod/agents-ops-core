@@ -71,6 +71,15 @@
  *                  When no detector completed a search, `couldNotSearch` says so
  *                  instead, because claiming a search nobody ran is worse than
  *                  admitting none happened.
+ *   Rate watch.    The eighth silent condition — **the fail-closed screening
+ *                  rate moving sharply** — is the only one this module can see,
+ *                  and it is a property of a window rather than of a payload:
+ *                  *"every individual case behaved exactly as designed."* Wired
+ *                  through `GuardrailsDeps.rateAlerting`, as one object with its
+ *                  raiser so a window with nowhere to raise cannot be built.
+ *                  Deliberately **not** written as a node: a movement over a
+ *                  population is not a fact about whichever case happened to
+ *                  close the window. See `lib/rate-watch.ts`.
  *   Integers.      Cost in tenth-cents, latency in microseconds, confidence and
  *                  support in basis points. No IEEE-754 in any payload.
  *   Clock.         Injected. No `Date.now()` in this module, ever. So is the
@@ -83,15 +92,27 @@
  *                  field is range-checked at construction, because
  *                  `maxFindingsPerScreening: 0` used to turn a `block` into an
  *                  `allow`.
- *   Budget.        The detector budget bounds the **answer**, not the work, and
- *                  the difference is load-bearing. A detector that overran is
- *                  recorded `unavailable/timed-out` against the injected clock
- *                  however it got there, so the screening fails closed
- *                  deterministically. But losing a race cancels nothing, and a
- *                  **synchronous** detector cannot be raced at all — a
- *                  catastrophically backtracking regular expression in a
- *                  caller-supplied pattern pack is an unbounded event-loop stall
- *                  that no in-process timer can preempt. See `lib/detectors.ts`.
+ *   Budget.        The detector budget bounds the answer deterministically — a
+ *                  detector that overran is recorded `unavailable/timed-out`
+ *                  against the injected clock however it got there, so the
+ *                  screening fails closed. It now also bounds the **work**, on
+ *                  two further axes: `Detector.screen` must return a promise, so
+ *                  the race is scheduled rather than deferred; and every
+ *                  detector is handed a `deadline` — a one-bit oracle over the
+ *                  same injected clock, never a clock — which both shipped
+ *                  adapters check between units of work. See "The synchronous
+ *                  detector, closed and re-measured" below for what is left.
+ *   Patterns.      A `Pattern` cannot be constructed from a regular expression
+ *                  capable of exponential backtracking. `safePattern` is the
+ *                  only mint, the brand is a non-exported `unique symbol`, and
+ *                  `deterministicDetector` re-checks so a cast is refused too.
+ *                  `PatternUnsafe` is a boot failure, never a screening-time
+ *                  one. There is deliberately no override.
+ *   Coverage.      Every screening reports how much of the payload a completing
+ *                  detector actually examined, how much text went into the trace
+ *                  unmasked, and what the detectors that ran declare they do and
+ *                  do not cover. It is **coverage, not confidence** — see
+ *                  `ScreeningCoverage`.
  *   Telemetry.     Cost, tokens, latency and the price-table version on every
  *                  node that measured a model call, as `audit`'s typed
  *                  `NodeTelemetry` rather than as free-form payload keys. Where
@@ -143,21 +164,78 @@
  * The honest claim is *unrepresentable through `guardrails`, against a witness
  * that persists*, not *unrepresentable*.
  *
+ * ## The synchronous detector, closed and re-measured
+ *
+ * This module's frankest residual was that a synchronous detector's work could
+ * not be bounded: `screen` could return a value rather than a promise, a
+ * synchronous body never yields, and no in-process timer could preempt a
+ * catastrophically backtracking regular expression over a 32,768-character
+ * field. It was an unbounded event-loop stall on the hot path of every decision,
+ * twice. It is closed structurally, on three axes, and the honest accounting of
+ * each is worth more than the headline:
+ *
+ *   1. **`Pattern` is unforgeable and analysed.** `safePattern` refuses
+ *      backreferences, `(a+)+`-shaped nesting, alternations under an unbounded
+ *      quantifier, and repetition products past a bound — at construction, with
+ *      no escape hatch. This is what removes *exponential* blowup, and it is the
+ *      one that actually matters. Both shipped market packs pass unchanged.
+ *   2. **`screen` must return a promise.** This is a precondition, not a bound:
+ *      an `async` body that never awaits blocks exactly as a synchronous one
+ *      did. It buys the race a chance to be scheduled and it buys the interface
+ *      an honest signal to its implementor. Saying more than that would be the
+ *      comfortable sentence rather than the true one.
+ *   3. **A `deadline` is handed to every detector** — one bit, over the engine's
+ *      injected clock, never a clock — and both shipped adapters check it
+ *      between patterns, between fields and between classifier calls. This is
+ *      what bounds the aggregate: a pack of twelve patterns over sixty-four
+ *      fields cannot compound one slow scan into a slow screening.
+ *
+ * **What remains possible.** An accepted pattern can still be polynomial, so one
+ * (pattern, field) scan can cost on the order of `maxFieldChars²` character
+ * comparisons — roughly a second of one core at the default — and nothing in
+ * this runtime can preempt it. That is a stall, it is bounded, and the bound is
+ * computable from `Limits`. A caller-supplied detector that neither awaits nor
+ * reads its deadline is bounded by nothing this module can offer; its *answer*
+ * is still refused on time. True preemption needs a worker thread, and
+ * `lib/safe-pattern.ts` states why serialising an unredacted payload into a
+ * second heap is the wrong trade for closing a bounded stall.
+ *
  * ## The residual risk, because it is a conversation and not a footnote
  *
  * Redaction masks **detected sites**. A free-text narrative carrying a name, an
  * address or a diagnosis in a shape no pattern matched is recorded in full,
  * bounded by `maxRecordedFieldChars` — and the digest beside the truncation is
  * brute-forceable for a low-entropy value, so it is not a redaction of the tail
- * either. Two things shrink the residue and both are the caller's to wire:
+ * either. That is inherent to detection-based redaction and this module does not
+ * claim to have closed it. What it now does is **make it visible**:
+ * `Screening.coverage` reports how much text a completing detector examined, how
+ * many code units were masked, and how many went into the trace verbatim — so
+ * "we found and masked three items" and "we found nothing and wrote all 4,812
+ * characters down" are different rows in the trace rather than the same one.
+ *
+ * Three things shrink the residue and all three are the caller's to wire:
  *
  *   - a model-class detector on the same field, which is what the tiered
- *     detector sets exist for; and
+ *     detector sets exist for;
  *   - `audit`'s deny-by-default `redactAllExcept`, wired with
  *     `GUARDRAILS_TRACE_FIELDS` so this module's integers survive as evidence
  *     while the payload text does not. Applied *without* that list it replaces
  *     every integer on every guardrails node with the string `"[redacted]"`,
- *     which destroys the trace it was meant to protect.
+ *     which destroys the trace it was meant to protect; and
+ *   - reading `coverage` and deciding which fields are worth either, since
+ *     neither is free.
+ *
+ * ## What a pack does not find, said by the pack
+ *
+ * A locale that silently covers less than a caller assumes is the compliance
+ * incident this module exists to prevent, and it is invisible by construction:
+ * an unmatched street address produces a clean screening and a green dashboard.
+ * So every shipped pack declares what it covers, what it covers **partially**
+ * with the caveat, and what it does **not** cover with the reason — and the
+ * covered list is *derived from the patterns*, so a declaration cannot drift
+ * from the pack. `localeCoverage(locale)` answers the question before anything
+ * is wired; `Screening.coverage.declared` answers it on every screening, over
+ * the detectors that actually completed.
  *
  * ## Groundedness is implemented once
  *
@@ -174,8 +252,16 @@
  * including where the count is zero:
  *
  *   - **`Detector` — a real seam.** Two shipped adapters with genuinely
- *     different bodies: `deterministicDetector` (patterns, synchronous, no I/O)
- *     and `modelDetector` (a classifier behind an injected port).
+ *     different bodies: `deterministicDetector` (patterns, no I/O) and
+ *     `modelDetector` (a classifier behind an injected port).
+ *
+ *     `personalDataDetector` and `promptInjectionDetector` are **not** a third
+ *     and fourth adapter, and counting them would be exactly the fudge C5
+ *     forbids: both are pattern packs configured into `deterministicDetector`,
+ *     sharing its body entirely. They are shipped content behind an adapter, and
+ *     the deletion test for them is different — delete them and nineteen
+ *     applications write their own personal-data and injection patterns, which
+ *     is nineteen chances at an incident that presents as a clean payload.
  *   - **`Groundedness` — a real seam.** Two shipped adapters:
  *     `overlapGroundedness` (deterministic token overlap) and
  *     `judgeGroundedness` (a model judging each claim). `evals` consumes either
@@ -210,6 +296,8 @@ export type {
   ClassifierRequest,
   ClassifierResponse,
   Clock,
+  CoverageDepth,
+  Deadline,
   Detector,
   DetectorCostClass,
   DetectorId,
@@ -243,6 +331,7 @@ export type {
   Screening,
   ScreenedPayload,
   ScreeningCost,
+  ScreeningCoverage,
   ScreeningPhase,
   ScreeningSubject,
   Severity,
@@ -266,12 +355,55 @@ export type {
 } from "./lib/detectors.js";
 
 /**
- * Shipped personal-data pattern packs, one per market. This is the deletion
- * test for the module: nineteen applications each writing their own patterns is
- * nineteen chances at a notifiable incident, and a subtly wrong pattern does not
- * present as a bug — it finds nothing, which reads exactly like a clean payload.
+ * The only mint for a `Pattern`, and the reason a runaway regular expression is
+ * unrepresentable in a pack rather than merely discouraged. See
+ * `lib/safe-pattern.ts` for the refused shapes, why the analyser is deliberately
+ * conservative, and why there is no override.
  */
-export { personalDataDetector, SHIPPED_LOCALES } from "./lib/patterns.js";
+export { safePattern } from "./lib/safe-pattern.js";
+export type { PatternSpec } from "./lib/safe-pattern.js";
+
+/**
+ * The coverage vocabulary: what a detector says it finds, what it finds
+ * incompletely, and what it does not find at all. The third list is the one that
+ * prevents the incident, because a missing rule is invisible in a trace unless
+ * somebody wrote it down.
+ */
+export type {
+  CoverageCategory,
+  CoverageNote,
+  DeclaredCoverage,
+  DetectorCoverage,
+  PersonalDataCategory,
+  PromptInjectionTechnique,
+} from "./lib/coverage.js";
+
+/**
+ * Shipped personal-data pattern packs, one per market, each declaring its own
+ * gaps. This is the deletion test for the module: nineteen applications each
+ * writing their own patterns is nineteen chances at a notifiable incident, and a
+ * subtly wrong pattern does not present as a bug — it finds nothing, which reads
+ * exactly like a clean payload.
+ *
+ * `localeCoverage` is the same declaration readable *before* wiring, which is
+ * when it is cheapest to discover that your market has no rule for the
+ * identifier your payloads are full of.
+ */
+export { localeCoverage, personalDataDetector, SHIPPED_LOCALES } from "./lib/patterns.js";
+export type { LocaleCoverage } from "./lib/patterns.js";
+
+/**
+ * The deterministic prompt-injection pack — the first adapter for injection
+ * screening that does not require a model call, and therefore the first one the
+ * cheap tier can have at all. Until it existed, low-tier decisions had **no**
+ * injection screening, and the absence read exactly like a clean payload.
+ *
+ * It is a **floor, not a ceiling**, and `lib/injection.ts` says so at length and
+ * first: paraphrase, another language, encoding, splitting across fields and
+ * indirection all defeat it without effort. Wiring it and calling the problem
+ * solved is worse than not wiring it, because the reassurance is the failure.
+ */
+export { promptInjectionDetector, SHIPPED_INJECTION_LOCALES } from "./lib/injection.js";
 
 /**
  * Groundedness adapters. Two, which is what makes `Groundedness` a real seam:
@@ -301,14 +433,35 @@ export {
 export {
   GuardrailsError,
   AuditWitnessUnsound,
+  CoverageIncoherent,
   DetectorReportInvalid,
   DetectorSetEmpty,
   LimitsInvalid,
   LocaleNotJurisdictional,
   LocaleUnsupported,
   OutputCheckOutOfOrder,
+  PatternUnsafe,
   ScreeningLimitExceeded,
   ScreeningNotRecorded,
   ScreeningParentUnknown,
   ScreeningPayloadInvalid,
 } from "./lib/errors.js";
+
+/**
+ * The fail-closed screening rate watch — `docs/CONTEXT.md`'s eighth silent
+ * condition, and the only one this module can see.
+ *
+ * `isFailClosed` is exported because there must be exactly **one** definition of
+ * the thing being measured. A dashboard query that recomputes "fail-closed rate"
+ * from node payloads and disagrees by a hair with the rule that raises the alert
+ * is how an operator learns to trust neither.
+ *
+ * `RateAlerting` is the terms a deployment must state — window, move, minimum
+ * sample — and it is wired into `GuardrailsDeps.rateAlerting` as one object with
+ * its `AlertRaiser`, so a window with nowhere to raise cannot be constructed.
+ * There is no third entry point here and no verb to poll: the rate is watched as
+ * a side effect of screening, and the raise goes to `alerts`, not to a return
+ * value nobody would read.
+ */
+export { isFailClosed } from "./lib/rate-watch.js";
+export type { RateAlerting } from "./lib/rate-watch.js";

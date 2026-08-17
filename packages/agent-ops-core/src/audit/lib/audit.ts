@@ -1,3 +1,4 @@
+import { raiseAndRecord } from "../../alerts/index.js";
 import {
   ENVELOPE_VERSION,
   assertCanonicalisable,
@@ -8,18 +9,19 @@ import {
 } from "./canonical.js";
 import {
   AuditError,
+  CaseNotClosed,
   NoSuchCase,
   ParentNotOfThisCase,
   PayloadTooLarge,
   RedactionUnsound,
   ReservedNodeKind,
   StoreContractViolated,
-  TraceIncoherent,
-  TraceTampered,
   TraceUnavailable,
-  UnknownEnvelope,
+  WitnessUnavailable,
 } from "./errors.js";
-import { SEAL_KIND, isReservedKind, isSealNode } from "./seal.js";
+import { SEAL_KIND, isReservedKind } from "./seal.js";
+import { traceVerifier, walkCase } from "./stream.js";
+import { closedCaseDigest, verifyReceipt, witnessVerdict } from "./witness.js";
 import type {
   Audit,
   AuditDeps,
@@ -36,8 +38,12 @@ import type {
   ReplayedCase,
   RiskTier,
   StoredCase,
-  TraceProvenance,
+  TraceDigest,
+  TraceVerdict,
   UnassistedContainment,
+  WalkLimits,
+  WitnessReceipt,
+  WitnessRecord,
 } from "./types.js";
 
 const DEFAULT_LIMITS: AuditLimits = {
@@ -52,143 +58,25 @@ const DEFAULT_LIMITS: AuditLimits = {
 // ---------------------------------------------------------------------------
 
 /**
- * Sequences must run 0..n-1 with no duplicate and no hole.
- *
- * The primary key makes a duplicate unreachable through the shipped Postgres
- * adapter, but `TraceStore` is a public seam and a sort by sequence over two
- * equal sequences has an implementation-defined order — and therefore a
- * non-deterministic digest for the same bytes. A hole is what a removed row
- * looks like.
- */
-const checkOrder = (
-  correlationId: CorrelationId,
-  nodes: readonly RecordedNode[],
-): void => {
-  for (let i = 0; i < nodes.length; i += 1) {
-    const node = nodes[i];
-    if (node === undefined) continue;
-    if (node.sequence === i) continue;
-    const previous = nodes[i - 1];
-    if (previous !== undefined && previous.sequence === node.sequence) {
-      throw new TraceIncoherent(
-        correlationId,
-        "duplicate-sequence",
-        `two nodes claim sequence ${node.sequence}`,
-      );
-    }
-    throw new TraceIncoherent(
-      correlationId,
-      "sequence-gap",
-      `expected sequence ${i}, found ${node.sequence}`,
-    );
-  }
-};
-
-const sealField = (
-  correlationId: CorrelationId,
-  seal: RecordedNode,
-  field: string,
-): string | number | boolean => {
-  const value = seal.payload[field];
-  if (value === undefined || value === null) {
-    throw new TraceIncoherent(
-      correlationId,
-      "seal-malformed",
-      `seal payload has no ${field}`,
-    );
-  }
-  return value;
-};
-
-/**
- * Read the seal, rather than merely having written one.
- *
- * The seal node has always carried the digest of everything before it and the
- * count of what it sealed. For one release nothing compared either, so a
- * removed row replayed cleanly and a row forged after the seal — which needs
- * only the INSERT grant the writer role legitimately holds — replayed cleanly
- * too. Both are caught here.
- */
-const checkSeal = (
-  correlationId: CorrelationId,
-  nodes: readonly RecordedNode[],
-  provenance: TraceProvenance,
-): boolean => {
-  const sealIndexes = nodes.flatMap((node, index) => (isSealNode(node) ? [index] : []));
-  if (sealIndexes.length === 0) return false;
-  if (sealIndexes.length > 1) {
-    throw new TraceIncoherent(
-      correlationId,
-      "duplicate-seal",
-      `${sealIndexes.length} nodes carry the terminal kind ${SEAL_KIND}`,
-    );
-  }
-
-  const index = sealIndexes[0] as number;
-  const seal = nodes[index] as RecordedNode;
-  if (index !== nodes.length - 1) {
-    throw new TraceIncoherent(
-      correlationId,
-      "node-after-seal",
-      `${nodes.length - 1 - index} node(s) sit after the terminal seal`,
-    );
-  }
-
-  const sealed = nodes.slice(0, index);
-  const nodesSealed = sealField(correlationId, seal, "nodesSealed");
-  if (nodesSealed !== sealed.length) {
-    throw new TraceIncoherent(
-      correlationId,
-      "seal-count-mismatch",
-      `the seal counted ${String(nodesSealed)} nodes; ${sealed.length} precede it`,
-    );
-  }
-
-  const recorded = String(sealField(correlationId, seal, "sealDigest"));
-  const version = digestVersionOf(recorded);
-  if (version === undefined) {
-    throw new UnknownEnvelope(recorded.slice(0, recorded.indexOf(":")), correlationId);
-  }
-  if (String(traceDigest(sealed, version)) !== recorded) {
-    throw new TraceIncoherent(
-      correlationId,
-      "seal-digest-mismatch",
-      "the seal's digest is not the digest of the nodes before it",
-    );
-  }
-
-  // Seal payload version 1 predates provenance being witnessed. Reading it as
-  // if it had those fields would report every old seal as broken, which is the
-  // same mistake this module made with the envelope version.
-  if (seal.payloadSchemaVersion >= 2) {
-    const witnessed: Record<string, string | number | boolean> = {
-      provenanceCapturedVia: provenance.capturedVia,
-      provenanceCanonicalForm: provenance.canonicalForm,
-      provenanceRedaction: String(provenance.redaction),
-      provenanceOpenedAt: provenance.openedAt,
-    };
-    for (const [field, expected] of Object.entries(witnessed)) {
-      if (sealField(correlationId, seal, field) !== expected) {
-        throw new TraceIncoherent(
-          correlationId,
-          "provenance-mismatch",
-          `the case's ${field} is not the one the seal witnessed`,
-        );
-      }
-    }
-  }
-
-  return true;
-};
-
-/**
  * Build the replayed graph.
  *
- * Every check that matters happens here, on the read path, because that is
- * where an auditor stands. `roots` and `childrenOf` are answered from an index
- * built once — they used to be linear filters per call, so walking a graph of n
- * nodes cost n² — and the digest is computed at most once however often it is
- * asked for.
+ * Every check that matters happens on the read path, because that is where an
+ * auditor stands — but it does not happen *here*. It happens in
+ * `lib/stream.ts`'s `traceVerifier`, which this drives with a materialised
+ * array and which `walk` drives a page at a time. One expression of the
+ * invariants, two readers: a whole-case replay that checked the seal and a
+ * streaming walk that forgot to would be this module's oldest defect — two
+ * paths claiming the same guarantee and holding different ones — wearing a new
+ * shape.
+ *
+ * The sort is the one thing that cannot be folded, and it stays here. A store
+ * is obliged to return `readPage` in order (invariant 7) because a streaming
+ * reader cannot reorder what it has already yielded; `read` returns the whole
+ * case, so this path can be forgiving and sort defensively.
+ *
+ * `roots` and `childrenOf` are answered from an index built once — they used to
+ * be linear filters per call, so walking a graph of n nodes cost n² — and the
+ * digest is the one the verifier already folded.
  */
 const replayedCase = (
   correlationId: CorrelationId,
@@ -196,21 +84,10 @@ const replayedCase = (
 ): ReplayedCase => {
   const nodes = [...stored.nodes].sort((a, b) => a.sequence - b.sequence);
 
-  checkOrder(correlationId, nodes);
-
-  // Tamper detection on the read path. A row whose stored bytes disagree with
-  // the bytes its own columns produce has been edited in place, which is the
-  // one thing the append-only grants exist to prevent. Handing the trace back
-  // anyway would launder tampering into evidence. Each node is canonicalised
-  // under *its own* envelope, so a node written before a version bump verifies
-  // rather than being reported as tampered.
-  for (const node of nodes) {
-    if (canonicalNodeFormOf(node) !== node.canonical) {
-      throw new TraceTampered(correlationId, node.sequence);
-    }
-  }
-
-  const closed = checkSeal(correlationId, nodes, stored.provenance);
+  const verifier = traceVerifier(correlationId, stored.provenance);
+  for (const node of nodes) verifier.accept(node);
+  const verdict = verifier.finish();
+  const closed = verdict.closed;
 
   const roots: RecordedNode[] = [];
   const children = new Map<string, RecordedNode[]>();
@@ -224,9 +101,6 @@ const replayedCase = (
     else bucket.push(node);
   }
 
-  let digest: string | undefined;
-  const computed = (): string => (digest ??= String(traceDigest(nodes)));
-
   return {
     correlationId,
     provenance: stored.provenance,
@@ -234,7 +108,7 @@ const replayedCase = (
     closed,
     roots: () => roots,
     childrenOf: (id: NodeId) => children.get(id) ?? [],
-    digest: () => computed() as ReturnType<ReplayedCase["digest"]>,
+    digest: () => verdict.digest,
     verify: (expected) => {
       const version = digestVersionOf(String(expected));
       // A digest whose construction this release does not implement is not a
@@ -376,8 +250,68 @@ export const createAudit = ({
   redact,
   onTraceUnavailable,
   limits,
+  witness,
+  alerting,
 }: AuditDeps): Audit => {
   const { maxPayloadBytes } = { ...DEFAULT_LIMITS, ...limits };
+
+  /**
+   * Publish one whole-case digest, checking the receipt against what we asked
+   * for on exactly the reasoning `verifyAcknowledgement` applies to a store.
+   *
+   * `sealed` travels into the error because a caller must be able to tell
+   * "close failed" from "the case is closed and unwitnessed" — different
+   * sentences, and only the second one has an idempotent recovery.
+   */
+  const publish = async (
+    correlationId: CorrelationId,
+    digest: TraceDigest,
+    nodes: number,
+    sealed: boolean,
+  ): Promise<WitnessReceipt> => {
+    if (witness === undefined) {
+      throw new WitnessUnavailable("not-configured", correlationId, { sealed });
+    }
+    const asked: WitnessRecord = {
+      correlationId,
+      digest,
+      nodes,
+      at: clock.now(),
+      witness: witness.id,
+    };
+    let receipt: WitnessReceipt;
+    try {
+      receipt = await witness.publish(asked);
+    } catch (error) {
+      if (error instanceof AuditError) throw error;
+      throw new WitnessUnavailable("witness-failure", correlationId, {
+        cause: error,
+        sealed,
+      });
+    }
+    // Outside the catch on purpose: a witness that broke its contract must not
+    // be able to have that reported as an outage.
+    verifyReceipt(asked, receipt);
+    return receipt;
+  };
+
+  /**
+   * Walk a case to the end and keep only the verdict.
+   *
+   * Bounded: this is how `witness` and `verifyAgainstWitness` work on a
+   * 100,000-node case without materialising it. The nodes are discarded as they
+   * pass, which is the whole point — the verdict is fixed-size.
+   */
+  const verdictOf = async (
+    correlationId: CorrelationId,
+    limits?: Partial<WalkLimits>,
+  ): Promise<TraceVerdict> => {
+    const walk = walkCase(store, correlationId, limits);
+    for (;;) {
+      const step = await walk.next();
+      if (step.done) return step.value;
+    }
+  };
 
   return {
     async open(correlationId) {
@@ -465,6 +399,28 @@ export const createAudit = ({
             options.tier === "high" ||
             onTraceUnavailable[options.tier] === "fail-closed"
           ) {
+            // `docs/CONTEXT.md`, seventh silent condition: *"Fail-closed is
+            // correct AND means work has stopped. Correct behaviour is still an
+            // incident."* Nothing here is broken. A £2M disbursement simply is
+            // not happening, and the only outward sign is a well-named error
+            // that a retry loop will very reasonably swallow.
+            //
+            // Raised at HIGH TIER ONLY, and only for an unavailable store — not
+            // for a payload defect, which is a bug at the call site rather than
+            // an outage, and not at low or medium, where a fail-closed policy is
+            // the application's own declared choice about its own latency.
+            // Paging an operator about a policy working as declared is how the
+            // channel carrying the other seven conditions gets muted.
+            if (options.tier === "high" && failure instanceof TraceUnavailable) {
+              // The record goes onto the error, because the one place this
+              // library normally records an alert — a node on the case's trace —
+              // is the thing that just failed. See `TraceUnavailable.alerting`.
+              failure.alerting = await raiseAndRecord(alerting, {
+                kind: "trace-unavailable-at-high-tier",
+                correlationId,
+                reason: failure.reason,
+              });
+            }
             throw failure;
           }
 
@@ -517,6 +473,34 @@ export const createAudit = ({
             "sealed with bytes that are not the canonical form of the seal it returned",
           );
         }
+
+        // The external witness, published from the seal alone.
+        //
+        // The seal carries the digest of everything before it, so the whole-case
+        // digest is that chain extended by one link — no re-read of a case we
+        // have just written, and byte for byte what `replay(...).digest()`
+        // produces. Publication is necessarily *after* the seal commits, because
+        // the digest does not exist until the seal does. That window is real: a
+        // process dying here leaves a sealed, unwitnessed case. It is handled by
+        // `Audit.witness`, which is idempotent, rather than pretended away.
+        //
+        // Fail-closed, with no policy knob, and the reasoning is the opposite of
+        // `TraceUnavailable`'s. Degrading a write keeps a decision moving;
+        // degrading this keeps nothing moving, because the case is already
+        // sealed and the evidence is already written. It would trade a loud,
+        // cheap, retryable failure for a permanent silent gap in the one
+        // mechanism that catches a total rewrite.
+        if (witness !== undefined) {
+          const closed = closedCaseDigest(seal);
+          if (closed === undefined) {
+            throw new StoreContractViolated(
+              correlationId,
+              "sealed with a payload the whole-case digest cannot be derived from",
+            );
+          }
+          await publish(correlationId, closed.digest, closed.nodes, true);
+        }
+
         return seal;
       };
 
@@ -545,6 +529,33 @@ export const createAudit = ({
       // happened" — those are very different answers to give an auditor.
       if (stored === undefined) throw new NoSuchCase(correlationId);
       return replayedCase(correlationId, stored);
+    },
+
+    walk(correlationId, limits) {
+      return walkCase(store, correlationId, limits);
+    },
+
+    async witness(correlationId, limits) {
+      // The recovery path, and the sweep path. Idempotent: republishing an
+      // identical digest returns the record the witness already holds, so a
+      // sweep over sealed-and-unwitnessed cases can be re-run as often as
+      // anyone likes and a crash between seal and publication costs nothing but
+      // a later run.
+      const verdict = await verdictOf(correlationId, limits);
+      if (!verdict.closed) throw new CaseNotClosed(correlationId);
+      return publish(correlationId, verdict.digest, verdict.nodes, true);
+    },
+
+    async verifyAgainstWitness(correlationId, limits) {
+      if (witness === undefined) {
+        throw new WitnessUnavailable("not-configured", correlationId);
+      }
+      const verdict = await verdictOf(correlationId, limits);
+      if (!verdict.closed) {
+        return { agrees: false, reason: "not-closed", digest: verdict.digest };
+      }
+      const held = await witness.lookUp(correlationId);
+      return witnessVerdict(verdict.digest, held);
     },
   };
 };

@@ -4,7 +4,14 @@ import type { EvalRecorder } from "./recorder.js";
 import { recorderInternals } from "./recorder.js";
 import type { AccuracyCaseStatus, AccuracyReport } from "./report.js";
 import { reopenAccuracyReport } from "./report.js";
-import type { CaseDigest, CaseRef, EvalNodeId, RunId, SourceDigest, SubjectVersion } from "./types.js";
+import type {
+  CaseDigest,
+  CaseRef,
+  EvalNodeId,
+  RunId,
+  SourceDigest,
+  SubjectVersion,
+} from "./types.js";
 
 /**
  * The continuous-integration regression gate.
@@ -65,6 +72,23 @@ export const accept = (input: {
   if (input.report.attribution === "partial") {
     throw new BaselineRefused(
       `${input.report.unattributedCases.length} decision(s) were unattributed`,
+    );
+  }
+  if (input.report.selection !== null) {
+    // **A subset run never advances the baseline.** A pre-merge subset is
+    // deliberately cheap and deliberately incomplete; accepting one as the
+    // standard would silently shrink what every later run is measured against,
+    // and the cases it never selected would stop being compared at all. The
+    // nightly full-suite run is what sets the standard.
+    throw new BaselineRefused(
+      `this report covers the subset "${input.report.selection.label}" (${String(input.report.casesRun)} of ${String(input.report.selection.fromSize)} cases); a subset never advances the baseline`,
+    );
+  }
+  if (input.report.couldNotEvaluateBasisPoints > 0) {
+    // A provider outage is not a standard. Baking one in means every later run
+    // is compared against a run that partly did not happen.
+    throw new BaselineRefused(
+      `${String(input.report.couldNotEvaluateBasisPoints)}bp of cases could not be evaluated (the provider, not the subject)`,
     );
   }
   reopenAccuracyReport(input.report);
@@ -130,7 +154,44 @@ export type GateBlockReason =
   | "edited-cases"
   | "regression"
   | "unscored-rate"
-  | "contested-rate";
+  | "contested-rate"
+  /**
+   * The provider would not serve some of this run. **Not a regression**, and it
+   * is its own reason so it can carry its own exit code: a rate-limit storm that
+   * arrives on the same red line as "your change made something worse" teaches
+   * people to ignore that line.
+   */
+  | "could-not-evaluate"
+  /**
+   * The subject answered differently on re-execution under the same seed.
+   *
+   * Blocking on it is not pedantry. Every other number this module produces —
+   * the baseline, the regression comparison, the replay — assumes that running
+   * the same thing twice gives the same answer. When it does not, the gate is
+   * not measuring the change; it is measuring the weather.
+   */
+  | "non-deterministic-subject";
+
+/**
+ * What the gate actually covered, on the outcome so a green build states it.
+ *
+ * A pre-merge subset that passes is not the same claim as a full suite that
+ * passes, and until this existed there was no way to tell the two apart from a
+ * `GateOutcome`. `notCovered` is enumerated because "these four baseline cases
+ * were not run" is a different sentence from "these four baseline cases were
+ * deleted", and a gate that cannot say which one it means is a gate that will be
+ * argued with.
+ */
+export interface GateCoverage {
+  readonly kind: "full" | "subset";
+  /** The subset's label, or `null` for a full run. */
+  readonly label: string | null;
+  readonly casesRun: number;
+  /** The size of the source this was selected from; equals `casesRun` when full. */
+  readonly suiteSize: number;
+  /** Baseline cases the subset deliberately did not select. Never `dropped`. */
+  readonly notCovered: readonly CaseRef[];
+}
 
 export interface GateCounts {
   readonly regressed: readonly CaseRef[];
@@ -151,6 +212,8 @@ export type GateOutcome =
       readonly gateRun: RunId;
       readonly node: EvalNodeId;
       readonly counts: GateCounts;
+      /** What this pass covered. A green subset build says so on the outcome. */
+      readonly coverage: GateCoverage;
     }
   | {
       readonly kind: "blocked";
@@ -161,6 +224,7 @@ export type GateOutcome =
       readonly gateRun: RunId;
       readonly node: EvalNodeId;
       readonly counts: GateCounts;
+      readonly coverage: GateCoverage;
       /** What to do about it, on the failure line rather than in a wiki. */
       readonly remedy: string;
     };
@@ -228,6 +292,7 @@ export const gate = async (input: GateInput): Promise<GateOutcome> => {
   });
   const gateRun = scope.runId;
 
+  const coverage = coverageOf(report, input.baseline);
   const counts = compare(report, input.baseline);
   const decision = decide(report, input.baseline, input.floors, counts);
 
@@ -246,6 +311,18 @@ export const gate = async (input: GateInput): Promise<GateOutcome> => {
       newCases: counts.newCases.length,
       dropped: counts.dropped.length,
       edited: counts.edited.length,
+      coverageKind: coverage.kind,
+      coverageLabel: coverage.label,
+      coverageCasesRun: coverage.casesRun,
+      coverageSuiteSize: coverage.suiteSize,
+      coverageNotCovered: coverage.notCovered.join(","),
+      determinismChecked: report.determinism.check.kind === "checked",
+      determinismUnstable:
+        report.determinism.check.kind === "checked"
+          ? report.determinism.check.unstable.length
+          : null,
+      couldNotEvaluateBasisPoints: report.couldNotEvaluateBasisPoints,
+      memoisation: report.memoisation.kind,
       baselineSuiteDigest: input.baseline?.suiteDigest ?? null,
       runSuiteDigest: report.suiteDigest,
       attribution: report.attribution,
@@ -262,7 +339,7 @@ export const gate = async (input: GateInput): Promise<GateOutcome> => {
   await scope.finish({ outcome: "ok", closing: {} });
 
   return decision.kind === "passed"
-    ? { kind: "passed", runId: report.runId, gateRun, node: gateNode.id, counts }
+    ? { kind: "passed", runId: report.runId, gateRun, node: gateNode.id, counts, coverage }
     : {
         kind: "blocked",
         reason: decision.reason,
@@ -272,7 +349,38 @@ export const gate = async (input: GateInput): Promise<GateOutcome> => {
         gateRun,
         node: gateNode.id,
         counts,
+        coverage,
       };
+};
+
+/**
+ * What this gate decision covered.
+ *
+ * `notCovered` is the intersection of the baseline's cases with the subset's
+ * `notSelected` list — the baseline cases this run deliberately skipped. It is
+ * the reason `dropped-cases` does not fire on every pre-merge run: deleting a
+ * failing golden case and not selecting it are the same absence, and only the
+ * selection record can tell them apart.
+ */
+const coverageOf = (report: AccuracyReport, baseline: Baseline | undefined): GateCoverage => {
+  const selection = report.selection;
+  if (selection === null) {
+    return {
+      kind: "full",
+      label: null,
+      casesRun: report.casesRun,
+      suiteSize: report.casesRun,
+      notCovered: [],
+    };
+  }
+  const skipped = new Set<string>(selection.notSelected);
+  return {
+    kind: "subset",
+    label: selection.label,
+    casesRun: report.casesRun,
+    suiteSize: selection.fromSize,
+    notCovered: (baseline?.cases ?? []).map((c) => c.ref).filter((ref) => skipped.has(ref)),
+  };
 };
 
 const passing = (status: AccuracyCaseStatus): boolean => status === "correct";
@@ -327,8 +435,13 @@ const compare = (report: AccuracyReport, baseline: Baseline | undefined): GateCo
     else if (!passing(previous.status) && passing(current.status)) improved.push(current.ref);
     else unchanged += 1;
   }
+  // A case absent from the run is `dropped` **unless the subset said so**.
+  // Deleting a failing golden case and not selecting it produce the same
+  // absence, and only the recorded selection distinguishes them — which is why
+  // `notSelected` is enumerated on the report rather than counted.
+  const deliberatelySkipped = new Set<string>(report.selection?.notSelected ?? []);
   for (const previous of baseline.cases) {
-    if (!now.has(previous.ref)) dropped.push(previous.ref);
+    if (!now.has(previous.ref) && !deliberatelySkipped.has(previous.ref)) dropped.push(previous.ref);
   }
   return { regressed, improved, unchanged, newCases, dropped, edited };
 };
@@ -365,6 +478,30 @@ const decide = (
       reason: "partial-run",
       detail: report.partialReason ?? "run stopped early",
       remedy: "raise the run budget or reduce the suite, then re-run; a partial run is a biased sample",
+    };
+  }
+  // Second on purpose, ahead of every quality signal. If the provider would not
+  // serve part of this run, nothing downstream of it is a statement about the
+  // subject, and reporting one of those first would be reporting the weather as
+  // a regression.
+  if (report.couldNotEvaluateBasisPoints > 0) {
+    return {
+      kind: "blocked",
+      reason: "could-not-evaluate",
+      detail: `${report.couldNotEvaluateBasisPoints}bp of cases could not be evaluated: the provider refused or could not be reached`,
+      remedy:
+        "re-run when the provider is serving again — this is not a regression, it exits 2 rather than 1, and nothing about the change under test has been established either way",
+    };
+  }
+  // Third. Every number below this line — the baseline, the comparison, the
+  // replay — assumes running the same thing twice gives the same answer.
+  if (report.determinism.check.kind === "checked" && report.determinism.check.unstable.length > 0) {
+    return {
+      kind: "blocked",
+      reason: "non-deterministic-subject",
+      detail: `re-executed under the same seed, the subject answered differently on ${String(report.determinism.check.unstable.length)} of ${String(report.determinism.check.sampled.length)} sampled case(s): ${report.determinism.check.unstable.join(", ")}`,
+      remedy:
+        "pin the subject's own sources of variation — temperature, iteration order, ambient time, an unseeded shuffle — and use ctx.seed; until then a regression figure over this subject is measuring the weather",
     };
   }
   // `declared-pure` is exempt from the coverage floor and from nothing else. A

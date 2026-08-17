@@ -442,24 +442,57 @@ const hash = (chunks: readonly (Buffer | string)[]): Buffer => {
 };
 
 /**
+ * A digest construction, expressed as a **fold** rather than as a function over
+ * a whole array.
+ *
+ * That is not a stylistic choice. Splitting the construction into a genesis
+ * value and a single step is what makes three things possible at once, all with
+ * byte-identical results:
+ *
+ *   - `traceDigest(nodes)` — the whole-case digest, unchanged.
+ *   - `walk` — a 100,000-node case digested incrementally, holding one page of
+ *     nodes rather than the case (see `lib/stream.ts`).
+ *   - `extendDigest` — the digest of a sealed case computed from the seal alone,
+ *     because the seal already carries the digest of everything before it. That
+ *     is what lets `close` publish a whole-case digest to a witness without
+ *     reading back the case it has just written.
+ *
+ * A construction that could only be evaluated over a materialised array would
+ * force the third to re-read the case under the close lock, which is the cost
+ * the streaming work exists to remove.
+ */
+interface DigestConstruction {
+  /** The digest of zero nodes. "No nodes" is a verifiable claim, not a gap. */
+  genesis(): Buffer;
+  /** One link of the chain. */
+  step(running: Buffer, node: RecordedNode): Buffer;
+}
+
+/**
  * `aoc.audit.trace.v1` — a hash chain in store-assigned sequence order, seeded
  * with the version string, each node separated by an ASCII record separator.
  */
-const traceDigestV1 = (nodes: readonly RecordedNode[]): string => {
-  const ordered = [...nodes].sort((a, b) => a.sequence - b.sequence);
-  let running = hash(["aoc.audit.trace.v1"]);
-  for (const node of ordered) {
-    running = hash([running, SEPARATOR, canonicalNodeFormOf(node)]);
-  }
-  return running.toString("hex");
+const traceDigestV1: DigestConstruction = {
+  genesis: () => hash(["aoc.audit.trace.v1"]),
+  step: (running, node) => hash([running, SEPARATOR, canonicalNodeFormOf(node)]),
 };
 
-const DIGESTS: Readonly<Record<string, (nodes: readonly RecordedNode[]) => string>> = {
+const DIGESTS: Readonly<Record<string, DigestConstruction>> = {
   "aoc.audit.trace.v1": traceDigestV1,
 };
 
 /** The digest constructions this release implements. */
 export const KNOWN_DIGEST_VERSIONS: readonly string[] = Object.keys(DIGESTS).sort();
+
+/** `version:algorithm:hex`. The version is inside the string, always. */
+const renderDigest = (version: string, running: Buffer): TraceDigest =>
+  `${version}:${DIGEST_ALGORITHM}:${running.toString("hex")}` as TraceDigest;
+
+const constructionOf = (version: string, context: string): DigestConstruction => {
+  const construction = DIGESTS[version];
+  if (construction === undefined) throw new UnknownEnvelope(version, context);
+  return construction;
+};
 
 /**
  * Content digest over a trace, so tampering is detectable.
@@ -478,14 +511,59 @@ export const KNOWN_DIGEST_VERSIONS: readonly string[] = Object.keys(DIGESTS).sor
  * string, so "no nodes" is a verifiable claim rather than a missing one.
  */
 export const traceDigest = (
-  nodes: readonly RecordedNode[],
+  nodes: readonly NodeForDigest[],
   version: string = TRACE_DIGEST_VERSION,
 ): TraceDigest => {
-  const construction = DIGESTS[version];
-  if (construction === undefined) {
-    throw new UnknownEnvelope(version, String(nodes[0]?.correlationId ?? "(empty)"));
+  const construction = constructionOf(
+    version,
+    String(nodes[0]?.correlationId ?? "(empty)"),
+  );
+  const ordered = [...nodes].sort((a, b) => a.sequence - b.sequence);
+  let running = construction.genesis();
+  for (const node of ordered) running = construction.step(running, node);
+  return renderDigest(version, running);
+};
+
+/**
+ * `traceDigest` accepts any node-shaped value the canonicaliser can read. It is
+ * spelled out rather than left as `RecordedNode` so that a caller holding a
+ * decoded node — one rebuilt from bytes by an independent auditor, say — can
+ * recompute without first satisfying an interface it has no reason to know.
+ */
+export type NodeForDigest = RecordedNode;
+
+/** The digest of a case with no nodes yet, under a named construction. */
+export const digestGenesis = (
+  version: string = TRACE_DIGEST_VERSION,
+): TraceDigest => renderDigest(version, constructionOf(version, "(empty)").genesis());
+
+/**
+ * Extend a digest by one node, producing the digest of the same nodes plus that
+ * one. `extendDigest(traceDigest(ns), n)` is `traceDigest([...ns, n])`, byte for
+ * byte, provided `n` sorts last — which for a seal it always does.
+ *
+ * The version is read out of the digest handed in, never assumed, so a chain
+ * begun under an older construction is continued under that same construction
+ * rather than silently switched to whatever this release currently writes.
+ */
+export const extendDigest = (
+  digest: TraceDigest,
+  node: RecordedNode,
+): TraceDigest => {
+  const parts = String(digest).split(":");
+  const [version, algorithm, hex] = parts;
+  const context = String(node.correlationId);
+  if (parts.length !== 3 || version === undefined || hex === undefined) {
+    throw new UnknownEnvelope(String(digest).slice(0, 32), context);
   }
-  return `${version}:${DIGEST_ALGORITHM}:${construction(nodes)}` as TraceDigest;
+  const construction = constructionOf(version, context);
+  if (algorithm !== DIGEST_ALGORITHM) {
+    throw new UnknownEnvelope(`${version}:${String(algorithm)}`, context);
+  }
+  if (!/^[0-9a-f]+$/.test(hex) || hex.length % 2 !== 0) {
+    throw new UnknownEnvelope(version, context);
+  }
+  return renderDigest(version, construction.step(Buffer.from(hex, "hex"), node));
 };
 
 /** The construction named inside a digest string, if this release knows it. */

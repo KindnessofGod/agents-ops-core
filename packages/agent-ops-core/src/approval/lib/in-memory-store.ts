@@ -20,6 +20,10 @@ import type {
  *
  *   - **Records are frozen on write.** A caller holding a returned record
  *     cannot mutate the store through it.
+ *   - **`saveSuspension` is insert-if-absent.** A second save for an id that
+ *     already exists is a no-op rather than an overwrite: an overwrite resets
+ *     `revision`, and a reset revision turns a lost compare-and-set into a
+ *     silent clobber of somebody else's answer.
  *   - **Updates are compare-and-swap on `revision`.** Two writers to one
  *     suspension — a `sweep` and an `answer` arriving in the same second — are
  *     correct without a lock. No lock is ever held across the human gate,
@@ -34,11 +38,11 @@ import type {
  *     because no outbound call was made, and an expired lease on `unknown` is
  *     never reclaimed for execution, whatever its age.
  *
- * A second adapter is named and not built here: `postgresApprovalStore`,
- * alongside `audit`'s Postgres trace store, sharing one connection so that a
- * suspension and its trace node can commit together. Until it exists this seam
- * has one adapter and is, by the project's own rule, hypothetical. Reported as
- * such rather than dressed up.
+ * The second adapter is `postgresApprovalStore`, in `postgres-store.ts`. That
+ * one carries a suspension across **process death**; this one carries it across
+ * a runtime restart over the same object. Both are deliverables and the
+ * difference between them is stated rather than blurred: an in-process `Map`
+ * survives a rebuilt runtime and does not survive a killed process.
  */
 export const inMemoryApprovalStore = (): ApprovalStore => {
   const suspensions = new Map<SuspensionId, SuspensionRecord>();
@@ -49,11 +53,24 @@ export const inMemoryApprovalStore = (): ApprovalStore => {
 
   return {
     async saveSuspension(record) {
+      // Insert-if-absent, matching the Postgres adapter's
+      // `ON CONFLICT (id) DO NOTHING`. First write wins.
+      if (suspensions.has(record.id)) return;
       suspensions.set(record.id, freeze(record));
     },
 
     async loadSuspension(id) {
       return suspensions.get(id);
+    },
+
+    async suspensionsOf(correlationId, limit) {
+      const out: SuspensionRecord[] = [];
+      for (const record of suspensions.values()) {
+        if (record.correlationId !== correlationId) continue;
+        out.push(record);
+        if (out.length >= limit) break;
+      }
+      return out;
     },
 
     async swapSuspension(id, expectedRevision, next) {
@@ -66,8 +83,12 @@ export const inMemoryApprovalStore = (): ApprovalStore => {
     async dueSuspensions(now: Instant, limit: number) {
       const due: SuspensionRecord[] = [];
       for (const record of suspensions.values()) {
-        if (record.state !== "awaiting") continue;
-        const expired = record.expiresAt !== null && record.expiresAt <= now;
+        // `held` is due as well as `awaiting`. A kill-switch hold is resumable,
+        // and a case the sweep stopped visiting when the switch went on is a
+        // case nobody comes back to after the incident.
+        if (record.state !== "awaiting" && record.state !== "held") continue;
+        const expired =
+          record.state === "awaiting" && record.expiresAt !== null && record.expiresAt <= now;
         if (!expired && record.nextDueAt > now) continue;
         due.push(record);
       }

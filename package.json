@@ -14,7 +14,8 @@
     "test": "vitest run --passWithNoTests",
     "test:watch": "vitest",
     "lint:boundaries": "depcruise packages/agent-ops-core/src",
-    "check": "npm run typecheck && npm run lint:boundaries && npm run test",
+    "lint:vocabulary": "node scripts/lint-vocabulary.mjs",
+    "check": "npm run typecheck && npm run lint:boundaries && npm run lint:vocabulary && npm run test",
     "db:up": "docker compose up -d --wait",
     "db:down": "docker compose down",
     "db:reset": "docker compose down -v && docker compose up -d --wait"

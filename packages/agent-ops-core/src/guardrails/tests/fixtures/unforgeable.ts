@@ -19,6 +19,7 @@ import type {
   DetectorReport,
   Findings,
   Guardrails,
+  Pattern,
   Screening,
   ScreenedPayload,
   Source,
@@ -83,16 +84,40 @@ export const emptyFind: DetectorReport = { outcome: "found", findings: [], costT
 export const selfDiagnosis: DetectorReport = { outcome: "unavailable", reason: "timed-out", detail: "not my call to make" };
 
 /* 8. A detector receives no client, no store, no recorder and no clock. There
-      is nothing in a subject to have an effect with. */
-export const noCapability: Detector["screen"] = (subject) => {
+      is nothing in a subject to have an effect with. `deadline` is the one thing
+      added since, and it is a one-bit oracle rather than a clock: it answers
+      "is my budget spent" and cannot be asked what time it is. */
+export const noCapability: Detector["screen"] = async (subject) => {
   // @ts-expect-error a ScreeningSubject carries no client of any kind
   subject.client;
   // @ts-expect-error nor a recorder
   subject.recorder;
   // @ts-expect-error nor a clock
   subject.clock;
+  // @ts-expect-error and the deadline is not one either — no `now`
+  subject.deadline.now;
+  subject.deadline.expired();
   return { outcome: "searched-and-found-none", costTenthCents: 0, modelCalls: 0 };
 };
+
+/* 12. A detector cannot be synchronous. A synchronous body never yields, so the
+       engine's race against the budget was not scheduled until after it had
+       already finished — which made the budget a bound on the answer and on
+       nothing else. Requiring a promise does not by itself bound a
+       central-processing-unit-bound body, and the interface says so; what it
+       does is stop a detector being written in the one shape that cannot be
+       raced at all. */
+// prettier-ignore
+// @ts-expect-error screen must return a promise
+export const synchronous: Detector["screen"] = () => ({ outcome: "searched-and-found-none", costTenthCents: 0, modelCalls: 0 });
+
+/* 13. A `Pattern` cannot be written down. `safePattern` is the only mint, and it
+       refuses a regular expression capable of exponential backtracking — so a
+       pack cannot carry `(a+)+` past the analyser by declaring it as a literal
+       instead of minting it. */
+// prettier-ignore
+// @ts-expect-error a Pattern is branded and only safePattern mints one
+export const forgedPattern: Pattern = { rule: "sneaky", match: /(a+)+$/g, confidenceBasisPoints: 9_000, covers: "personal-data.name" };
 
 /* 9. A model call cannot decline to say what it consumed. C2 names four things
       per node — cost, tokens, latency and the price-table version — and a cost

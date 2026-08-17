@@ -7,13 +7,20 @@ import {
   TraceUnavailable,
 } from "./errors.js";
 import { SEAL_REDACTION, SEAL_TIER, isReservedKind, sealPayload } from "./seal.js";
+import { closedCaseDigest } from "./witness.js";
 import type {
   AppendInput,
   CorrelationId,
+  ExpiredCase,
   NodeId,
   NodeTelemetry,
   RecordedNode,
+  RetentionPage,
+  RetentionQuery,
+  RetentionRegister,
   StoredCase,
+  TracePage,
+  TracePageRequest,
   TraceProvenance,
   TraceStore,
   UnassistedContainment,
@@ -86,7 +93,7 @@ const DEFAULT_LIMITS: InMemoryStoreLimits = {
  * it cannot touch a node, cannot touch an open case, and has no counterpart in
  * Postgres because Postgres is the archive and this is not.
  */
-export interface InMemoryTraceStore extends TraceStore {
+export interface InMemoryTraceStore extends TraceStore, RetentionRegister {
   /** How many cases are currently retained. */
   readonly size: number;
   /**
@@ -291,6 +298,27 @@ export const inMemoryTraceStore = (
       if (state === undefined) return undefined;
       return { provenance: state.provenance, nodes: [...state.nodes] };
     },
+
+    async readPage(request: TracePageRequest): Promise<TracePage | undefined> {
+      const state = cases.get(request.correlationId);
+      if (state === undefined) return undefined;
+
+      // Sequences are dense and assigned by position here, so the cursor is an
+      // index rather than a scan. That is a property of this adapter, not of
+      // the seam: the Postgres adapter uses `sequence > $2` and gets the same
+      // answer from an index range scan.
+      const from = request.afterSequence === undefined ? 0 : request.afterSequence + 1;
+      const limit = Math.max(request.limit, 0);
+      const start = Math.min(Math.max(from, 0), state.nodes.length);
+      const end = Math.min(start + limit, state.nodes.length);
+      return {
+        provenance: state.provenance,
+        nodes: state.nodes.slice(start, end),
+        // Stated, not inferred from `nodes.length === limit`: that inference is
+        // wrong exactly when a case ends on a page boundary.
+        more: end < state.nodes.length,
+      };
+    },
   });
 
   return {
@@ -298,6 +326,48 @@ export const inMemoryTraceStore = (
     get size() {
       return cases.size;
     },
+
+    /**
+     * The retention register, implemented here rather than in a separate
+     * adapter because the data it reads is the data this object already holds.
+     *
+     * It is the second adapter of `RetentionRegister`, which is what makes that
+     * a real seam — and it is a deliverable rather than a convenience: it is
+     * what lets an application test its own expiry procedure, including the
+     * clearance step, without a database. Note what it still does not do:
+     * nothing here removes a case either. `releaseClosed` drops a case from
+     * *this process's working set*, which is a different act with a different
+     * name, and it exists because this adapter is a working set and not an
+     * archive.
+     */
+    async dueForRemoval(query: RetentionQuery): Promise<RetentionPage> {
+      const limit = Math.max(query.limit, 0);
+      const after = query.afterCorrelationId;
+      const due: ExpiredCase[] = [];
+
+      const ordered = [...cases.entries()].sort(([a], [b]) =>
+        String(a) < String(b) ? -1 : String(a) > String(b) ? 1 : 0,
+      );
+      for (const [correlationId, state] of ordered) {
+        if (after !== undefined && String(correlationId) <= String(after)) continue;
+        if (state.sealedAt === undefined) continue;
+        const seal = state.nodes[state.sealedAt];
+        if (seal === undefined || seal.at >= query.closedBefore) continue;
+        const closed = closedCaseDigest(seal);
+        if (closed === undefined) continue;
+        // limit + 1 so `more` is stated from a fact rather than inferred from a
+        // full page — the inference is wrong exactly on a page boundary.
+        if (due.length === limit) return { cases: due, more: true };
+        due.push({
+          correlationId,
+          closedAt: seal.at,
+          nodes: closed.nodes,
+          digest: closed.digest,
+        });
+      }
+      return { cases: due, more: false };
+    },
+
     releaseClosed(max: number): number {
       let released = 0;
       for (const [correlationId, state] of cases) {

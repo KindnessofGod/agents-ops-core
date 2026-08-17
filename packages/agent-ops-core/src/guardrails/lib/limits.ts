@@ -16,15 +16,21 @@ import type { Limits } from "./types.js";
  *
  * ## What these bounds do not reach, counted honestly
  *
- * "No unbounded anything" was too strong, and three things escaped it. Two are
- * now bounded and the third cannot be, in this runtime:
+ * "No unbounded anything" was too strong, and three things escaped it. All three
+ * are now bounded, and the first is bounded in a smaller way than the sentence
+ * that replaced it might suggest:
  *
- *   - **A synchronous detector's work.** `detectorBudgetMicros` bounds the
- *     *answer* — an overrun is measured against the injected clock and recorded
- *     `unavailable/timed-out`, so the screening fails closed deterministically.
- *     It does not bound the work: a synchronous body never yields, so nothing
- *     can preempt a catastrophically backtracking regular expression in a
- *     caller-supplied pattern pack. See `lib/detectors.ts`.
+ *   - **A detector's work, not only its answer.** `detectorBudgetMicros` bounds
+ *     the answer — an overrun is measured against the injected clock and
+ *     recorded `unavailable/timed-out`, so the screening fails closed
+ *     deterministically. It now also bounds the work, on two further axes:
+ *     `Pattern` cannot be built from a regular expression capable of exponential
+ *     backtracking, and every detector is handed a `deadline` over the same
+ *     injected clock which both shipped adapters check between units of work.
+ *     What is left is a **polynomial** worst case for one accepted pattern over
+ *     one field — on the order of `maxFieldChars²` character comparisons, which
+ *     is the term to halve if a stall is ever measured. `lib/safe-pattern.ts`
+ *     gives the full accounting; `lib/detectors.ts` gives the mechanism.
  *   - **A judge's model calls.** `maxClaims` bounds the count and the budget is
  *     now divided across them rather than discarded, so each call is asked for a
  *     bound. A classifier that ignores its `budgetMicros` is bounded by nothing

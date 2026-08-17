@@ -79,6 +79,27 @@ export class CaseAlreadyClosed extends AuditError {
 export class TraceUnavailable extends AuditError {
   override readonly name = "TraceUnavailable";
   override readonly degradable = true;
+  /**
+   * What became of the `trace-unavailable-at-high-tier` alert, where one was
+   * raised — and it is raised only at high tier, only where the write was
+   * refused rather than degraded.
+   *
+   * **It lives on the error because there is nowhere else for it to live.** Every
+   * other alert in this library is recorded as a node on the case's own trace.
+   * This condition is precisely the one where the trace could not be written, so
+   * a node is not available by definition, and putting the record somewhere
+   * less honest — a counter, a log line — would be inventing a second evidence
+   * store for the case where the first one is down.
+   *
+   * `undefined` means no alert was raised: either the write was degraded (which
+   * is the policy working, not an incident) or the tier was not high. It does
+   * **not** mean the raise failed; a raise that reached nobody is
+   * `alerted: "undelivered"`, which is a fact and is recorded as one.
+   *
+   * Assigned once, at construction time, before the error is thrown — so a
+   * caller holding the exception is holding the whole story.
+   */
+  alerting?: import("../../alerts/index.js").AlertRecord | undefined;
   constructor(
     readonly reason: TraceUnavailableReason,
     readonly correlationId: string,
@@ -352,6 +373,116 @@ export type TraceIncoherenceReason =
   | "provenance-mismatch"
   /** The seal payload is missing a field the library always writes. */
   | "seal-malformed";
+
+/**
+ * A case was asked to be witnessed, or to be cleared for removal, before it was
+ * sealed.
+ *
+ * Fail-closed, not degradable. A witness attests to a finished case: an open one
+ * has no final digest, because the next append changes it. Publishing a digest
+ * that is about to be superseded would produce a `WitnessConflict` at the real
+ * close — an alarm raised by correct behaviour, which is the fastest way to
+ * teach an operations team to ignore the alarm.
+ */
+export class CaseNotClosed extends AuditError {
+  override readonly name = "CaseNotClosed";
+  override readonly degradable = false;
+  constructor(readonly correlationId: string) {
+    super(`case is not closed and cannot be witnessed: ${correlationId}`);
+  }
+}
+
+/** Why the external witness could not take, or answer about, a publication. */
+export type WitnessUnavailableReason =
+  /** The witness adapter itself failed — connection, timeout, driver fault. */
+  | "witness-failure"
+  /** The in-memory witness has hit its bounded record ceiling. */
+  | "capacity"
+  /**
+   * No witness was wired at the composition root. Named rather than silently
+   * skipped: a library that quietly does nothing when its witness is missing
+   * gives nineteen applications a guarantee that depends on a line of wiring
+   * nobody checks.
+   */
+  | "not-configured";
+
+/**
+ * The external witness could not be reached, so a sealed case is unwitnessed.
+ *
+ * **Fail-closed, at every tier, and not degradable — and the reasoning here is
+ * the opposite of `TraceUnavailable`'s, deliberately.** A trace that cannot take
+ * a write may lawfully be degraded below high tier because the alternative is
+ * stalling a decision. A witness that cannot take a publication stalls nothing:
+ * the case is already sealed, the evidence is already written, and the only
+ * thing lost is the external copy of the digest. Degrading here would trade a
+ * loud, cheap, retryable failure for a permanent silent gap in exactly the
+ * mechanism that exists to catch a total rewrite. There is no policy knob for
+ * this and there is deliberately not going to be one.
+ *
+ * `sealed` is on the error because a caller must be able to tell "close failed"
+ * from "the case is closed and unwitnessed". The recovery is
+ * `Audit.witness(correlationId)`, which is idempotent — **not** a second
+ * `close`, which raises `CaseAlreadyClosed` and is correct to.
+ */
+export class WitnessUnavailable extends AuditError {
+  override readonly name = "WitnessUnavailable";
+  override readonly degradable = false;
+  /** True where the seal was written and only the publication failed. */
+  readonly sealed: boolean;
+  constructor(
+    readonly reason: WitnessUnavailableReason,
+    readonly correlationId: string,
+    options?: { readonly cause?: unknown; readonly sealed?: boolean },
+  ) {
+    super(
+      `external witness unavailable (${reason}) for case ${correlationId}`,
+      options as ErrorOptions,
+    );
+    this.sealed = options?.sealed ?? false;
+  }
+}
+
+/**
+ * The witness already holds a **different** digest for this case.
+ *
+ * Fail-closed, never degradable, and the loudest thing in this file. The witness
+ * table is append-only with one row per case, so this cannot be resolved by
+ * writing again — and it should not be. Exactly one of two things has happened:
+ * the trace was rewritten after it was witnessed, or two different traces are
+ * claiming one correlation identifier. Both are incidents; neither is a retry.
+ */
+export class WitnessConflict extends AuditError {
+  override readonly name = "WitnessConflict";
+  override readonly degradable = false;
+  constructor(
+    readonly correlationId: string,
+    readonly witnessed: string,
+    readonly offered: string,
+  ) {
+    super(
+      `case ${correlationId} was witnessed as ${witnessed}; this trace digests to ${offered}`,
+    );
+  }
+}
+
+/**
+ * A witness adapter broke the seam contract: it receipted a record it was not
+ * asked to publish, or answered with a row it cannot have held.
+ *
+ * Fail-closed, not degradable, on the same reasoning as `StoreContractViolated`.
+ * A witness that acknowledges without recording is worse than no witness, because
+ * every later verification reports agreement.
+ */
+export class WitnessContractViolated extends AuditError {
+  override readonly name = "WitnessContractViolated";
+  override readonly degradable = false;
+  constructor(
+    readonly correlationId: string,
+    readonly detail: string,
+  ) {
+    super(`witness broke its contract for case ${correlationId}: ${detail}`);
+  }
+}
 
 /**
  * The trace's rows are each self-consistent but do not form the trace they

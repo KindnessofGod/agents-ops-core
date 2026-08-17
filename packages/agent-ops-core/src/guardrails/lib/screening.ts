@@ -1,5 +1,6 @@
 import type { NodeId, NodePayload, NodeTelemetry, RiskTier } from "../../audit/index.js";
 import { GUARDRAILS_PAYLOAD_VERSION as V, NODE, digest, isBasisPoints } from "./canonical.js";
+import { aggregateCoverage, type DetectorCoverage } from "./coverage.js";
 import {
   DetectorReportInvalid,
   ScreeningLimitExceeded,
@@ -7,6 +8,7 @@ import {
 } from "./errors.js";
 import { SETTLED_NODE } from "./mint.js";
 import type { Recorder } from "./recorder.js";
+import { MASK } from "./types.js";
 import {
   frozenSources,
   frozenView,
@@ -16,6 +18,8 @@ import {
 } from "./subject.js";
 import type {
   Clock,
+  CoverageDepth,
+  Deadline,
   Detector,
   DetectorReport,
   DetectorRun,
@@ -32,10 +36,14 @@ import type {
   Payload,
   RecommendedDisposition,
   Screening,
+  ScreeningCoverage,
   ScreeningPhase,
   Sources,
   Timer,
 } from "./types.js";
+
+/** Names the arithmetic in `ScreeningCoverage`. A change to it is a new name. */
+const COVERAGE_RULE = "guardrails.coverage.v1";
 
 declare const SCREENING_MINT: unique symbol;
 
@@ -205,6 +213,9 @@ export const runScreening = async (run: ScreeningRun): Promise<Screening> => {
     drafts: [],
     grounds: [],
     searched: [],
+    examined: new Set<string>(),
+    declared: [],
+    undeclared: 0,
   };
 
   // ---- Pass 1: the deterministic round, over the caller's text --------------
@@ -226,6 +237,7 @@ export const runScreening = async (run: ScreeningRun): Promise<Screening> => {
   const masked = {
     fields: secondMask.fields,
     maskedSites: firstMask.maskedSites + secondMask.maskedSites,
+    maskedCodeUnits: firstMask.maskedCodeUnits + secondMask.maskedCodeUnits,
   };
 
   // **Grounds are built from every draft, not from the kept list.** Truncating
@@ -261,20 +273,38 @@ export const runScreening = async (run: ScreeningRun): Promise<Screening> => {
     kind: NODE.payload,
     v: V,
     maskedSites: masked.maskedSites,
+    maskedCodeUnits: masked.maskedCodeUnits,
     fieldCount: fields.length,
     recordedFieldChars: limits.maxRecordedFieldChars,
   };
+  /**
+   * How much caller text this screening writes into a seven-year archive
+   * unmasked. Counted while it is being written, which is the only place the
+   * number is exact: after masking and after truncation.
+   */
+  let verbatimCodeUnitsRecorded = 0;
   for (const field of fields) {
     const value = masked.fields[field] as string;
     // The **detected sites** never reach a store: what is recorded here is the
     // masked form, bounded, and the digest covers the whole masked value so
     // truncation is visible rather than silent. Text no detector flagged is
-    // recorded verbatim — see `subject.ts` for that residual risk and the two
-    // things that shrink it.
-    payloadNode[`f.${field}`] = value.slice(0, limits.maxRecordedFieldChars);
+    // recorded verbatim — see `subject.ts` for that residual risk, and
+    // `Screening.coverage` for how much of it there was.
+    const recorded = value.slice(0, limits.maxRecordedFieldChars);
+    payloadNode[`f.${field}`] = recorded;
     payloadNode[`d.${field}`] = digest(value);
+    verbatimCodeUnitsRecorded += recorded.length - countMasks(recorded) * MASK.length;
   }
   await recorder.record(payloadNode as unknown as NodePayload, tier, opened.id);
+
+  const coverage = summariseCoverage(
+    payload,
+    fields,
+    totalChars,
+    masked,
+    verbatimCodeUnitsRecorded,
+    state,
+  );
 
   const cost = state.runs.reduce(
     (acc, r) => ({
@@ -313,6 +343,24 @@ export const runScreening = async (run: ScreeningRun): Promise<Screening> => {
       costUnmeasuredDetectors: cost.unmeasuredDetectors,
       // Wall-clock across the whole screening, from the injected clock.
       latencyMicros: wallMicros,
+      // ---- Coverage. What was looked at, by what, and what went in anyway ----
+      // Recorded on the settled node so the trace answers "how much of this
+      // payload did anybody actually screen?" without the reader having to
+      // reconstruct it from detector nodes. `recommend=allow` beside
+      // `coverageExaminedBasisPoints=0` is a different sentence from
+      // `recommend=allow` beside 10000, and the two used to be identical rows.
+      coverageRule: coverage.rule,
+      coverageExaminedBasisPoints: coverage.examinedBasisPoints,
+      coverageExaminedCodeUnits: coverage.examinedCodeUnits,
+      coverageTotalCodeUnits: coverage.totalCodeUnits,
+      coverageUnexaminedFields: coverage.unexaminedFields.join(","),
+      coverageDepth: coverage.depth,
+      maskedCodeUnits: coverage.maskedCodeUnits,
+      verbatimCodeUnitsRecorded: coverage.verbatimCodeUnitsRecorded,
+      coverageCovers: coverage.declared.covers.join(","),
+      coveragePartial: coverage.declared.partial.map((n) => n.category).join(","),
+      coverageGaps: coverage.declared.gaps.map((n) => n.category).join(","),
+      coverageUndeclaredDetectors: coverage.declared.undeclared,
     },
     tier,
     opened.id,
@@ -357,6 +405,7 @@ export const runScreening = async (run: ScreeningRun): Promise<Screening> => {
     findings,
     recommended,
     cost: { ...cost, latencyMicros: wallMicros },
+    coverage,
     payload: mintScreenedPayload(masked.fields, masked.maskedSites),
   }) as unknown as Screening & { readonly [SCREENING_MINT]?: never };
 };
@@ -368,6 +417,16 @@ interface PassState {
   readonly drafts: Finding[];
   readonly grounds: Ground[];
   readonly searched: string[];
+  /**
+   * Fields at least one **completing** detector examined. A detector that was
+   * unavailable examined nothing, whatever it was configured for: an outage
+   * that improved the coverage figure would be the reverse of the point.
+   */
+  readonly examined: Set<string>;
+  /** Declarations from completing detectors only, for the same reason. */
+  readonly declared: DetectorCoverage[];
+  /** Completing detectors that declared no scope at all. */
+  undeclared: number;
 }
 
 /**
@@ -491,6 +550,13 @@ const runOne = async (
         latencyMicros,
         overBudget,
         modelCalls,
+        // Written on this branch too, at zero, so a detector node has one shape
+        // whatever its outcome. A reader in 2033 comparing rows should not have
+        // to know that an absent key means an outage rather than a field that
+        // was added later.
+        examinedFields: "",
+        examinedFieldCount: 0,
+        covers: detector.declares === undefined ? "" : [...detector.declares.covers].sort().join(","),
       },
       tier,
       parent,
@@ -526,6 +592,17 @@ const runOne = async (
   validateCosts(detector.id, observed.costTenthCents, observed.modelCalls, observed.spend);
   const found = observed.outcome === "found" ? observed.findings : [];
   for (const draft of found) validateDraft(detector.id, draft, view);
+  // Which fields this detector actually looked at. Absent means all of them;
+  // a name that was never in the view is a claim about a search nobody ran.
+  const examined = observed.examinedFields ?? Object.keys(view);
+  for (const field of examined) {
+    if (!(field in view)) {
+      throw new DetectorReportInvalid(
+        detector.id,
+        `claims to have examined field ${field}, which it was not shown`,
+      );
+    }
+  }
 
   const node = await recorder.record(
     {
@@ -542,6 +619,13 @@ const runOne = async (
       latencyMicros,
       overBudget,
       modelCalls: observed.modelCalls,
+      // Field **names**, never content, and the count beside them so a reader
+      // with a truncated list still knows whether the payload was fully seen.
+      examinedFields: examined.join(","),
+      examinedFieldCount: examined.length,
+      // What this detector says it covers. Recorded per detector as well as per
+      // screening, because a set is wired once and read for seven years.
+      covers: detector.declares === undefined ? "" : [...detector.declares.covers].sort().join(","),
     },
     tier,
     parent,
@@ -560,7 +644,87 @@ const runOne = async (
     ...(observed.spend === undefined ? {} : { spend: observed.spend }),
   });
   state.searched.push(detector.searches);
+  for (const field of examined) state.examined.add(field);
+  if (detector.declares === undefined) state.undeclared += 1;
+  else state.declared.push(detector.declares);
   for (const draft of found) state.drafts.push({ ...draft, detector: detector.id, space });
+};
+
+/** How many `MASK` markers a recorded string carries. See `verbatim…` below. */
+const countMasks = (recorded: string): number => {
+  let count = 0;
+  let at = recorded.indexOf(MASK);
+  while (at !== -1) {
+    count += 1;
+    at = recorded.indexOf(MASK, at + MASK.length);
+  }
+  return count;
+};
+
+/**
+ * What was looked at, by what, and what went into the trace anyway.
+ *
+ * ## Why this is the module's own arithmetic and not a detector's opinion
+ *
+ * Every figure below is computed by the engine from things it observed: the
+ * fields it handed over, the detectors that came back, the sites it masked
+ * itself, and the characters it wrote. The one input that comes from a detector
+ * is `examinedFields`, and it is validated against the view the detector was
+ * actually shown — a detector cannot claim a field it never saw, though it can
+ * of course decline to look at one it did. That residual is the same trust the
+ * module already extends to `searched-and-found-none`, and it is smaller than
+ * the alternative: before this, a detector configured for one field of six
+ * produced a screening that read as though all six had been searched.
+ *
+ * ## The one number deliberately not computed
+ *
+ * There is no probability that the payload is clean. It cannot be estimated from
+ * anything here — it depends on the text nobody recognised — and a plausible
+ * number in that slot would be believed, cited, and put on a dashboard. What is
+ * reported is what was measured; the reader has the payload and can decide.
+ */
+const summariseCoverage = (
+  payload: Payload,
+  fields: readonly string[],
+  totalCodeUnits: number,
+  masked: { readonly maskedSites: number; readonly maskedCodeUnits: number },
+  verbatimCodeUnitsRecorded: number,
+  state: PassState,
+): ScreeningCoverage => {
+  const unexamined = fields.filter((field) => !state.examined.has(field));
+  let examinedCodeUnits = 0;
+  for (const field of fields) {
+    if (state.examined.has(field)) examinedCodeUnits += (payload[field] as string).length;
+  }
+  const completing = state.runs.filter((r) => r.outcome !== "unavailable");
+  const deterministic = completing.filter((r) => r.costClass === "deterministic").length;
+  const model = completing.filter((r) => r.costClass === "model").length;
+  const depth: CoverageDepth =
+    deterministic > 0 && model > 0
+      ? "deterministic-and-model"
+      : model > 0
+        ? "model"
+        : deterministic > 0
+          ? "deterministic"
+          : "none";
+  return Object.freeze({
+    rule: COVERAGE_RULE,
+    examinedCodeUnits,
+    totalCodeUnits,
+    // An empty payload is fully examined, which is true and uninteresting; the
+    // alternative is a division by zero reported as a coverage failure.
+    examinedBasisPoints:
+      totalCodeUnits === 0 ? 10_000 : Math.floor((examinedCodeUnits * 10_000) / totalCodeUnits),
+    unexaminedFields: Object.freeze([...unexamined].sort()),
+    maskedSites: masked.maskedSites,
+    maskedCodeUnits: masked.maskedCodeUnits,
+    verbatimCodeUnitsRecorded,
+    depth,
+    deterministicDetectors: deterministic,
+    modelDetectors: model,
+    unavailableDetectors: state.runs.length - completing.length,
+    declared: aggregateCoverage(state.declared, state.undeclared),
+  });
 };
 
 /**
@@ -614,30 +778,35 @@ const screeningTelemetry = (
  * None of them is retried — see `limits.ts` for why a hidden retry is worse
  * than a visible re-screen.
  *
- * ## What the budget bounds, exactly
+ * ## What the budget bounds, exactly, on three axes rather than one
  *
- * It bounds the **answer**, not the work. Two limits, both real, and the second
- * used to be undisclosed:
+ * It used to bound the **answer** and nothing else, and the module said so: a
+ * synchronous detector could not be raced at all, because a synchronous body
+ * never yields and `Promise.race` was not scheduled until after it had finished.
+ * That was an unbounded event-loop stall on the hot path of every decision,
+ * twice. Three things bound it now, and they are listed with what each is worth:
  *
- *   1. Losing the race does not cancel an asynchronous detector's work, because
- *      this module did not start it and holds no handle on it. The budget is
- *      also handed to the detector in `budgetMicros` so a well-behaved one that
- *      owns a client can pass it down.
- *   2. **A synchronous detector cannot be raced at all.** `Detector.screen` may
- *      return a `DetectorReport` rather than a promise, and a synchronous body
- *      never yields, so `Promise.race` is not scheduled until after it has
- *      finished. `deterministicDetector` — the adapter this package ships — is
- *      synchronous, and it compiles caller-supplied regular expressions over
- *      fields of up to `maxFieldChars`. A catastrophically-backtracking pattern
- *      is therefore an unbounded event-loop stall, and no in-process timer of
- *      any design can preempt it. That is a property of the runtime, not of this
- *      module, and it is stated here rather than implied away.
+ *   1. **The answer is bounded, deterministically.** The elapsed time is
+ *      measured against the injected clock after the call returns, and a
+ *      detector that took longer than its budget is recorded
+ *      `unavailable/timed-out` however it got there — so the budget is a policy
+ *      rather than a race whose winner depends on microtask ordering. The
+ *      screening fails closed. This is worth the most and bounds the work least.
+ *   2. **`Detector.screen` is asynchronous**, so the race is at least scheduled
+ *      concurrently for any detector that yields. This is a precondition, not a
+ *      bound: an `async` body that never awaits blocks exactly as a synchronous
+ *      one did, and this module will not pretend otherwise.
+ *   3. **The detector is handed a `deadline`** — a one-bit oracle over the same
+ *      injected clock — and both shipped adapters check it between units of
+ *      work. That is what actually bounds the work: the deterministic scan stops
+ *      between patterns, the model scan stops between calls, and neither can
+ *      compound a slow unit into a slow screening.
  *
- * What this module *can* do about (2) is refuse the answer: the elapsed time is
- * measured against the injected clock after the call returns, and a detector
- * that took longer than its budget is recorded `unavailable/timed-out` however
- * it got there — so the budget is a deterministic policy rather than a race
- * whose winner depends on microtask ordering. The screening then fails closed.
+ * What is still not bounded, named rather than implied: a caller-supplied
+ * detector that neither awaits nor reads its deadline, and a single unit of work
+ * already in flight. `lib/safe-pattern.ts` gives the size of the residue for the
+ * shipped pack — one pattern over one field, polynomial in `maxFieldChars` — and
+ * why a worker thread is the wrong trade for closing it.
  */
 const callDetector = async (
   detector: Detector,
@@ -647,6 +816,11 @@ const callDetector = async (
 ): Promise<ObservedReport> => {
   const budgetMicros = run.limits.detectorBudgetMicros;
   const handle = run.timer.wait(Math.ceil(budgetMicros / 1000));
+  // The same injected clock the engine measures the answer against, so a
+  // detector's own view of its budget and the engine's cannot disagree — and a
+  // test drives both from one manual clock.
+  const endsAt = run.clock.now() + Math.ceil(budgetMicros / 1000);
+  const deadline: Deadline = { expired: () => run.clock.now() >= endsAt };
   try {
     return await Promise.race([
       (async (): Promise<ObservedReport> => {
@@ -658,6 +832,7 @@ const callDetector = async (
               fields,
               sources,
               budgetMicros,
+              deadline,
             }),
           );
         } catch (cause) {

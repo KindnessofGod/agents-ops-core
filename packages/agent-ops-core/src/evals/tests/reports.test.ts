@@ -66,7 +66,7 @@ describe("agreement is not accuracy, and the compiler enforces it", () => {
   it("derives the report type from the case source rather than the verb called", async () => {
     const report = await goldenRun("");
     // A golden source produced an accuracy report. Its provenance is on it.
-    expect(report.schema).toBe("report.accuracy/1");
+    expect(report.schema).toBe("report.accuracy/2");
     expect(report.against).toBe("golden");
     expect(report.capturedVia).toBe("injected-client-only");
   });

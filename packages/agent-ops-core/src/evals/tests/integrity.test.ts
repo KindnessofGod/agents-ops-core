@@ -7,8 +7,10 @@ import {
   EvalStoreUnavailable,
   exactVerdict,
   inMemoryEvalNodeStore,
+  inMemoryRunLedger,
   RecorderNotMinted,
   run,
+  seed as makeSeed,
   sqlEvalNodeStore,
   systemTimers,
 } from "../index.js";
@@ -279,6 +281,7 @@ describe("the SQL store adapter", () => {
       clock,
       redact: passthroughRedactor,
       timers: systemTimers(),
+      ledger: inMemoryRunLedger(),
     });
     const report = await run({
       label: "pre-merge",
@@ -352,6 +355,7 @@ describe("retention", () => {
       clock,
       redact: passthroughRedactor,
       timers: systemTimers(),
+      ledger: inMemoryRunLedger(),
     });
     const first = await run({
       label: "day-one",
@@ -368,12 +372,17 @@ describe("retention", () => {
     clock.advance(90 * 24 * 60 * 60 * 1_000);
     const second = await run({
       label: "day-ninety",
+      // A different seed, so this is genuinely a second execution. The label is
+      // not part of the run key, so re-asking the identical question ninety days
+      // later returns the first run's report and opens no second run — which is
+      // the idempotency guarantee working, and would leave nothing here to
+      // expire.
+      seed: makeSeed("seed-day-ninety"),
       cases: threeInvoices(),
       subject: callingSubject,
       scorers: [exactVerdict],
       models: echoBackend(),
       recorder,
-      seed: testSeed,
       limits: smallLimits,
       priceTable,
     });
@@ -419,6 +428,6 @@ describe("seven-year readability", () => {
       }
     }
     // The artefact names its own shape, so a reader in 2033 needs no registry.
-    expect(report.schema).toBe("report.accuracy/1");
+    expect(report.schema).toBe("report.accuracy/2");
   });
 });

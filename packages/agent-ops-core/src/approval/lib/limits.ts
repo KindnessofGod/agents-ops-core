@@ -27,6 +27,18 @@ export const DEFAULT_LIMITS: Limits = Object.freeze({
   /** The reconciliation queue is read in pages, never whole. */
   inDoubtBatch: 100,
   /**
+   * Reconciliation reads a whole trace per case, so it is bounded harder than
+   * the sweep is. Fifty cases per pass, run as often as the operator likes.
+   */
+  reconcileBatch: 50,
+  /**
+   * Sixty-four entry-point invocations in flight. Matches `audit`'s Postgres
+   * adapter deliberately: each `run` holds trace writes and store round trips
+   * open, and the two ceilings bounding the same connection pool from two
+   * directions should not disagree by an order of magnitude.
+   */
+  maxInFlight: 64,
+  /**
    * Parent indexes for at most this many cases are held at once, least
    * recently used evicted first. A sweep of 200 suspensions therefore replays
    * at most 200 traces the first time it sees them and none thereafter,

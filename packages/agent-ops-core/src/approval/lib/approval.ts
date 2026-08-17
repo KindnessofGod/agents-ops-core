@@ -1,8 +1,21 @@
 import type { CorrelationId, NodeId, PayloadField, RiskTier } from "../../audit/index.js";
+import { raiseAndRecord } from "../../alerts/index.js";
+import type {
+  AlertRaiser,
+  AuthorityPoolId as AlertAuthorityPoolId,
+  ComponentId,
+  DecisionPointId,
+  EffectKindId,
+  Heartbeat,
+  IdempotencyKeyId,
+  ReservedRuleId,
+} from "../../alerts/index.js";
 import { canonicalJson, digest } from "./canonical.js";
 import {
   AdapterFailed,
   ApprovalError,
+  ApprovalOverloaded,
+  ApprovalStoreUnavailable,
   AuthorityNotOffered,
   AuthorityUnavailable,
   DualControlSelfApproval,
@@ -45,9 +58,12 @@ import type {
   HumanAuthority,
   IdempotencyKey,
   Instant,
+  KillSwitchState,
   Licence,
+  LinkDivergence,
   NonEmpty,
   PolicyFacts,
+  ReconciliationReport,
   ReservedStatus,
   RunContext,
   SealedAnswer,
@@ -128,6 +144,39 @@ const MODULE_SPEND: DecisionSpend = {
 
 /** The injected clock is millisecond-resolution, so every latency is too. */
 const CLOCK_RESOLUTION_US = 1_000;
+
+/* ------------------------------------------------------------------ alerting */
+
+/**
+ * Crossing the naming edge between this module and `alerts`.
+ *
+ * Two of the identifiers an alert condition carries are already branded
+ * identically on both sides — `CorrelationId` and `AuthorityPoolId` — and cross
+ * with no help at all, which is why `alerts/lib/primitives.ts` says the brand
+ * strings match on purpose. The rest are plain `string` here (`pointId`,
+ * `effectKind`, a reserved rule's citation) and branded there, because `alerts`
+ * chose to make an operator rota unable to be confused with an authority and
+ * branded everything for consistency once it had.
+ *
+ * So this is a widening of a name, not a change of meaning, and it is the only
+ * cast in this file. It is written as one function with one comment rather than
+ * six `as` expressions scattered through the phase machine, so that the day
+ * somebody wants to know what this module asserts about identifiers crossing to
+ * `alerts`, the answer is here and it is short.
+ */
+const asAlertId = <B extends string>(value: string): B => value as B;
+
+/**
+ * The component name the sweeper's heartbeat is filed under, unless a
+ * deployment names its own.
+ *
+ * A constant rather than a literal at the call site so that the emitter and
+ * whatever an external watcher passes to `alerts.livenessQuery` cannot drift: a
+ * watcher pointed at a name nothing emits reports `never-seen` forever, which
+ * reads as a dead sweeper and trains an operator to ignore the alert that
+ * matters most.
+ */
+export const DEFAULT_SWEEPER_COMPONENT = "approval.sweeper" as ComponentId;
 
 type Fields = Readonly<Record<string, PayloadField | undefined>>;
 
@@ -261,6 +310,9 @@ export const createApproval = (deps: ApprovalDeps): Approval => {
     limits,
     sweeperId,
   } = deps;
+  const alerting: AlertRaiser | undefined = deps.alerting;
+  const heartbeat: Heartbeat | undefined = deps.heartbeat;
+  const sweeperComponent: ComponentId = deps.sweeperComponent ?? DEFAULT_SWEEPER_COMPONENT;
 
   const registry = new Map(deps.points.map((point) => [point.id, point]));
   const indexes = parentIndexes(limits.parentIndexCases);
@@ -319,6 +371,30 @@ export const createApproval = (deps: ApprovalDeps): Approval => {
       // Our own errors are already recorded at the site that raised them, and
       // a trace-write failure has nowhere to be recorded by definition.
       if (cause instanceof TraceNodeNotRecorded) throw cause;
+      if (cause instanceof ApprovalStoreUnavailable) {
+        // The one exception, and it is why `ApprovalStoreUnavailable` carries
+        // `adapterRaised`. It is raised **by an adapter**, which holds no
+        // recorder, so nothing has recorded it yet — and it is raised with a
+        // reason (`contract` versus `store-failure` versus `backpressure`)
+        // worth more to an operator than the seam name a wrapper would keep.
+        // Recorded here, re-raised unwrapped.
+        await writer.write(
+          {
+            kind: "approval.adapter-failed",
+            seam,
+            error: cause.name,
+            reason: cause.reason,
+            operation: cause.operation,
+            fatal: true,
+            alert: true,
+            incident: cause.incident,
+            retryable: cause.reason !== "contract",
+            ...causeFields("cause", cause.cause ?? cause),
+          },
+          parent,
+        );
+        throw cause;
+      }
       if (cause instanceof ApprovalError) throw cause;
       const failure = new AdapterFailed(seam, cause, causeClassOf(cause));
       await writer.write(
@@ -370,6 +446,37 @@ export const createApproval = (deps: ApprovalDeps): Approval => {
     }
   };
 
+  /* ------------------------------------------------------------- alerting */
+
+  /**
+   * An effect was attempted and its outcome is unrecorded.
+   *
+   * The second of `docs/CONTEXT.md`'s eight silent failures, and the one that
+   * costs money: *"Possible double payment. Nothing failed; something is merely
+   * unwitnessed."* Nothing throws its way out of here that says so — the caller
+   * receives `IdempotencyIndeterminate`, which is the right error and is caught
+   * by exactly the application code least likely to wake anybody at 3am.
+   *
+   * `unknown` is never auto-retried, at any tier, ever. This alert is therefore
+   * the **only** thing that moves the claim: it puts a human on a reconciliation
+   * queue that would otherwise be read on whatever schedule somebody remembers.
+   */
+  const alertEffectUnknown = (
+    correlationId: CorrelationId,
+    effectKind: string,
+    idempotencyKey: IdempotencyKey,
+    unknownForMs: number,
+    tier: Tier,
+  ) =>
+    raiseAndRecord(alerting, {
+      kind: "effect-outcome-unknown",
+      correlationId,
+      effectKind: asAlertId<EffectKindId>(effectKind),
+      idempotencyKey: asAlertId<IdempotencyKeyId>(idempotencyKey),
+      unknownForMs,
+      tier,
+    });
+
   const deriveIdempotencyKey = (
     correlationId: CorrelationId,
     pointId: string,
@@ -408,6 +515,19 @@ export const createApproval = (deps: ApprovalDeps): Approval => {
     idempotencyKey: IdempotencyKey,
     approvals: NonEmpty<ApprovalRecord>,
     licenceExpiresAt: Instant,
+    /**
+     * What the licence is *for*, named so a `LicenceExpired` raised here says
+     * which thing went stale: a suspension identifier on the gated path, a
+     * correlation identifier on the delegated one, where no suspension exists.
+     */
+    subject: string,
+    /**
+     * The tier the effect is being taken at. Carried only so that an operator
+     * paged about an effect in `unknown` learns immediately whether a
+     * disbursement or a ticket-routing update is behind it, without opening the
+     * trace. It changes nothing about how the effect executes.
+     */
+    tier: Tier,
   ): Promise<
     | { readonly outcome: EffectOutcome; readonly node: NodeId }
     | { readonly held: NodeId; readonly reason: string }
@@ -459,6 +579,43 @@ export const createApproval = (deps: ApprovalDeps): Approval => {
     if (engaged) return { held: killNode, reason: heldReason };
 
     const now = clock.now();
+
+    // The licence's own expiry, enforced HERE — at the instant of use, against
+    // the clock, before a claim is taken and before anything leaves the
+    // building.
+    //
+    // It used to be computed, written onto the licence, written onto a node,
+    // and then never compared to anything on this side: `answer` checked it
+    // before committing the settlement, and everything after that — the
+    // compare-and-set, the kill-switch read, the idempotency claim — ran on the
+    // strength of a check made earlier. A field that is recorded and never read
+    // is worse than no field, because it reads as a control. This is the read.
+    //
+    // Withheld rather than thrown, and the difference matters: the case becomes
+    // `held`, which is resumable, so a stale licence returns the case to an
+    // approver rather than ending it. No claim is taken, so there is nothing to
+    // release and nothing in doubt.
+    if (now > licenceExpiresAt) {
+      const stale = new LicenceExpired(subject, licenceExpiresAt, now);
+      const node = await writer.write(
+        {
+          kind: "approval.licence-expired",
+          subject,
+          idempotencyKey,
+          expiredAt: licenceExpiresAt,
+          staleByMs: now - licenceExpiresAt,
+          approvals: approvals.length,
+          checkedAt: "execute",
+          error: stale.name,
+          alert: true,
+          incident: stale.incident,
+          effectAttempted: false,
+        },
+        killNode,
+      );
+      return { held: node, reason: "licence-expired" };
+    }
+
     const licenceNode = await writer.write(
       {
         kind: "approval.licence-minted",
@@ -503,13 +660,26 @@ export const createApproval = (deps: ApprovalDeps): Approval => {
         // The lease is released, so nobody is holding this call: it really is
         // in doubt. Recorded under its own kind because this attempt did not
         // create the ambiguity, it ran into it.
+        //
+        // Measured from the claim rather than from the moment the state became
+        // `unknown`, because the store records when the key was claimed and not
+        // when it turned: the two are one outbound call apart, and reporting the
+        // longer of the two errs towards making the alert look worse, which is
+        // the direction an ambiguous payment should err in.
+        const inDoubtFor = now - claim.claimedAt;
         await writer.write(
           {
             kind: "effect.blocked-in-doubt",
             idempotencyKey,
             autoRetried: false,
-            alert: true,
             incident: true,
+            ...(await alertEffectUnknown(
+              correlationId,
+              declaration.kind,
+              idempotencyKey,
+              inDoubtFor,
+              tier,
+            )),
           },
           licenceNode,
         );
@@ -585,9 +755,20 @@ export const createApproval = (deps: ApprovalDeps): Approval => {
           kind: "effect.in-doubt",
           idempotencyKey,
           autoRetried: false,
-          alert: true,
           incident: true,
           ...causeFields("cause", cause),
+          // Zero, and it is not a missing value: the claim turned `unknown` at
+          // this instant, in this process. An operator reading a page wants to
+          // know a payment has been unwitnessed for four hours; this one has
+          // been unwitnessed for none, and that is worth saying plainly rather
+          // than leaving a field out.
+          ...(await alertEffectUnknown(
+            correlationId,
+            declaration.kind,
+            idempotencyKey,
+            0,
+            tier,
+          )),
         },
         attemptNode,
       );
@@ -632,9 +813,9 @@ export const createApproval = (deps: ApprovalDeps): Approval => {
         kind: "effect.in-doubt",
         idempotencyKey,
         autoRetried: false,
-        alert: true,
         incident: true,
         ...textFields("reason", outcome.reason),
+        ...(await alertEffectUnknown(correlationId, declaration.kind, idempotencyKey, 0, tier)),
       },
       attemptNode,
     );
@@ -671,6 +852,18 @@ export const createApproval = (deps: ApprovalDeps): Approval => {
     reserved: boolean,
     excluding: readonly AuthorityId[],
     at: Instant,
+    /**
+     * How long the case has been waiting when this offer is attempted. Zero on
+     * the suspend path and on a second seat — both are offering a brief the
+     * instant it comes into existence — and the real age on a sweep retry.
+     *
+     * It exists for the `AuthorityUnavailable` alert below. "Nobody to escalate
+     * to" on a case that is four seconds old is a directory that has not warmed
+     * up; the same words on a case that is eleven days old is a rota with nobody
+     * on it, and an operator needs to be able to tell those apart from the page
+     * rather than by opening the trace.
+     */
+    awaitingForMs: number,
     parent: NodeId,
   ): Promise<{
     readonly offeredTo: readonly AuthorityId[];
@@ -687,14 +880,25 @@ export const createApproval = (deps: ApprovalDeps): Approval => {
       // and — unlike before — the next sweep tries the offer again, so a
       // directory outage or an on-call gap at suspend time is a delay rather
       // than a brief that is never delivered at all.
+      // The fifth silent condition: *"looks like a queue with nothing in it."*
+      // Nothing throws — the case stays suspended and the ladder keeps running —
+      // so without this raise the only witness is a node nobody reads. For a
+      // reserved decision it is the failure the whole reserved-decision doctrine
+      // exists to prevent: while it holds, **no lawful terminal state exists**.
       await writer.write(
         {
           kind: "approval.authority-unavailable",
           pool,
           reserved,
-          alert: true,
           retriedOnNextSweep: true,
           error: new AuthorityUnavailable(pool, reserved).name,
+          ...(await raiseAndRecord(alerting, {
+            kind: "authority-unavailable",
+            correlationId: brief.correlationId,
+            pool: pool as AlertAuthorityPoolId,
+            reserved: reserved ? "reserved" : "not-reserved",
+            awaitingForMs,
+          })),
         },
         parent,
       );
@@ -904,6 +1108,77 @@ export const createApproval = (deps: ApprovalDeps): Approval => {
     }
     if (spec.gate === "human") assertLadderSound(spec.id, spec.doNothing.ladder, limits);
 
+    /**
+     * The first silent condition, and the one the whole reserved-decision
+     * doctrine exists to prevent: **a decision the law reserved to a human
+     * completed without one, and returned success.**
+     *
+     * `docs/CONTEXT.md`: *"A legal breach reported as a good outcome."* For a
+     * reserved decision the correct unassisted containment is exactly zero —
+     * not low, nil — so any occurrence is a breach rather than a metric
+     * movement, and no amount of confidence is an argument against it.
+     *
+     * ## Why this exists when the type system already forbids it
+     *
+     * It should be unreachable. A reserved point declaring `gate: "never"` is
+     * `ReservedStepMisdeclared` a dozen lines above; a reserved gated point
+     * suspends and cannot expire, because the expiry branch is deleted rather
+     * than disabled. So every path that reaches a terminal state for a reserved
+     * decision goes through `answer`, and `answer` sets
+     * `authorityTransferred: true`.
+     *
+     * Except two, and they are the reason this is here rather than in a
+     * comment saying it cannot happen:
+     *
+     *   - **The system abstained.** A terminal verdict, reached with no human,
+     *     on a decision a human was required to make. `docs/CONTEXT.md` rule 8
+     *     names this path specifically and says it gets its own alert.
+     *   - **The decision proposed no effect.** The system concluded, decided
+     *     there was nothing to do, and ended the case. That is the system
+     *     making a reserved decision. It is the quietest possible breach: no
+     *     money moved, so nothing downstream notices.
+     *
+     * Both return `Settled` with `authorityTransferred: false`, and both used to
+     * return it silently. Beyond those two this is defence in depth against our
+     * own refactoring, which is the only kind of defence worth having against a
+     * legal obligation: a future change that opens a third path is caught by a
+     * check that ran anyway, rather than by an auditor in 2031.
+     */
+    const settled = async <T extends Settled<V>>(result: T): Promise<T> => {
+      if (!reserved.reserved) return result;
+      // `refused` and `expired` name an authority or a declared expiry, and
+      // `held` is not terminal at all — a kill-switch hold is revisited by the
+      // sweep. None of the three is this condition, and each carries no
+      // `authorityTransferred` field precisely because it is not the question
+      // being asked of them.
+      if (!("authorityTransferred" in result)) return result;
+      if (result.authorityTransferred) return result;
+      await writer.write(
+        {
+          kind: "approval.reserved-completed-unassisted",
+          pointId: spec.id,
+          rule: reserved.rule,
+          citation: reserved.citation,
+          policyVersion: reserved.policyVersion,
+          tier,
+          settlement: result.kind,
+          incident: true,
+          // Recorded as its own node, hanging off the terminal node, so the
+          // breach is a fact on the case's own trace and not merely a page that
+          // somebody may or may not have received.
+          ...(await raiseAndRecord(alerting, {
+            kind: "reserved-decision-completed-unassisted",
+            correlationId: ctx.correlationId,
+            decisionPoint: asAlertId<DecisionPointId>(spec.id),
+            reservedRule: asAlertId<ReservedRuleId>(reserved.rule),
+            tier,
+          })),
+        },
+        result.node,
+      );
+      return result;
+    };
+
     // decide — read-only client, at every tier.
     const decideNode = await writer.write(
       { kind: "approval.deciding", tier, reserved: reserved.reserved },
@@ -936,7 +1211,12 @@ export const createApproval = (deps: ApprovalDeps): Approval => {
       );
       // An abstention is a verdict and a successful outcome of a working
       // system. It is returned, never thrown.
-      return { kind: "abstained", reason: determination.reason, authorityTransferred: false, node };
+      return await settled({
+        kind: "abstained",
+        reason: determination.reason,
+        authorityTransferred: false,
+        node,
+      });
     }
 
     const decidedNode = await writer.write(
@@ -955,12 +1235,12 @@ export const createApproval = (deps: ApprovalDeps): Approval => {
 
     if (spec.gate === "never") {
       if (spec.effect.kind === "no-effect" || determination.proposes === null) {
-        return {
+        return await settled({
           kind: "no-effect",
           verdict: determination.verdict,
           authorityTransferred: false,
           node: decidedNode,
-        };
+        });
       }
       const { declaration, delegation, licenceValidFor } = spec.effect;
       const payload = determination.proposes.payload;
@@ -1015,28 +1295,30 @@ export const createApproval = (deps: ApprovalDeps): Approval => {
         key,
         approvals,
         now + licenceValidFor,
+        ctx.correlationId,
+        tier,
       );
       if ("held" in result) {
         return { kind: "held", reason: result.reason, node: result.held };
       }
-      return {
+      return await settled({
         kind: "executed",
         verdict: determination.verdict,
         effect: result.outcome,
         authorityTransferred: false,
         node: result.node,
-      };
+      });
     }
 
     /* ------------------------------------------------------ gated points */
 
     if (determination.proposes === null) {
-      return {
+      return await settled({
         kind: "no-effect",
         verdict: determination.verdict,
         authorityTransferred: false,
         node: decidedNode,
-      };
+      });
     }
 
     const payload = determination.proposes.payload;
@@ -1107,6 +1389,9 @@ export const createApproval = (deps: ApprovalDeps): Approval => {
       {
         kind: "approval.suspend.begin",
         suspension: suspensionId,
+        // The trace-side half of the link, and the field `reconcile` reads to
+        // say which point to re-run when the durable half is missing.
+        pointId: spec.id,
         seat: "first",
         tier,
         reserved: reserved.reserved,
@@ -1189,6 +1474,9 @@ export const createApproval = (deps: ApprovalDeps): Approval => {
       reserved.reserved,
       [],
       now,
+      // The case is being suspended at this instant: it has waited for none of
+      // the time yet.
+      0,
       durableNode,
     );
     await commitOffer(writer, suspensionId, offer, durableNode);
@@ -1241,7 +1529,14 @@ export const createApproval = (deps: ApprovalDeps): Approval => {
       };
     }
     if (existing.state === "held") {
-      return { kind: "held", reason: "kill-switch", node: existing.suspendNode };
+      // Not terminal. The next sweep that finds the hold clear returns this
+      // case to an approver, so a retried `run` after that point sees a
+      // suspension again rather than a settled case.
+      return {
+        kind: "held",
+        reason: "withheld; the sweep returns this case to an approver once the hold clears",
+        node: existing.suspendNode,
+      };
     }
     if (existing.state === "executed") {
       const claim = await store.readIdempotency(existing.idempotencyKey);
@@ -1476,6 +1771,7 @@ export const createApproval = (deps: ApprovalDeps): Approval => {
         {
           kind: "approval.suspend.begin",
           suspension: suspensionId,
+          pointId: current.pointId,
           seat: "second",
           tier: current.tier,
           reserved: current.reserved.reserved,
@@ -1507,6 +1803,8 @@ export const createApproval = (deps: ApprovalDeps): Approval => {
         // unable to answer.
         [ctx.authority.id],
         now,
+        // The second seat opens now. The first seat's wait was the first seat's.
+        0,
         secondNode,
       );
       await commitOffer(writer, suspensionId, offer, secondNode);
@@ -1635,6 +1933,8 @@ export const createApproval = (deps: ApprovalDeps): Approval => {
       current.idempotencyKey,
       approvals,
       licenceExpiresAt,
+      suspensionId,
+      current.tier,
     );
 
     /**
@@ -1645,10 +1945,19 @@ export const createApproval = (deps: ApprovalDeps): Approval => {
      */
     const settle = async (state: "executed" | "held", parent: NodeId): Promise<void> => {
       const base = claimedRecord ?? current;
+      // A hold keeps a due time. `held` is not terminal: the kill switch is
+      // engaged during an incident and disengaged after it, and a case the
+      // sweep stopped visiting is a case nobody comes back to. The cadence is
+      // the ladder's own recurrence interval, so a hold is re-examined on the
+      // same bounded, non-accelerating schedule as everything else.
+      const heldDoNothing = JSON.parse(current.doNothingJson) as ServedDoNothing;
       const swapped = await store.swapSuspension(base.id, base.revision, {
         ...base,
         state,
         finalAnswer: sealed,
+        ...(state === "held"
+          ? { nextDueAt: now + heldDoNothing.ladder.recurrence.every }
+          : {}),
         leaseUntil: null,
         leaseOwner: null,
       });
@@ -1700,9 +2009,32 @@ export const createApproval = (deps: ApprovalDeps): Approval => {
     let remindersSent = 0;
     let expired = 0;
     let presented = 0;
+    let holdsReleased = 0;
     let skippedLeased = 0;
     let raceLost = 0;
     const nodes: NodeId[] = [];
+
+    /**
+     * The kill switch, read at most once per sweep and only if a held case is
+     * actually found.
+     *
+     * Bounded on purpose: a batch of two hundred held cases during an incident
+     * would otherwise be two hundred reads of the control plane that is already
+     * having the incident. One read per sweep is enough — the switch cannot
+     * meaningfully change inside one pass, and if it does the next pass sees it.
+     */
+    let switchThisSweep: KillSwitchState | "unreadable" | undefined;
+    const readSwitchOnce = async (): Promise<KillSwitchState | "unreadable"> => {
+      if (switchThisSweep !== undefined) return switchThisSweep;
+      try {
+        switchThisSweep = await killSwitch();
+      } catch {
+        // Fail-closed: an unreadable switch is treated as engaged, so a hold is
+        // never released on a guess. The reason is recorded per case below.
+        switchThisSweep = "unreadable";
+      }
+      return switchThisSweep;
+    };
 
     for (const suspension of due) {
       // Compare-and-set. Two sweepers running during a deploy is the normal
@@ -1731,10 +2063,124 @@ export const createApproval = (deps: ApprovalDeps): Approval => {
           stepsFired: suspension.stepsFired,
           cyclesFired: suspension.cyclesFired,
           presented: suspension.presentedAt !== null,
+          state: suspension.state,
         },
         suspension.suspendNode,
       );
       nodes.push(visitNode);
+
+      /* --------------------- a kill-switch hold is revisited, not buried */
+
+      if (suspension.state === "held") {
+        const state = await readSwitchOnce();
+        const stillHeld = state === "unreadable" || state.engaged;
+        if (stillHeld) {
+          // The incident is still running. Record the read — "we looked and it
+          // was still engaged" is a different fact from "nobody looked" — and
+          // push the next visit out by the ladder's own interval, so a hold
+          // that lasts a week costs one read a day rather than one a second.
+          await writer.write(
+            {
+              kind: "approval.hold-continues",
+              suspension: suspension.id,
+              readable: state !== "unreadable",
+              heldForMs: now - suspension.awaitingSince,
+              nextDueAt: now + ladder.recurrence.every,
+            },
+            visitNode,
+          );
+          const pushed = await store.swapSuspension(suspension.id, suspension.revision, {
+            ...suspension,
+            nextDueAt: now + ladder.recurrence.every,
+            leaseUntil: null,
+            leaseOwner: null,
+          });
+          if (!pushed) raceLost += 1;
+          continue;
+        }
+
+        // The switch is off. The case returns to an approver — it is NOT
+        // executed here, and that is the decision rather than an omission: the
+        // approval it holds was given before an incident, against pre-incident
+        // evidence, and "the kill switch went off" is not a lawful basis for
+        // moving money. The sealed answers are cleared, the seat goes back to
+        // the first, and the ladder restarts, so the case is asked again and
+        // the whole of it is on the trace.
+        const expiresAt =
+          suspension.reserved.reserved || doNothing.expire === null
+            ? null
+            : now + doNothing.expire.after;
+        const released = await store.swapSuspension(suspension.id, suspension.revision, {
+          ...suspension,
+          state: "awaiting",
+          seat: "first",
+          firstAnswer: null,
+          finalAnswer: null,
+          presentedAt: null,
+          offeredTo: [],
+          lastRemindedAt: null,
+          awaitingSince: now,
+          stepsFired: 0,
+          cyclesFired: 0,
+          nextDueAt: nextDueAt(ladder, now, { stepsFired: 0, cyclesFired: 0 }, null),
+          expiresAt,
+          leaseUntil: null,
+          leaseOwner: null,
+        });
+        if (!released) {
+          raceLost += 1;
+          await writer.write(
+            { kind: "sweep.race-lost", suspension: suspension.id, intended: "hold-released" },
+            visitNode,
+          );
+          continue;
+        }
+        const releaseNode = await writer.write(
+          {
+            kind: "approval.hold-released",
+            suspension: suspension.id,
+            heldForMs: now - suspension.awaitingSince,
+            returnedToSeat: "first",
+            // Nothing was executed on release. A fresh approval licenses the
+            // effect, or nothing does.
+            effectTaken: false,
+            reApprovalRequired: true,
+            alert: true,
+          },
+          visitNode,
+        );
+        holdsReleased += 1;
+
+        // And the brief goes back out in the same visit. A case returned to the
+        // queue that nobody has been told about is the silent failure this
+        // whole module is arranged against — it would sit `awaiting` with an
+        // empty `offeredTo` until the ladder's first step fired hours later.
+        const reoffer = await presentTo(
+          writer,
+          buildServedBrief(
+            {
+              suspension: suspension.id,
+              correlationId: suspension.correlationId,
+              tier: suspension.tier,
+              reserved: suspension.reserved,
+              doNothing,
+              presentedAt: now,
+              body: JSON.parse(suspension.briefBodyJson) as BriefBody,
+            },
+            "first",
+            null,
+          ),
+          suspension.pool,
+          suspension.reserved.reserved,
+          [],
+          now,
+          now - suspension.awaitingSince,
+          releaseNode,
+        );
+        await commitOffer(writer, suspension.id, reoffer, releaseNode);
+        if (reoffer.presentedAt !== null) presented += 1;
+        continue;
+      }
 
       /* ------------- a brief that was never served is served again here */
 
@@ -1762,6 +2208,7 @@ export const createApproval = (deps: ApprovalDeps): Approval => {
           suspension.reserved.reserved,
           suspension.firstAnswer === null ? [] : [suspension.firstAnswer.by],
           now,
+          now - suspension.awaitingSince,
           visitNode,
         );
         if (offer.presentedAt !== null) {
@@ -1822,14 +2269,70 @@ export const createApproval = (deps: ApprovalDeps): Approval => {
       if (becomesBuried(ladder, position)) {
         // An incident, not a state. The ladder has failed, and the failure is
         // of the organisation, not of the case. The chasing does not stop.
+        //
+        // Note the severity `alerts` derives for this and does not let us
+        // override: `degraded`, not `incident`. `docs/CONTEXT.md` calls a buried
+        // case an incident of the ORGANISATION and is right, but an alert
+        // addresses an OPERATOR and no part of the machinery is broken here.
+        // Paging an engineer at 3am about a case a manager must answer is how a
+        // channel gets muted, which is the failure the escalation/alert
+        // separation exists to prevent. Loud, recorded, and not a page.
         await writer.write(
           {
             kind: "approval.buried",
             suspension: suspension.id,
             awaitingForMs: now - suspension.awaitingSince,
-            alert: true,
             incident: true,
             stillAnswerable: true,
+            ...(await raiseAndRecord(alerting, {
+              kind: "case-buried",
+              correlationId: suspension.correlationId,
+              awaitingForMs: now - suspension.awaitingSince,
+              scheduledStepsSpent: suspension.stepsFired,
+              recurrenceCycles: suspension.cyclesFired,
+              pool: suspension.pool as AlertAuthorityPoolId,
+            })),
+          },
+          visitNode,
+        );
+      }
+
+      /* ------------------------------ reminders that stopped firing */
+
+      // The third silent condition, and the one that is invisible from inside
+      // the sweep that is finally running: *"nothing errored. The case simply
+      // stopped being chased."*
+      //
+      // What it looks like from here is a case arriving at a visit far later
+      // than it was due. The recurrence never accelerates and has no stop value,
+      // so a case cannot legitimately be a whole extra interval overdue — if it
+      // is, then between `nextDueAt` and now there was a window in which nothing
+      // swept it. A sweeper that was down for a fortnight and came back is
+      // exactly this, and it is exactly the case that produces no error.
+      //
+      // The threshold is the ladder's own `recurrence.every` rather than a new
+      // configured limit, deliberately: the interval the recurrence declared is
+      // the interval this case was promised, and a bound derived from the
+      // promise cannot be tuned out of agreement with it.
+      const overdueByMs = now - suspension.nextDueAt;
+      if (suspension.presentedAt !== null && overdueByMs > ladder.recurrence.every) {
+        await writer.write(
+          {
+            kind: "approval.reminders-stopped",
+            suspension: suspension.id,
+            overdueByMs,
+            expectedEveryMs: ladder.recurrence.every,
+            // Detected on the pass that resumes chasing, so the case is being
+            // chased again by the time anybody reads this. The alert is about
+            // the window, not about now.
+            chasingResumed: true,
+            ...(await raiseAndRecord(alerting, {
+              kind: "reminders-stopped",
+              correlationId: suspension.correlationId,
+              expectedEveryMs: ladder.recurrence.every,
+              overdueByMs,
+              remindersSent: suspension.stepsFired + suspension.cyclesFired,
+            })),
           },
           visitNode,
         );
@@ -1924,21 +2427,257 @@ export const createApproval = (deps: ApprovalDeps): Approval => {
       }
     }
 
+    /* ------------------------------------------- ⚠ the dead-man's switch */
+
+    /**
+     * The sweeper proves it is alive — **on every run, including this one if it
+     * found nothing at all.**
+     *
+     * `docs/CONTEXT.md`: *"The sweeper is the single point of failure for the
+     * whole recurrence guarantee. It is what fires reminders. If it stops,
+     * nobody is chased, nothing throws, and every waiting case rots silently."*
+     * That is the failure this beat exists to make visible, and note what it
+     * cannot do by itself: a beat is evidence of life, and **the absence of one
+     * is the alert**, which only something outside this process can observe.
+     *
+     * ⚠ **THE WATCHER IS EXTERNAL, AND THIS LIBRARY CANNOT DELIVER THIS ONE
+     * ALERT.** A watchdog that depends on the thing it watches fails silently
+     * at the exact moment it is needed: if this process dies, an in-process
+     * check dies with it, nothing runs, nothing throws, no dashboard turns red.
+     * Poll `alerts.livenessQuery` from a different process, on a different
+     * schedule, and read `alerts.EXTERNAL_WATCHDOG_REQUIREMENT` — which
+     * `docs/RUNBOOK.md` must carry verbatim — before deciding this is somebody
+     * else's problem. It is the single deployment instruction most likely to be
+     * skipped and the most expensive to have skipped.
+     *
+     * Two deliberate choices about *when* the beat happens:
+     *
+     *   - **After the batch, not before it.** A beat emitted on entry would
+     *     prove the sweeper was started, not that it can complete a pass. A
+     *     sweeper wedged on a store that never answers would keep beating
+     *     forever while chasing nobody, which is a liveness signal that lies in
+     *     the reassuring direction.
+     *   - **Not in a `finally`.** A sweep that threw did not complete a run, so
+     *     it does not get to claim one. It will go overdue, and an external
+     *     watcher will say so. That is the safe direction: a false alarm costs
+     *     an operator five minutes, and a missed one costs every waiting case.
+     */
+    let beat: SweepReport["heartbeat"] = "not-configured";
+    if (heartbeat !== undefined) {
+      // `HeartbeatRun` has no field for "I did zero things" on the empty arm,
+      // on purpose: *"nothing was due"* and *"I did not run"* must not share a
+      // representation, for exactly the reason `not-attempted` and `unknown` do
+      // not. The second is the ABSENCE of a beat and is not spellable here.
+      const run =
+        due.length === 0
+          ? ({ ran: "nothing-was-due" } as const)
+          : ({ ran: "did-work", itemsProcessed: due.length } as const);
+      try {
+        await heartbeat.beat({ component: sweeperComponent, run });
+        beat = run.ran;
+      } catch {
+        // A beat that could not be stored must not take a completed sweep down
+        // with it: the reminders were sent and the ladder advanced, and
+        // discarding that because a liveness row would not write is a strictly
+        // worse outcome. The failure is on the report instead, where a caller
+        // can see that this sweeper is running but is about to be declared
+        // dead — which is a different problem from being dead, and one an
+        // operator otherwise discovers by being paged about a healthy process.
+        beat = "failed";
+      }
+    }
+
     return {
       examined: due.length,
       remindersSent,
       expired,
       presented,
+      holdsReleased,
       skippedLeased,
       raceLost,
       nodes,
+      heartbeat: beat,
     };
   };
 
+  /* ----------------------------------------------------------- reconcile */
+
+  /** The node kind that carries the trace-side half of the link. */
+  const SUSPEND_BEGIN = "approval.suspend.begin";
+
+  /**
+   * Compare both halves of the link and report every disagreement.
+   *
+   * **Why this exists rather than a transaction.** A suspension is written
+   * through `ApprovalStore`; its nodes are written through `audit`. Those are
+   * two seams and two stores, and `audit`'s interface exposes no transaction to
+   * enlist in. Even if it did, the transaction would have to be open across
+   * `decide` — a model call — which means holding a pooled database connection
+   * for the length of an inference on every gated decision in nineteen
+   * applications. That is not a trade this library gets to make on their
+   * behalf, so the two writes stay separate and the gap between them is made
+   * **findable** instead of silent.
+   *
+   * What makes it findable is that the link is written on both sides: the
+   * durable record carries `suspendNode`, and the `approval.suspend.begin` node
+   * carries the suspension identifier. A crash between the two writes therefore
+   * loses a row and never the link, and this pass is the query that finds it.
+   *
+   * Bounded in both dimensions — cases per pass and suspensions per case — and
+   * it takes the cases to compare rather than discovering them, because neither
+   * seam can enumerate cases and a store scan over a seven-year archive is not
+   * a health check.
+   */
+  const reconcile = async (request: {
+    readonly cases: readonly CorrelationId[];
+  }): Promise<ReconciliationReport> => {
+    const cases = request.cases.slice(0, Math.max(0, limits.reconcileBatch));
+    const divergences: LinkDivergence[] = [];
+    const unreadable: CorrelationId[] = [];
+    let compared = 0;
+
+    for (const correlationId of cases) {
+      let replayed;
+      try {
+        replayed = await audit.replay(correlationId);
+      } catch {
+        // "We could not look" and "we looked and everything agreed" are
+        // different facts. Reporting them as one is a green dashboard for an
+        // unread archive.
+        unreadable.push(correlationId);
+        continue;
+      }
+
+      const nodeIds = new Set<string>(replayed.nodes.map((node) => String(node.id)));
+      const fromTrace = new Map<string, { node: NodeId; pointId: string; tier: RiskTier }>();
+      for (const node of replayed.nodes) {
+        if (node.payload["kind"] !== SUSPEND_BEGIN) continue;
+        const id = node.payload["suspension"];
+        if (typeof id !== "string") continue;
+        // First begin node wins: a second seat writes another one for the same
+        // suspension, and the first is the one the record was born with.
+        if (!fromTrace.has(id)) {
+          const pointId = node.payload["pointId"];
+          fromTrace.set(id, {
+            node: node.id,
+            pointId: typeof pointId === "string" ? pointId : "",
+            tier: node.tier,
+          });
+        }
+      }
+
+      const stored = await store.suspensionsOf(correlationId, limits.reconcileBatch);
+      const byId = new Map(stored.map((record) => [String(record.id), record]));
+      // Distinct suspensions seen on either side. Counting per loop would count
+      // an agreeing suspension twice and make the report read as twice the work.
+      compared += new Set([...fromTrace.keys(), ...byId.keys()]).size;
+
+      for (const [id, trace] of fromTrace) {
+        if (byId.has(id)) continue;
+        // The dangerous direction: `run` returned an identifier nobody can
+        // answer, `sweep` will never see it, and nothing errored.
+        const writer = await openWriter(correlationId, trace.tier);
+        await writer.write(
+          {
+            kind: "approval.link-divergence",
+            divergence: "trace-without-suspension",
+            suspension: id,
+            recordedNode: String(trace.node),
+            recovery: "re-run",
+            alert: true,
+            incident: true,
+          },
+          trace.node,
+        );
+        divergences.push({
+          kind: "trace-without-suspension",
+          correlationId,
+          suspension: id as SuspensionId,
+          node: trace.node,
+          pointId: trace.pointId,
+          recovery: "re-run",
+        });
+      }
+
+      for (const record of stored) {
+        // Checked against the node the record actually names, not against
+        // "is there a begin node somewhere for this id". A record pointing at a
+        // node this trace does not contain is the same defect whether the begin
+        // node is missing or the pointer is wrong, and it has the same
+        // consequence: everything written later hangs at the root.
+        if (nodeIds.has(String(record.suspendNode))) continue;
+        // The record names a node this trace does not contain. The case is
+        // still answerable; what is broken is parentage, so every later node
+        // would hang at the root and the ageing of a case that waited eleven
+        // days would stop being provable from its own trace.
+        const writer = await openWriter(correlationId, record.tier);
+        const repairNode = await writer.write({
+          kind: "approval.link-divergence",
+          divergence: "suspension-without-trace",
+          suspension: record.id,
+          missingNode: String(record.suspendNode),
+          pointId: record.pointId,
+          state: record.state,
+          recovery: "repaired",
+          alert: true,
+          incident: true,
+        });
+        // Repair, not rewrite. Nothing in the trace is edited — a node is
+        // added, which is the only edit an append-only archive permits — and
+        // the record is re-pointed at it, so later nodes are parented again.
+        const repairable = record.state === "awaiting" || record.state === "held";
+        if (repairable) {
+          await store.swapSuspension(record.id, record.revision, {
+            ...record,
+            suspendNode: repairNode,
+          });
+        }
+        divergences.push({
+          kind: "suspension-without-trace",
+          correlationId,
+          suspension: record.id,
+          node: record.suspendNode,
+          pointId: record.pointId,
+          recovery: "repaired",
+        });
+      }
+    }
+
+    return { examined: cases.length, compared, divergences, unreadable };
+  };
+
+  /* ------------------------------------------------------ bounded concurrency */
+
+  /**
+   * Admission control on every entry point.
+   *
+   * Each invocation holds trace writes, store round trips and adapter calls
+   * open for its duration, so "how many at once" is a real resource and it was
+   * previously unbounded. Over the ceiling the call is refused **before
+   * anything starts** — no classification, no screening, no node, no claim — so
+   * a shed call costs the caller a retry and nothing else.
+   */
+  let inFlight = 0;
+  const admit = async <T>(entryPoint: string, body: () => Promise<T>): Promise<T> => {
+    if (inFlight >= limits.maxInFlight) {
+      throw new ApprovalOverloaded(entryPoint, inFlight, limits.maxInFlight);
+    }
+    inFlight += 1;
+    try {
+      return await body();
+    } finally {
+      inFlight -= 1;
+    }
+  };
+
   return {
-    run,
-    answer,
-    sweep,
-    inDoubt: () => store.inDoubt(limits.inDoubtBatch),
+    run: <In, V, P>(point: DecisionPoint<In, V, P>, input: In, ctx: RunContext) =>
+      admit("run", () => run(point, input, ctx)),
+    answer: (suspension: SuspensionId, given: ApproverAnswer, ctx: AnsweringContext) =>
+      admit("answer", () => answer(suspension, given, ctx)),
+    sweep: (request: { readonly limit: number }) => admit("sweep", () => sweep(request)),
+    inDoubt: () => admit("inDoubt", () => store.inDoubt(limits.inDoubtBatch)),
+    reconcile: (request: { readonly cases: readonly CorrelationId[] }) =>
+      admit("reconcile", () => reconcile(request)),
   };
 };

@@ -5,9 +5,12 @@ import {
   type Audit,
   type Clock,
   type CorrelationId,
+  type RecordedNode,
   type Redactor,
   type TraceStore,
+  type TraceVerdict,
   type UnavailabilityPolicy,
+  type Witness,
 } from "../index.js";
 
 /**
@@ -60,6 +63,8 @@ export interface Harness {
   readonly audit: Audit;
   readonly store: TraceStore;
   readonly clock: TestClock;
+  /** Present only where the harness was given one. */
+  readonly witness?: Witness;
 }
 
 export const harness = (
@@ -67,17 +72,64 @@ export const harness = (
     readonly store?: TraceStore;
     readonly redact?: Redactor;
     readonly onTraceUnavailable?: UnavailabilityPolicy;
+    readonly witness?: Witness;
+    readonly clock?: TestClock;
+    /**
+     * Where `trace-unavailable-at-high-tier` goes.
+     *
+     * Only ever an in-memory `Alerts` here — and not because a test remembers to
+     * do that. `alerts` constructs no transport and reads nothing from the
+     * environment, so there is no path from this package to a pager to reach.
+     */
+    readonly alerting?: import("../../alerts/index.js").AlertRaiser;
   } = {},
 ): Harness => {
-  const clock = testClock(1_700_000_000_000);
+  const clock = overrides.clock ?? testClock(1_700_000_000_000);
   const store = overrides.store ?? inMemoryTraceStore();
   const audit = createAudit({
     store,
     clock,
     redact: overrides.redact ?? redactNothing,
     onTraceUnavailable: overrides.onTraceUnavailable ?? strictPolicy,
+    ...(overrides.witness === undefined ? {} : { witness: overrides.witness }),
+    alerting: overrides.alerting,
   });
-  return { audit, store, clock };
+  return {
+    audit,
+    store,
+    clock,
+    ...(overrides.witness === undefined ? {} : { witness: overrides.witness }),
+  };
+};
+
+/**
+ * Record `count` nodes and close. Used where the *shape* of a case matters and
+ * its contents do not — the streaming tests, which care about node counts far
+ * beyond what any other test in this module builds.
+ */
+export const caseOf = async (
+  audit: Audit,
+  correlationId: CorrelationId,
+  count: number,
+  options: { readonly close?: boolean } = {},
+): Promise<void> => {
+  const trace = await audit.open(correlationId);
+  for (let i = 0; i < count; i += 1) {
+    await trace.record({ kind: "decision.decided", v: 1, step: i }, { tier: "low" });
+  }
+  if (options.close !== false) await trace.close({ unassistedContainment: true });
+};
+
+/** Drain a walk, returning the nodes read and the verdict it ended on. */
+export const drain = async (
+  walk: AsyncGenerator<RecordedNode, TraceVerdict, undefined>,
+): Promise<{ readonly nodes: RecordedNode[]; readonly verdict: TraceVerdict }> => {
+  const nodes: RecordedNode[] = [];
+  for (;;) {
+    const step = await walk.next();
+    if (step.done) return { nodes, verdict: step.value };
+    nodes.push(step.value);
+  }
 };
 
 /** Narrow a record result, failing loudly rather than silently skipping. */

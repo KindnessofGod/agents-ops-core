@@ -196,6 +196,51 @@ export interface StoredCase {
 export type StoredNode = RecordedNode;
 
 /**
+ * One bounded window onto a case's nodes.
+ *
+ * `read` returns a whole case and is the right verb for the overwhelming
+ * majority of cases, which hold tens of nodes. It is the wrong verb for the
+ * ceiling: `maxNodesPerCase` is 100,000, and a caller who only wants to walk
+ * such a case should not have to hold it. So the seam carries both, and the
+ * cursor is the **store-assigned sequence** rather than an opaque token — the
+ * sequence is already a total order the store guarantees, so a cursor built on
+ * it is stable across adapters, reproducible in a runbook, and readable by a
+ * human comparing two runs.
+ */
+export interface TracePageRequest {
+  readonly correlationId: CorrelationId;
+  /**
+   * Exclusive lower bound. `undefined` starts at the beginning. A store must
+   * never return a node at or below this sequence.
+   */
+  readonly afterSequence: number | undefined;
+  /**
+   * Hard ceiling on nodes returned. A store returning more has broken the
+   * contract and is refused, because a page that ignores its limit is an
+   * unbounded read wearing a bounded interface.
+   */
+  readonly limit: number;
+}
+
+export interface TracePage {
+  /** The case's scope statement, repeated on every page so a page stands alone. */
+  readonly provenance: TraceProvenance;
+  /** Ascending by sequence, strictly above `afterSequence`, at most `limit` long. */
+  readonly nodes: readonly StoredNode[];
+  /**
+   * True when at least one further node exists after the last one here.
+   *
+   * Stated by the store rather than inferred from `nodes.length === limit`,
+   * because that inference is wrong exactly when the case ends on a page
+   * boundary — and being wrong there means a walk that stops one page early on
+   * a case whose length happens to be a multiple of the page size, which is the
+   * kind of defect that hides for years and then loses the last node of a
+   * trace.
+   */
+  readonly more: boolean;
+}
+
+/**
  * The replayed graph.
  *
  * **Bounded, and materialised on purpose.** `nodes` is a real array, so a case
@@ -399,6 +444,12 @@ declare const traceStoreBrand: unique symbol;
  *      correlation identifier is refused, not silently rebound.
  *   6. `case.`-prefixed kinds are reserved to the library. An `append` carrying
  *      one is refused; only `closeCase` may write the seal.
+ *   7. `readPage` is **bounded and ordered**: ascending by sequence, strictly
+ *      above the cursor, never longer than the limit, and `more` says whether
+ *      anything follows. `createAudit` checks all four on every page and raises
+ *      `StoreContractViolated`, because a streaming reader that trusted an
+ *      unordered page would compute a digest over an order the store never
+ *      assigned.
  */
 export interface TraceStore {
   readonly [traceStoreBrand]: true;
@@ -414,7 +465,17 @@ export interface TraceStore {
     at: number,
     outcome: UnassistedContainment,
   ): Promise<RecordedNode>;
+  /**
+   * The whole case. Bounded by `maxNodesPerCase` and materialised — the common
+   * path, and the one `replay` uses.
+   */
   read(correlationId: CorrelationId): Promise<StoredCase | undefined>;
+  /**
+   * One bounded window. `undefined` where the case does not exist, which is a
+   * different answer from a page with no nodes on it — an open case with
+   * nothing recorded yet is real and returns an empty page.
+   */
+  readPage(request: TracePageRequest): Promise<TracePage | undefined>;
 }
 
 /**
@@ -426,6 +487,221 @@ export interface TraceStore {
 export const asTraceStore = (
   impl: Omit<TraceStore, typeof traceStoreBrand>,
 ): TraceStore => impl as TraceStore;
+
+// ---------------------------------------------------------------------------
+// Reading a case without holding it
+// ---------------------------------------------------------------------------
+
+/**
+ * What a complete read of a case establishes. Fixed-size whatever the case:
+ * this is what lets a 100,000-node case be verified, witnessed or cleared for
+ * archive without materialising it.
+ */
+export interface TraceVerdict {
+  readonly correlationId: CorrelationId;
+  readonly provenance: TraceProvenance;
+  /** How many nodes were read, the seal counted. */
+  readonly nodes: number;
+  /** True once a seal node has been read. Derived, never a mutable flag. */
+  readonly closed: boolean;
+  /**
+   * The seal's clock reading, or `undefined` on an open case. Retention is
+   * measured from here rather than from a database's `inserted_at`, because a
+   * trace ordered or aged by a database's own clock is aged by whichever server
+   * took the write.
+   */
+  readonly closedAt: number | undefined;
+  /** Digest over the whole case, seal included, in store-assigned order. */
+  readonly digest: TraceDigest;
+}
+
+export interface WalkLimits {
+  /**
+   * Nodes fetched per round trip. Bounded on both sides: one node per query is
+   * 100,000 round trips, and "no limit" is the unbounded read this exists to
+   * replace. Values outside the permitted range are clamped, not rejected — a
+   * page size is a performance choice, and refusing an operator's `500_000`
+   * outright would leave them with no way to read the case at all.
+   */
+  readonly pageSize: number;
+  /**
+   * Ceiling on nodes walked in one pass, above the store's own per-case
+   * ceiling. It exists because a store that miscounts `more` would otherwise
+   * spin forever, and an operator command that never returns is an outage with
+   * no error in it.
+   */
+  readonly maxNodes: number;
+}
+
+// ---------------------------------------------------------------------------
+// The external witness
+// ---------------------------------------------------------------------------
+
+/** Names the witness that took a record. Stamped on every row it writes. */
+export type WitnessId = string & { readonly __brand: "WitnessId" };
+
+/**
+ * What is published. Deliberately tiny: a correlation identifier, a digest, a
+ * count and a time. **No payload, no node kinds, no personal data** — a witness
+ * may be under someone else's custody, and a digest reveals nothing about the
+ * case while proving everything about its integrity.
+ */
+export interface WitnessRecord {
+  readonly correlationId: CorrelationId;
+  /** The digest of the **whole** case, seal included. */
+  readonly digest: TraceDigest;
+  /** How many nodes that digest covers, the seal counted. */
+  readonly nodes: number;
+  /** Milliseconds since epoch, from the injected clock. Our claim, not a notary's. */
+  readonly at: number;
+  readonly witness: WitnessId;
+}
+
+/**
+ * The record as the witness now holds it — which may be an **earlier**
+ * publication than the one just offered, because publishing is idempotent. A
+ * caller can see that from `record.at`, rather than being told a comfortable
+ * "yes, done" that hides a republication.
+ */
+export interface WitnessReceipt {
+  readonly record: WitnessRecord;
+}
+
+/**
+ * Why a replayed case does or does not agree with what was witnessed.
+ *
+ * Four values rather than a boolean, because the three ways of disagreeing call
+ * for three different responses: an incident, a backlog sweep, and a wait.
+ */
+export type WitnessVerdict =
+  | {
+      readonly agrees: true;
+      readonly digest: TraceDigest;
+      readonly witnessed: WitnessRecord;
+    }
+  /** The alarm. The archive is not the case that was published. */
+  | {
+      readonly agrees: false;
+      readonly reason: "digest-mismatch";
+      readonly digest: TraceDigest;
+      readonly witnessed: WitnessRecord;
+    }
+  /** A gap, not a proof. The case was sealed and publication did not happen. */
+  | {
+      readonly agrees: false;
+      readonly reason: "not-witnessed";
+      readonly digest: TraceDigest;
+    }
+  /** Nothing is witnessed until it is sealed. An open case is evidence of nothing. */
+  | {
+      readonly agrees: false;
+      readonly reason: "not-closed";
+      readonly digest: TraceDigest;
+    };
+
+/**
+ * The brand on `Witness`, on the same reasoning as `TraceStore`'s and against
+ * the same attack. `{ publish: async () => receipt, lookUp: async () => undefined }`
+ * is four lines, would make every case report itself witnessed, and does not
+ * typecheck.
+ */
+declare const witnessBrand: unique symbol;
+
+/**
+ * The seam that closes this module's stated blind spot — see `lib/witness.ts`
+ * for what it does and does not defeat, in detail and without flattery.
+ *
+ * Two shipped adapters, `inMemoryWitness` and `postgresWitness`, which is what
+ * makes it a real seam. A third, under separate custody, is the one that
+ * actually crosses a trust boundary; it is named in `lib/witness.ts` and
+ * deliberately not shipped, because shipping it means choosing a custodian for
+ * nineteen applications.
+ *
+ * Every adapter owes three invariants:
+ *
+ *   1. **Append-only, one record per case.** A second publication of the *same*
+ *      digest is accepted and returns the record already held. A second
+ *      publication of a *different* digest raises `WitnessConflict` and writes
+ *      nothing. A witness that can be overwritten is not a witness.
+ *   2. **`lookUp` never invents.** An absent record is `undefined`, never an
+ *      empty or optimistic one.
+ *   3. **Failures are named.** Anything an adapter cannot classify surfaces as
+ *      `WitnessUnavailable`, which is fail-closed.
+ */
+export interface Witness {
+  readonly [witnessBrand]: true;
+  readonly id: WitnessId;
+  publish(record: WitnessRecord): Promise<WitnessReceipt>;
+  lookUp(correlationId: CorrelationId): Promise<WitnessRecord | undefined>;
+}
+
+/** Mints the witness brand. Called in exactly the two shipped adapter factories. */
+export const asWitness = (impl: Omit<Witness, typeof witnessBrand>): Witness =>
+  impl as Witness;
+
+// ---------------------------------------------------------------------------
+// Retention: everything the expiry procedure needs, and nothing that performs it
+// ---------------------------------------------------------------------------
+
+/**
+ * One sealed case that is past its retention period.
+ *
+ * `digest` is derived from the seal's own bytes, so this is the digest the case
+ * claimed for itself at close — not a live recomputation. Clearing a case for
+ * removal recomputes it independently; see `Archivist`.
+ */
+export interface ExpiredCase {
+  readonly correlationId: CorrelationId;
+  /** The seal's clock reading. Retention runs from here. */
+  readonly closedAt: number;
+  /** Nodes in the case, the seal counted. */
+  readonly nodes: number;
+  /** The whole-case digest as the seal attests to it. */
+  readonly digest: TraceDigest;
+}
+
+export interface RetentionQuery {
+  /**
+   * Exclusive upper bound on the seal's clock reading. A case sealed at or
+   * after this is inside its retention period and is not returned.
+   */
+  readonly closedBefore: number;
+  /**
+   * Cursor. Exclusive lower bound on the correlation identifier, so paging is
+   * stable across an INSERT-only table: nothing already returned can move, and
+   * a case sealed during the sweep sorts wherever its identifier sorts rather
+   * than shifting an offset.
+   */
+  readonly afterCorrelationId: CorrelationId | undefined;
+  /** Hard ceiling. There is no "everything past retention" query, by design. */
+  readonly limit: number;
+}
+
+export interface RetentionPage {
+  /** Ascending by correlation identifier, at most `limit` long. */
+  readonly cases: readonly ExpiredCase[];
+  readonly more: boolean;
+}
+
+/**
+ * **Read-only, and the absence of a second verb is the design.**
+ *
+ * There is no `remove`, no `delete`, no `expire` and no `purge` here, and there
+ * will not be. The trace tables carry no DELETE grant for the library's writer
+ * role, and this interface carries no verb that would want one. A seven-year
+ * expiry is a lawful, separately-authorised operation performed by a role this
+ * library's migrations do not create, against a runbook a person signs; the
+ * library's job is to hand that procedure the two things it cannot safely
+ * produce for itself — which cases are due, and whether an archive copy is
+ * faithful. See `lib/retention.ts` for the reasoning in full and
+ * `migrations/0003_audit_witness.sql` for the half of it that lives in grants.
+ *
+ * Two adapters, so this is a real seam: the in-memory trace store implements it
+ * directly, and `postgresRetentionRegister` reads the seal rows.
+ */
+export interface RetentionRegister {
+  dueForRemoval(query: RetentionQuery): Promise<RetentionPage>;
+}
 
 /**
  * An open case. Note the verbs that are absent: no update, no delete, no
@@ -463,9 +739,87 @@ export interface AuditDeps {
   readonly onTraceUnavailable: UnavailabilityPolicy;
   /** Optional. See `AuditLimits` for why these carry defaults and the policy does not. */
   readonly limits?: Partial<AuditLimits>;
+  /**
+   * Optional, and the option is the honest part.
+   *
+   * Wired, `close` publishes the whole-case digest and every witness verb works.
+   * Unwired, nothing silently degrades: `witness` and `verifyAgainstWitness`
+   * raise `WitnessUnavailable("not-configured")` rather than quietly reporting
+   * agreement, because a guarantee that depends on a line of wiring nobody
+   * checks is not a guarantee.
+   *
+   * It is optional rather than required because a witness is only worth having
+   * where it is under separate custody, and choosing that custodian is the
+   * application's decision to make and answer for — not a default this library
+   * can pick on nineteen applications' behalf. `RUNBOOK` says which deployments
+   * must have one.
+   */
+  readonly witness?: Witness;
+  /**
+   * Where `trace-unavailable-at-high-tier` is raised — the seventh of
+   * `docs/CONTEXT.md`'s eight silent conditions, and the strangest one.
+   *
+   * *"Fail-closed is correct **and** means work has stopped. Correct behaviour
+   * is still an incident."* Nothing here is malfunctioning: a high-tier decision
+   * could not be traced, so it did not proceed, which is exactly the behaviour
+   * this module is built to guarantee. The caller receives `TraceUnavailable`,
+   * which is a well-named error that a retry loop will very reasonably catch —
+   * and then nineteen applications are quietly not making high-tier decisions
+   * while every dashboard stays green.
+   *
+   * Raised **only at high tier**, and only where the write is refused rather
+   * than degraded. A degraded low-tier write is the policy working: the decision
+   * proceeds, the gap is recorded, and paging somebody about it would train them
+   * to ignore the channel that carries the other seven conditions.
+   *
+   * Optional, injected, and its absence is written into the returned error's
+   * own record rather than assumed — see `AuditDeps.witness` for the same
+   * reasoning about a guarantee that depends on a line of wiring nobody checks.
+   * A test cannot page anybody through this: no transport is constructed here.
+   */
+  readonly alerting?: import("../../alerts/index.js").AlertRaiser | undefined;
 }
 
 export interface Audit {
   open(correlationId: CorrelationId): Promise<CaseTrace>;
+  /**
+   * The whole case, materialised, with the graph indexed. The common path: a
+   * case holds tens of nodes, and a caller who wants `childrenOf` wants the
+   * graph in memory anyway.
+   */
   replay(correlationId: CorrelationId): Promise<ReplayedCase>;
+  /**
+   * The same case, a page at a time, for the ones at the ceiling.
+   *
+   * Yields nodes in store-assigned order and **returns the verdict only to a
+   * walk that runs to the end** — a caller who breaks out early gets the nodes
+   * they read and no verdict, because a partial walk cannot verify a seal it
+   * never reached. Every integrity check `replay` makes is made here too, on
+   * the same code; see `lib/stream.ts`.
+   */
+  walk(
+    correlationId: CorrelationId,
+    limits?: Partial<WalkLimits>,
+  ): AsyncGenerator<RecordedNode, TraceVerdict, undefined>;
+  /**
+   * Publish a closed case's digest to the injected witness. Idempotent.
+   *
+   * `close` already does this. This verb is the recovery for the window between
+   * seal and publication, and the sweep for cases that fell into it. Streams the
+   * case rather than materialising it, so it works at the node ceiling.
+   */
+  witness(
+    correlationId: CorrelationId,
+    limits?: Partial<WalkLimits>,
+  ): Promise<WitnessReceipt>;
+  /**
+   * Recompute the whole-case digest and compare it with what the witness holds.
+   *
+   * This is the check the rows alone cannot make. Streams, so it costs one page
+   * of memory whatever the size of the case.
+   */
+  verifyAgainstWitness(
+    correlationId: CorrelationId,
+    limits?: Partial<WalkLimits>,
+  ): Promise<WitnessVerdict>;
 }

@@ -119,7 +119,7 @@ describe("the shadow path", () => {
       priceTable,
     });
 
-    expect(report.schema).toBe("report.agreement/1");
+    expect(report.schema).toBe("report.agreement/2");
     expect(report.against).toBe("recorded-human-decisions");
     // The provenance travels with the number, because a figure whose provenance
     // is unknown is not evidence of anything.

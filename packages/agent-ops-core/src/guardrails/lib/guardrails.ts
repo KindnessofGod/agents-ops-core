@@ -1,4 +1,10 @@
-import { DetectorSetEmpty, LimitsInvalid, LocaleUnsupported, OutputCheckOutOfOrder } from "./errors.js";
+import {
+  DetectorSetEmpty,
+  LimitsInvalid,
+  LocaleUnsupported,
+  OutputCheckOutOfOrder,
+} from "./errors.js";
+import { createRateWatch } from "./rate-watch.js";
 import { recorderFor, witnessLedger } from "./recorder.js";
 import { SETTLED_NODE, runScreening } from "./screening.js";
 import type { NodeId } from "../../audit/index.js";
@@ -40,9 +46,55 @@ export const createGuardrails = (deps: GuardrailsDeps): Guardrails => {
    */
   const ledger = witnessLedger();
 
+  /**
+   * The fail-closed rate watch, or nothing.
+   *
+   * Constructed once per `Guardrails` rather than per screening, because the
+   * whole point of it is state that outlives a case. A second composition root
+   * watches its own windows — which is right: two deployments screening
+   * different traffic through different detector sets do not share a baseline.
+   */
+  const rates =
+    deps.rateAlerting === undefined
+      ? undefined
+      : createRateWatch(deps.rateAlerting);
+
+  /**
+   * Every screening passes through here on its way back to the caller.
+   *
+   * The alert this can raise is `rate-moved-sharply`, and it is the one
+   * condition in this library that is **deliberately not recorded as a node**.
+   * A rate movement is a property of a window over a population, not of a case,
+   * and `alerts.correlationOf` returns `undefined` for it for exactly that
+   * reason. Writing it onto whichever case happened to be screening when the
+   * window closed would attribute a population fact to one arbitrary claim, and
+   * a reader in 2033 would reasonably conclude that claim had something to do
+   * with it. The record of the raise lives where the condition lives: in
+   * `alerts.health()` and on the operational stream.
+   *
+   * A failure to observe never costs a screening. The screening is complete and
+   * correct by the time this runs; losing it because a counter or a sink misfired
+   * would trade a real answer for a statistic about answers.
+   */
+  const observed = async (screening: Screening): Promise<Screening> => {
+    if (rates !== undefined) {
+      try {
+        await rates.observe(screening, deps.clock.now());
+      } catch {
+        // `raiseAndRecord` does not throw, so reaching here means the clock or
+        // the counter did — a defect, and one that must not eat the screening.
+      }
+    }
+    return screening;
+  };
+
   return {
     async screenInput(request: InputScreeningRequest): Promise<Screening> {
-      const recorder = await recorderFor(deps.audit, request.correlationId, ledger);
+      const recorder = await recorderFor(
+        deps.audit,
+        request.correlationId,
+        ledger,
+      );
       // A `Screening` carries its own settled node, so parenting to it costs
       // nothing. A bare `NodeId` costs one replay — see `InputScreeningRequest`.
       let under: NodeId | undefined;
@@ -52,24 +104,26 @@ export const createGuardrails = (deps: GuardrailsDeps): Guardrails => {
         recorder.index(request.under[SETTLED_NODE]);
         under = request.under.nodes.settled;
       }
-      return runScreening({
-        recorder,
-        clock: deps.clock,
-        timer: deps.timer,
-        limits: deps.limits,
-        locale: deps.locale,
-        phase: "input",
-        tier: request.tier,
-        set: sets[request.tier],
-        payload: request.payload,
-        // An input has nothing to be grounded against, and saying so in the
-        // same shape the output path uses keeps one code path rather than two.
-        sources: {
-          available: false,
-          why: "not applicable: an input screening has no reference material",
-        },
-        under,
-      });
+      return await observed(
+        await runScreening({
+          recorder,
+          clock: deps.clock,
+          timer: deps.timer,
+          limits: deps.limits,
+          locale: deps.locale,
+          phase: "input",
+          tier: request.tier,
+          set: sets[request.tier],
+          payload: request.payload,
+          // An input has nothing to be grounded against, and saying so in the
+          // same shape the output path uses keeps one code path rather than two.
+          sources: {
+            available: false,
+            why: "not applicable: an input screening has no reference material",
+          },
+          under,
+        }),
+      );
     },
 
     async checkOutput(request: OutputCheckRequest): Promise<Screening> {
@@ -83,7 +137,11 @@ export const createGuardrails = (deps: GuardrailsDeps): Guardrails => {
       if (request.after.phase !== "input") {
         throw new OutputCheckOutOfOrder(request.after.phase);
       }
-      const recorder = await recorderFor(deps.audit, request.after.correlationId, ledger);
+      const recorder = await recorderFor(
+        deps.audit,
+        request.after.correlationId,
+        ledger,
+      );
       // The settled node of `after` travels **on** the screening, behind a
       // symbol this module does not export. Without it, every `checkOutput`
       // replayed the whole case to turn one `NodeId` back into the
@@ -94,19 +152,21 @@ export const createGuardrails = (deps: GuardrailsDeps): Guardrails => {
       // remains only for a foreign `under`, where there is genuinely nothing
       // else to go on.
       recorder.index(request.after[SETTLED_NODE]);
-      return runScreening({
-        recorder,
-        clock: deps.clock,
-        timer: deps.timer,
-        limits: deps.limits,
-        locale: deps.locale,
-        phase: "output",
-        tier: request.tier,
-        set: sets[request.tier],
-        payload: request.output,
-        sources: request.sources,
-        under: request.after.nodes.settled,
-      });
+      return await observed(
+        await runScreening({
+          recorder,
+          clock: deps.clock,
+          timer: deps.timer,
+          limits: deps.limits,
+          locale: deps.locale,
+          phase: "output",
+          tier: request.tier,
+          set: sets[request.tier],
+          payload: request.output,
+          sources: request.sources,
+          under: request.after.nodes.settled,
+        }),
+      );
     },
   };
 };
@@ -149,7 +209,11 @@ const LIMIT_FIELDS: readonly (keyof Limits)[] = [
 const checkLimits = (limits: Limits): void => {
   for (const field of LIMIT_FIELDS) {
     const value: unknown = limits[field];
-    if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 1) {
+    if (
+      typeof value !== "number" ||
+      !Number.isSafeInteger(value) ||
+      value < 1
+    ) {
       throw new LimitsInvalid(field, value);
     }
   }
